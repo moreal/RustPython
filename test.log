@@ -1,0 +1,12 @@
+TypeError: bind Expected at most 2..=2 arguments (3 given)
+(cloned_args=[
+    [PyObj [PyType staticmethod]],
+    [PyObj [PyType staticmethod]],
+    [PyObj PyFunction {
+        code: [PyObj code: <code object module_repr at ??? file "_frozen_importlib", line 717>],
+        globals: [PyObj dict], closure: None, defaults_and_kwdefaults: Mutex { data: (None, None) },
+        name: Mutex { data: [PyObj PyStr { value: "module_repr", hash: -1, char_len: 18446744073709551615 }] }
+    }]
+])
+(args=[[PyObj PyFunction { code: [PyObj code: <code object module_repr at ??? file "_frozen_importlib", line 717>], globals: [PyObj dict], closure: None, defaults_and_kwdefaults: Mutex { data: (None, None) }, name: Mutex { data: [PyObj PyStr { value: "module_repr", hash: -1, char_len: 18446744073709551615 }] } }]])
+(bound=FuncArgs { args: [[PyObj PyFunction { code: [PyObj code: <code object module_repr at ??? file "_frozen_importlib", line 717>], globals: [PyObj dict], closure: None, defaults_and_kwdefaults: Mutex { data: (None, None) }, name: Mutex { data: [PyObj PyStr { value: "module_repr", hash: -1, char_len: 18446744073709551615 }] } }]], kwargs: {} })

@@ -62,8 +62,8 @@ impl PyBaseException {
         }
     }
 
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(name = "__new__")]
+    fn _new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         PyBaseException::new(args.args, vm).into_ref_with_type(vm, cls)
     }
 

@@ -93,8 +93,8 @@ impl PySlice {
         }
     }
 
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(magic)]
+    fn new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         let slice: PySlice = match args.args.len() {
             0 => {
                 return Err(
@@ -295,8 +295,8 @@ impl PyValue for PyEllipsis {
 
 #[pyimpl]
 impl PyEllipsis {
-    #[pyslot]
-    fn tp_new(_cls: PyTypeRef, vm: &VirtualMachine) -> PyRef<Self> {
+    #[pymethod(magic)]
+    fn new(_cls: PyTypeRef, vm: &VirtualMachine) -> PyRef<Self> {
         vm.ctx.ellipsis.clone()
     }
 

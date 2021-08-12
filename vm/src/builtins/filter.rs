@@ -24,8 +24,8 @@ impl PyValue for PyFilter {
 
 #[pyimpl(with(PyIter), flags(BASETYPE))]
 impl PyFilter {
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         function: PyObjectRef,
         iterable: PyObjectRef,

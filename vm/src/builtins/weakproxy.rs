@@ -21,8 +21,8 @@ impl PyValue for PyWeakProxy {
 #[pyimpl(with(SlotSetattro))]
 impl PyWeakProxy {
     // TODO: callbacks
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         referent: PyObjectRef,
         callback: OptionalArg<PyObjectRef>,

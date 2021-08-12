@@ -44,8 +44,8 @@ impl VersionInfo {
         releaselevel: RELEASELEVEL,
         serial: SERIAL,
     };
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         _cls: crate::builtins::pytype::PyTypeRef,
         _args: crate::function::FuncArgs,
         vm: &crate::VirtualMachine,

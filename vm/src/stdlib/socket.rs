@@ -190,8 +190,8 @@ impl PySocket {
         self.sock_io().map_err(|e| e.into_pyexception(vm))
     }
 
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(magic)]
+    fn new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         Self::default().into_ref_with_type(vm, cls)
     }
 

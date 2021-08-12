@@ -161,8 +161,8 @@ pub fn float_pow(v1: f64, v2: f64, vm: &VirtualMachine) -> PyResult {
 #[pyimpl(flags(BASETYPE), with(Comparable, Hashable))]
 #[allow(clippy::trivially_copy_pass_by_ref)]
 impl PyFloat {
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         arg: OptionalArg<PyObjectRef>,
         vm: &VirtualMachine,

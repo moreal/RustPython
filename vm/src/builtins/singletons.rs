@@ -32,8 +32,8 @@ impl<T: IntoPyObject> IntoPyObject for Option<T> {
 
 #[pyimpl]
 impl PyNone {
-    #[pyslot]
-    fn tp_new(_: PyTypeRef, vm: &VirtualMachine) -> PyRef<Self> {
+    #[pymethod(magic)]
+    fn new(_: PyTypeRef, vm: &VirtualMachine) -> PyRef<Self> {
         vm.ctx.none.clone()
     }
 
@@ -61,8 +61,8 @@ impl PyValue for PyNotImplemented {
 
 #[pyimpl]
 impl PyNotImplemented {
-    #[pyslot]
-    fn tp_new(_: PyTypeRef, vm: &VirtualMachine) -> PyRef<Self> {
+    #[pymethod(magic)]
+    fn new(_: PyTypeRef, vm: &VirtualMachine) -> PyRef<Self> {
         vm.ctx.not_implemented.clone()
     }
 

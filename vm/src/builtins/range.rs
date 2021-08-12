@@ -361,8 +361,8 @@ impl PyRange {
         }
     }
 
-    #[pyslot]
-    fn tp_new(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    #[pymethod(name = "__new__")]
+    fn _new(args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         let range = if args.args.len() <= 2 {
             let (cls, stop) = args.bind(vm)?;
             PyRange::new(cls, stop, vm)

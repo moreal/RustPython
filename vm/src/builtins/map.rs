@@ -24,8 +24,8 @@ impl PyValue for PyMap {
 
 #[pyimpl(with(PyIter), flags(BASETYPE))]
 impl PyMap {
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         function: PyObjectRef,
         iterables: Args,

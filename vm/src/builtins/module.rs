@@ -52,8 +52,8 @@ struct ModuleInitArgs {
 
 #[pyimpl(with(SlotGetattro), flags(BASETYPE, HAS_DICT))]
 impl PyModule {
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(magic)]
+    fn new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         PyModule {}.into_ref_with_type(vm, cls)
     }
 

@@ -141,8 +141,8 @@ impl SysFlags {
         }
     }
 
-    #[pyslot]
-    fn tp_new(_cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    #[pymethod(magic)]
+    fn new(_cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         Err(vm.new_type_error("cannot create 'sys.flags' instances".to_owned()))
     }
 }

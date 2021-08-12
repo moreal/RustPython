@@ -90,8 +90,8 @@ impl SlotDescriptor for PyProperty {
 
 #[pyimpl(with(SlotDescriptor), flags(BASETYPE))]
 impl PyProperty {
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(magic)]
+    fn new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         PyProperty {
             getter: PyRwLock::new(None),
             setter: PyRwLock::new(None),

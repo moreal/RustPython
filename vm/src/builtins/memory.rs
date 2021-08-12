@@ -250,8 +250,8 @@ impl PyMemoryView {
         })
     }
 
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         args: PyMemoryViewNewArgs,
         vm: &VirtualMachine,

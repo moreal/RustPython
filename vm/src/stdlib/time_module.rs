@@ -219,8 +219,8 @@ impl PyStructTime {
         Ok(dt)
     }
 
-    #[pyslot]
-    fn tp_new(_cls: PyTypeRef, seq: PyObjectRef, vm: &VirtualMachine) -> PyResult<Self> {
+    #[pymethod(magic, name = "__new__")]
+    fn _new(_cls: PyTypeRef, seq: PyObjectRef, vm: &VirtualMachine) -> PyResult<Self> {
         // cls is ignorable because this is not a basetype
         Self::try_from_object(vm, seq)
     }

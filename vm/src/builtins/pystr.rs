@@ -201,8 +201,8 @@ struct StrArgs {
 
 #[pyimpl(flags(BASETYPE), with(Hashable, Comparable, Iterable))]
 impl PyStr {
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, args: StrArgs, vm: &VirtualMachine) -> PyResult<PyStrRef> {
+    #[pymethod(magic)]
+    fn new(cls: PyTypeRef, args: StrArgs, vm: &VirtualMachine) -> PyResult<PyStrRef> {
         let string: PyStrRef = match args.object {
             OptionalArg::Present(input) => {
                 if let OptionalArg::Present(enc) = args.encoding {

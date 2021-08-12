@@ -18,8 +18,8 @@ impl Frame {}
 
 #[pyimpl]
 impl FrameRef {
-    #[pyslot]
-    fn tp_new(_cls: FrameRef, vm: &VirtualMachine) -> PyResult<Self> {
+    #[pymethod(magic)]
+    fn new(_cls: FrameRef, vm: &VirtualMachine) -> PyResult<Self> {
         Err(vm.new_type_error("Cannot directly create frame object".to_owned()))
     }
 

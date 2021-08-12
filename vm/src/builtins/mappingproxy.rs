@@ -38,8 +38,8 @@ impl PyMappingProxy {
 
 #[pyimpl(with(Iterable))]
 impl PyMappingProxy {
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, mapping: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(name = "__new__")]
+    fn _new(cls: PyTypeRef, mapping: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         Self {
             mapping: MappingProxyInner::Dict(mapping),
         }

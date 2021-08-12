@@ -21,8 +21,8 @@ impl PyValue for PyZip {
 
 #[pyimpl(with(PyIter), flags(BASETYPE))]
 impl PyZip {
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, iterables: Args, vm: &VirtualMachine) -> PyResult<PyZipRef> {
+    #[pymethod(magic)]
+    fn new(cls: PyTypeRef, iterables: Args, vm: &VirtualMachine) -> PyResult<PyZipRef> {
         let iterators = iterables
             .into_iter()
             .map(|iterable| iterator::get_iter(vm, iterable))

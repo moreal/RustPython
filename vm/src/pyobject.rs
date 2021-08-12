@@ -389,11 +389,11 @@ impl PyContext {
     }
 
     pub fn add_slot_wrappers(&self, ty: &PyTypeRef) {
-        if !ty.attributes.read().contains_key("__new__") {
-            let new_wrapper =
-                self.new_bound_method(self.tp_new_wrapper.clone(), ty.clone().into_object());
-            ty.set_str_attr("__new__", new_wrapper);
-        }
+        // if !ty.attributes.read().contains_key("__new__") {
+        //     let new_wrapper =
+        //         self.new_bound_method(self.tp_new_wrapper.clone(), ty.clone().into_object());
+        //     ty.set_str_attr("__new__", new_wrapper);
+        // }
     }
 
     pub fn is_tp_new_wrapper(&self, obj: &PyObjectRef) -> bool {
@@ -1226,6 +1226,7 @@ pub enum PyMethod {
 
 impl PyMethod {
     pub fn get(obj: PyObjectRef, name: pystr::PyStrRef, vm: &VirtualMachine) -> PyResult<Self> {
+        vm_trace!("PyMethod::get {:?} {:?}", obj, name);
         let cls = obj.class();
         let getattro = cls.mro_find_map(|cls| cls.slots.getattro.load()).unwrap();
         if getattro as usize != object::PyBaseObject::getattro as usize {

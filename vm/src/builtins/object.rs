@@ -27,8 +27,8 @@ impl PyValue for PyBaseObject {
 
 #[pyimpl(flags(BASETYPE))]
 impl PyBaseObject {
-    #[pyslot]
-    fn tp_new(mut args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+    #[pymethod(magic)]
+    fn new(mut args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         // more or less __new__ operator
         let cls = PyTypeRef::try_from_object(vm, args.shift())?;
         let dict = if cls.is(&vm.ctx.types.object_type) {

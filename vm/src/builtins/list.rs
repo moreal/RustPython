@@ -388,8 +388,8 @@ impl PyList {
         Ok(())
     }
 
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         _iterable: OptionalArg<PyObjectRef>,
         vm: &VirtualMachine,

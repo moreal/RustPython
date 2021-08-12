@@ -263,8 +263,8 @@ impl PyInt {
         &self.value
     }
 
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, options: IntOptions, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(magic)]
+    fn new(cls: PyTypeRef, options: IntOptions, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         let value = if let OptionalArg::Present(val) = options.val_options {
             if let OptionalArg::Present(base) = options.base {
                 let base = vm

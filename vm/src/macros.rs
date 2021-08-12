@@ -201,7 +201,7 @@ macro_rules! match_class {
 macro_rules! vm_trace {
     ($($arg:tt)+) => {
         #[cfg(feature = "vm-tracing-logging")]
-        trace!($($arg)+);
+        println!($($arg)+);
     }
 }
 

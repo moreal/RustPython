@@ -100,8 +100,8 @@ pub(crate) fn init(context: &PyContext) {
 
 #[pyimpl(flags(BASETYPE), with(Hashable, Comparable, BufferProtocol, Iterable))]
 impl PyBytes {
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         options: ByteInnerNewOptions,
         vm: &VirtualMachine,

@@ -52,8 +52,8 @@ impl PyValue for PyDict {
 #[allow(clippy::len_without_is_empty)]
 #[pyimpl(with(Hashable, Comparable, Iterable), flags(BASETYPE))]
 impl PyDict {
-    #[pyslot]
-    fn tp_new(class: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(magic)]
+    fn new(class: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         PyDict::default().into_ref_with_type(vm, class)
     }
 

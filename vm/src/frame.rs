@@ -1380,6 +1380,8 @@ impl ExecutingFrame<'_> {
     #[inline]
     fn execute_call(&mut self, args: FuncArgs, vm: &VirtualMachine) -> FrameResult {
         let func_ref = self.pop_value();
+        println!("execute_call func_ref={:?}", func_ref);
+        println!("execute_call args={:?}", args);
         let value = vm.invoke(&func_ref, args)?;
         self.push_value(value);
         Ok(None)

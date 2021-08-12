@@ -498,8 +498,8 @@ impl PyArray {
         self.array.write()
     }
 
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         spec: PyStrRef,
         init: OptionalArg<PyObjectRef>,

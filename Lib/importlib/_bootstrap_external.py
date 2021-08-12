@@ -422,6 +422,9 @@ def _get_sourcefile(bytecode_path):
 
 
 def _get_cached(filename):
+
+    print(tuple)
+
     if filename.endswith(tuple(SOURCE_SUFFIXES)):
         try:
             return cache_from_source(filename)

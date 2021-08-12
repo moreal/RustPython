@@ -131,8 +131,8 @@ impl PyBool {
         }
     }
 
-    #[pyslot]
-    fn tp_new(zelf: PyObjectRef, x: OptionalArg<PyObjectRef>, vm: &VirtualMachine) -> PyResult {
+    #[pymethod(magic)]
+    fn new(zelf: PyObjectRef, x: OptionalArg<PyObjectRef>, vm: &VirtualMachine) -> PyResult {
         if !zelf.isinstance(&vm.ctx.types.type_type) {
             let actual_type = &zelf.class().name;
             return Err(vm.new_type_error(format!(

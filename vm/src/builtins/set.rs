@@ -307,8 +307,8 @@ macro_rules! multi_args_set {
 
 #[pyimpl(with(Hashable, Comparable, Iterable), flags(BASETYPE))]
 impl PySet {
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         _iterable: OptionalArg<PyIterable>,
         vm: &VirtualMachine,
@@ -566,8 +566,8 @@ impl PyFrozenSet {
         Ok(Self { inner })
     }
 
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         iterable: OptionalArg<PyObjectRef>,
         vm: &VirtualMachine,

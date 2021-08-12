@@ -249,8 +249,8 @@ impl PyTuple {
         (tup_arg,)
     }
 
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         iterable: OptionalArg<PyObjectRef>,
         vm: &VirtualMachine,

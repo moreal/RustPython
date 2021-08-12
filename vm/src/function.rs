@@ -198,18 +198,22 @@ impl FuncArgs {
     /// arguments after performing the binding, or if an argument is not of
     /// the expected type, a TypeError is raised.
     ///
-    /// If the given `FromArgs` includes any conversions, exceptions raised
     /// during the conversion will halt the binding and return the error.
     pub fn bind<T: FromArgs>(mut self, vm: &VirtualMachine) -> PyResult<T> {
+        let cloned_args = self.args.clone();
         let given_args = self.args.len();
         let bound = T::from_args(vm, &mut self)
             .map_err(|e| e.into_exception(T::arity(), given_args, vm))?;
 
         if !self.args.is_empty() {
+            vm_trace!("bind inner !self.args.is_empty()");
             Err(vm.new_type_error(format!(
-                "Expected at most {} arguments ({} given)",
-                T::arity().end(),
+                "bind Expected at most {:?} arguments ({} given) (cloned_args={:?}) (args={:?}) (bound={:?})",
+                T::arity(),
                 given_args,
+                cloned_args,
+                self.args,
+                self
             )))
         } else if let Some(err) = self.check_kwargs_empty(vm) {
             Err(err)
@@ -262,7 +266,7 @@ impl ArgumentError {
                 num_given
             )),
             ArgumentError::TooManyArgs => vm.new_type_error(format!(
-                "Expected at most {} arguments ({} given)",
+                "ArgumentError Expected at most {} arguments ({} given)",
                 arity.end(),
                 num_given
             )),
@@ -622,6 +626,7 @@ macro_rules! into_py_native_func_tuple {
             R: IntoPyResult,
         {
             fn call_(&self, vm: &VirtualMachine, args: FuncArgs) -> PyResult {
+                // println!("_call {}", stringify!(($($T,)*)));
                 let ($($n,)*) = args.bind::<($($T,)*)>(vm)?;
 
                 (self)($($n,)* vm).into_pyresult(vm)

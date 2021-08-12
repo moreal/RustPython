@@ -258,8 +258,8 @@ impl PyComplex {
         !Complex64::is_zero(&self.value)
     }
 
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, args: ComplexArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(magic)]
+    fn new(cls: PyTypeRef, args: ComplexArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         let imag_missing = args.imag.is_missing();
         let (real, real_was_complex) = match args.real {
             OptionalArg::Missing => (Complex64::new(0.0, 0.0), false),

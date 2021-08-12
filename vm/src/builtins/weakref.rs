@@ -46,8 +46,8 @@ impl Callable for PyWeak {
 #[pyimpl(with(Callable, Hashable, Comparable), flags(BASETYPE))]
 impl PyWeak {
     // TODO callbacks
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(magic)]
+    fn new(
         cls: PyTypeRef,
         referent: PyObjectRef,
         _callback: OptionalArg<PyObjectRef>,

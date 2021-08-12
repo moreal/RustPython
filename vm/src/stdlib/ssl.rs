@@ -286,8 +286,8 @@ impl PySslContext {
         func(builder_as_ctx(&c))
     }
 
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, proto_version: i32, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(magic)]
+    fn new(cls: PyTypeRef, proto_version: i32, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         let proto = SslVersion::try_from(proto_version)
             .map_err(|_| vm.new_value_error("invalid protocol version".to_owned()))?;
         let method = match proto {

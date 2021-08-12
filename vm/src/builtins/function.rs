@@ -437,8 +437,8 @@ impl PyBoundMethod {
         PyBoundMethod { object, function }
     }
 
-    #[pyslot]
-    fn tp_new(
+    #[pymethod(name = "_new__")]
+    fn _new(
         cls: PyTypeRef,
         function: PyObjectRef,
         object: PyObjectRef,
@@ -527,8 +527,8 @@ impl PyValue for PyCell {
 
 #[pyimpl]
 impl PyCell {
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, value: OptionalArg, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(name = "__new__")]
+    fn _new(cls: PyTypeRef, value: OptionalArg, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         Self::new(value.into_option()).into_ref_with_type(vm, cls)
     }
 

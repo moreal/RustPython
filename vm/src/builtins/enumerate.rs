@@ -34,8 +34,8 @@ struct EnumerateArgs {
 
 #[pyimpl(with(PyIter))]
 impl PyEnumerate {
-    #[pyslot]
-    fn tp_new(cls: PyTypeRef, args: EnumerateArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+    #[pymethod(magic)]
+    fn new(cls: PyTypeRef, args: EnumerateArgs, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
         let counter = match args.start {
             OptionalArg::Present(start) => start.as_bigint().clone(),
             OptionalArg::Missing => BigInt::zero(),

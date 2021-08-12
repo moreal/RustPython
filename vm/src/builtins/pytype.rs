@@ -379,10 +379,13 @@ impl PyType {
                 .collect(),
         )
     }
-    #[pyslot]
-    fn tp_new(metatype: PyTypeRef, mut args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-        vm_trace!("type.__new__ {:?}", args);
+    #[pymethod(magic)]
+    fn new(metatype: PyTypeRef, mut args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+        vm_trace!("type.__new__ {:?} {:?}", metatype, args);
 
+        println!("new metatype={:?} args={:?}", metatype, args);
+
+        let metatype: PyTypeRef = PyTypeRef::try_from_object(vm, args.shift())?;
         let is_type_type = metatype.is(&vm.ctx.types.type_type);
         if is_type_type && args.args.len() == 1 && args.kwargs.is_empty() {
             return Ok(args.args[0].clone_class().into_object());
@@ -390,11 +393,11 @@ impl PyType {
 
         if args.args.len() != 3 {
             return Err(vm.new_type_error(if is_type_type {
-                "type() takes 1 or 3 arguments".to_owned()
+                format!("type() takes 1 or 3 arguments (args.args: {:?})", args.args)
             } else {
                 format!(
-                    "type.__new__() takes exactly 3 arguments ({} given)",
-                    args.args.len()
+                    "type.__new__() takes exactly 3 arguments ({} given) (args.args: {:?})",
+                    args.args.len(), args.args
                 )
             }));
         }
@@ -404,6 +407,7 @@ impl PyType {
 
         let bases = bases.as_slice();
         let (metatype, base, bases) = if bases.is_empty() {
+            vm_trace!("here");
             let base = vm.ctx.types.object_type.clone();
             (metatype, base.clone(), vec![base])
         } else {
@@ -467,7 +471,7 @@ impl PyType {
         let typ = new(metatype, name.as_str(), base, bases, attributes, slots)
             .map_err(|e| vm.new_type_error(e))?;
 
-        vm.ctx.add_slot_wrappers(&typ);
+        // vm.ctx.add_slot_wrappers(&typ);
 
         // avoid deadlock
         let attributes = typ
@@ -558,8 +562,8 @@ impl SlotGetattro for PyType {
             vm.call_if_get_descriptor(attr, zelf.into_object())
         } else {
             Err(vm.new_attribute_error(format!(
-                "type object '{}' has no attribute '{}'",
-                zelf, name
+                "type object '{}' has no attribute '{}' {:?} {:?} {:?}",
+                zelf, name, mcl_attr, zelf_attr, zelf.get_attributes()
             )))
         }
     }
@@ -721,8 +725,11 @@ fn call_tp_new(
     mut args: FuncArgs,
     vm: &VirtualMachine,
 ) -> PyResult {
+    vm_trace!("call_tp_new {:?} {:?} {:?}", typ, subtype, args);
     for cls in typ.deref().iter_mro() {
+        vm_trace!("call_tp_new({:?}, {:?}, {:?}) cls={:?} cls.attributes={:?}", typ, subtype, args, cls, cls.attributes);
         if let Some(new_meth) = cls.get_attr("__new__") {
+            vm_trace!("!vm.ctx.is_tp_new_wrapper(&new_meth) = {} | new_meth={:?}", !vm.ctx.is_tp_new_wrapper(&new_meth), new_meth);
             if !vm.ctx.is_tp_new_wrapper(&new_meth) {
                 let new_meth = vm.call_if_get_descriptor(new_meth, typ.clone().into_object())?;
                 args.prepend_arg(typ.clone().into_object());
