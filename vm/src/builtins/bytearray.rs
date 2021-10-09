@@ -417,6 +417,7 @@ impl PyByteArray {
     fn endswith(&self, options: anystr::StartsEndsWithArgs, vm: &VirtualMachine) -> PyResult<bool> {
         self.borrow_buf().py_startsendswith(
             options,
+            self.len(),
             "endswith",
             "bytes",
             |s, x: &PyBytesInner| s.ends_with(&x.elements[..]),
@@ -432,6 +433,7 @@ impl PyByteArray {
     ) -> PyResult<bool> {
         self.borrow_buf().py_startsendswith(
             options,
+            self.len(),
             "startswith",
             "bytes",
             |s, x: &PyBytesInner| s.starts_with(&x.elements[..]),
