@@ -1,4 +1,4 @@
-use super::{PyDictRef, PyIntRef, PyStrRef, PyTupleRef, PyTypeRef};
+use super::{PositionIterInternal, PyDictRef, PyIntRef, PyStrRef, PyTupleRef, PyTypeRef};
 use crate::{
     anystr::{self, AnyStr},
     bytesinner::{
@@ -6,19 +6,23 @@ use crate::{
         ByteInnerSplitOptions, ByteInnerTranslateOptions, DecodeArgs, PyBytesInner,
     },
     common::hash::PyHash,
-    function::{ArgBytesLike, ArgIterable, OptionalArg, OptionalOption},
-    protocol::{BufferInternal, BufferOptions, PyBuffer, PyIterReturn},
+    function::{
+        ArgBytesLike, ArgIterable, IntoPyObject, IntoPyResult, OptionalArg, OptionalOption,
+    },
+    protocol::{BufferInternal, BufferOptions, PyBuffer, PyIterReturn, PyMappingMethods},
     slots::{
-        AsBuffer, Callable, Comparable, Hashable, Iterable, IteratorIterable, PyComparisonOp,
-        SlotConstructor, SlotIterator,
+        AsBuffer, AsMapping, Callable, Comparable, Hashable, Iterable, IteratorIterable,
+        PyComparisonOp, SlotConstructor, SlotIterator,
     },
     utils::Either,
-    IdProtocol, IntoPyObject, IntoPyResult, PyClassImpl, PyComparisonValue, PyContext, PyObjectRef,
-    PyRef, PyResult, PyValue, TryFromBorrowedObject, TypeProtocol, VirtualMachine,
+    IdProtocol, PyClassImpl, PyComparisonValue, PyContext, PyObjectRef, PyRef, PyResult, PyValue,
+    TryFromBorrowedObject, TypeProtocol, VirtualMachine,
 };
 use bstr::ByteSlice;
-use crossbeam_utils::atomic::AtomicCell;
-use rustpython_common::borrow::{BorrowedValue, BorrowedValueMut};
+use rustpython_common::{
+    borrow::{BorrowedValue, BorrowedValueMut},
+    lock::PyMutex,
+};
 use std::mem::size_of;
 use std::ops::Deref;
 
@@ -103,12 +107,12 @@ impl SlotConstructor for PyBytes {
 
 #[pyimpl(
     flags(BASETYPE),
-    with(Hashable, Comparable, AsBuffer, Iterable, SlotConstructor)
+    with(AsMapping, Hashable, Comparable, AsBuffer, Iterable, SlotConstructor)
 )]
 impl PyBytes {
     #[pymethod(magic)]
     pub(crate) fn repr(&self) -> String {
-        self.inner.repr("", "")
+        self.inner.repr(None)
     }
 
     #[pymethod(magic)]
@@ -481,7 +485,7 @@ impl PyBytes {
     /// currently, only 'utf-8' and 'ascii' emplemented
     #[pymethod]
     fn decode(zelf: PyRef<Self>, args: DecodeArgs, vm: &VirtualMachine) -> PyResult<PyStrRef> {
-        bytes_decode(zelf.into_object(), args, vm)
+        bytes_decode(zelf.into(), args, vm)
     }
 
     #[pymethod(magic)]
@@ -545,6 +549,36 @@ impl BufferInternal for PyRef<PyBytes> {
     fn retain(&self) {}
 }
 
+impl AsMapping for PyBytes {
+    fn as_mapping(_zelf: &PyRef<Self>, _vm: &VirtualMachine) -> PyResult<PyMappingMethods> {
+        Ok(PyMappingMethods {
+            length: Some(Self::length),
+            subscript: Some(Self::subscript),
+            ass_subscript: None,
+        })
+    }
+
+    #[inline]
+    fn length(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
+        Self::downcast_ref(&zelf, vm).map(|zelf| Ok(zelf.len()))?
+    }
+
+    #[inline]
+    fn subscript(zelf: PyObjectRef, needle: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        Self::downcast_ref(&zelf, vm).map(|zelf| zelf.getitem(needle, vm))?
+    }
+
+    #[cold]
+    fn ass_subscript(
+        zelf: PyObjectRef,
+        _needle: PyObjectRef,
+        _value: Option<PyObjectRef>,
+        _vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        unreachable!("ass_subscript not implemented for {}", zelf.class())
+    }
+}
+
 impl Hashable for PyBytes {
     fn hash(zelf: &PyRef<Self>, vm: &VirtualMachine) -> PyResult<PyHash> {
         Ok(zelf.inner.hash(vm))
@@ -579,8 +613,7 @@ impl Comparable for PyBytes {
 impl Iterable for PyBytes {
     fn iter(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult {
         Ok(PyBytesIterator {
-            position: AtomicCell::new(0),
-            bytes: zelf,
+            internal: PyMutex::new(PositionIterInternal::new(zelf, 0)),
         }
         .into_object(vm))
     }
@@ -589,8 +622,7 @@ impl Iterable for PyBytes {
 #[pyclass(module = false, name = "bytes_iterator")]
 #[derive(Debug)]
 pub struct PyBytesIterator {
-    position: AtomicCell<usize>,
-    bytes: PyBytesRef,
+    internal: PyMutex<PositionIterInternal<PyBytesRef>>,
 }
 
 impl PyValue for PyBytesIterator {
@@ -600,17 +632,35 @@ impl PyValue for PyBytesIterator {
 }
 
 #[pyimpl(with(SlotIterator))]
-impl PyBytesIterator {}
+impl PyBytesIterator {
+    #[pymethod(magic)]
+    fn length_hint(&self) -> usize {
+        self.internal.lock().length_hint(|obj| obj.len())
+    }
+
+    #[pymethod(magic)]
+    fn reduce(&self, vm: &VirtualMachine) -> PyObjectRef {
+        self.internal
+            .lock()
+            .builtins_iter_reduce(|x| x.clone().into(), vm)
+    }
+
+    #[pymethod(magic)]
+    fn setstate(&self, state: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        self.internal
+            .lock()
+            .set_state(state, |obj, pos| pos.min(obj.len()), vm)
+    }
+}
 impl IteratorIterable for PyBytesIterator {}
 impl SlotIterator for PyBytesIterator {
     fn next(zelf: &PyRef<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
-        let pos = zelf.position.fetch_add(1);
-        let r = if let Some(&ret) = zelf.bytes.as_bytes().get(pos) {
-            PyIterReturn::Return(vm.ctx.new_int(ret))
-        } else {
-            PyIterReturn::StopIteration(None)
-        };
-        Ok(r)
+        zelf.internal.lock().next(|bytes, pos| {
+            Ok(match bytes.as_bytes().get(pos) {
+                Some(&x) => PyIterReturn::Return(vm.ctx.new_int(x)),
+                None => PyIterReturn::StopIteration(None),
+            })
+        })
     }
 }
 

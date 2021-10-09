@@ -1,7 +1,7 @@
 //! Implement virtual machine to run instructions.
 //!
 //! See also:
-//!   https://github.com/ProgVal/pythonvm-rust/blob/master/src/processor/mod.rs
+//!   <https://github.com/ProgVal/pythonvm-rust/blob/master/src/processor/mod.rs>
 //!
 
 #[cfg(feature = "rustpython-compiler")]
@@ -20,17 +20,16 @@ use crate::{
     exceptions,
     frame::{ExecutionResult, Frame, FrameRef},
     frozen,
-    function::{FuncArgs, IntoFuncArgs},
-    import, iterator,
-    protocol::PyIterReturn,
+    function::{FuncArgs, IntoFuncArgs, IntoPyObject},
+    import,
+    protocol::{PyIterIter, PyIterReturn},
     scope::Scope,
     signal::NSIG,
     slots::PyComparisonOp,
     stdlib,
     utils::Either,
-    IdProtocol, IntoPyObject, ItemProtocol, PyArithmaticValue, PyContext, PyLease, PyMethod,
-    PyObject, PyObjectRef, PyRef, PyRefExact, PyResult, PyValue, TryFromObject, TryIntoRef,
-    TypeProtocol,
+    IdProtocol, ItemProtocol, PyArithmeticValue, PyContext, PyLease, PyMethod, PyObject,
+    PyObjectRef, PyRef, PyRefExact, PyResult, PyValue, TryFromObject, TryIntoRef, TypeProtocol,
 };
 use crossbeam_utils::atomic::AtomicCell;
 use num_traits::{Signed, ToPrimitive};
@@ -495,6 +494,7 @@ impl VirtualMachine {
         self.run_frame_full(frame)
     }
 
+    #[inline(always)]
     pub fn run_frame_full(&self, frame: FrameRef) -> PyResult {
         match self.run_frame(frame)? {
             ExecutionResult::Return(value) => Ok(value),
@@ -591,11 +591,11 @@ impl VirtualMachine {
 
     /// Instantiate an exception with arguments.
     /// This function should only be used with builtin exception types; if a user-defined exception
-    /// type is passed in, it may not be fully initialized; try using [`exceptions::invoke`](invoke)
-    /// or [`exceptions::ExceptionCtor`](ctor) instead.
+    /// type is passed in, it may not be fully initialized; try using [`exceptions::invoke`]
+    /// or [`exceptions::ExceptionCtor`] instead.
     ///
-    /// [invoke]: rustpython_vm::exceptions::invoke
-    /// [ctor]: rustpython_vm::exceptions::ExceptionCtor
+    /// [exceptions::invoke]: rustpython_vm::exceptions::invoke
+    /// [exceptions::ctor]: rustpython_vm::exceptions::ExceptionCtor
     pub fn new_exception(&self, exc_type: PyTypeRef, args: Vec<PyObjectRef>) -> PyBaseExceptionRef {
         // TODO: add repr of args into logging?
 
@@ -611,22 +611,22 @@ impl VirtualMachine {
 
     /// Instantiate an exception with no arguments.
     /// This function should only be used with builtin exception types; if a user-defined exception
-    /// type is passed in, it may not be fully initialized; try using [`exceptions::invoke`](invoke)
-    /// or [`exceptions::ExceptionCtor`](ctor) instead.
+    /// type is passed in, it may not be fully initialized; try using [`exceptions::invoke`]
+    /// or [`exceptions::ExceptionCtor`] instead.
     ///
-    /// [invoke]: rustpython_vm::exceptions::invoke
-    /// [ctor]: rustpython_vm::exceptions::ExceptionCtor
+    /// [exceptions::invoke]: rustpython_vm::exceptions::invoke
+    /// [exceptions::ctor]: rustpython_vm::exceptions::ExceptionCtor
     pub fn new_exception_empty(&self, exc_type: PyTypeRef) -> PyBaseExceptionRef {
         self.new_exception(exc_type, vec![])
     }
 
     /// Instantiate an exception with `msg` as the only argument.
     /// This function should only be used with builtin exception types; if a user-defined exception
-    /// type is passed in, it may not be fully initialized; try using [`exceptions::invoke`](invoke)
-    /// or [`exceptions::ExceptionCtor`](ctor) instead.
+    /// type is passed in, it may not be fully initialized; try using [`exceptions::invoke`]
+    /// or [`exceptions::ExceptionCtor`] instead.
     ///
-    /// [invoke]: rustpython_vm::exceptions::invoke
-    /// [ctor]: rustpython_vm::exceptions::ExceptionCtor
+    /// [exceptions::invoke]: rustpython_vm::exceptions::invoke
+    /// [exceptions::ctor]: rustpython_vm::exceptions::ExceptionCtor
     pub fn new_exception_msg(&self, exc_type: PyTypeRef, msg: String) -> PyBaseExceptionRef {
         self.new_exception(exc_type, vec![self.ctx.new_utf8_str(msg)])
     }
@@ -799,12 +799,17 @@ impl VirtualMachine {
         self.new_exception_msg(memory_error_type, msg)
     }
 
-    pub fn new_stop_iteration(&self) -> PyBaseExceptionRef {
-        let stop_iteration_type = self.ctx.exceptions.stop_iteration.clone();
-        self.new_exception_empty(stop_iteration_type)
+    pub fn new_stop_iteration(&self, value: Option<PyObjectRef>) -> PyBaseExceptionRef {
+        let args = if let Some(value) = value {
+            vec![value]
+        } else {
+            Vec::new()
+        };
+        self.new_exception(self.ctx.exceptions.stop_iteration.clone(), args)
     }
 
-    // TODO: #[track_caller] when stabilized
+    #[track_caller]
+    #[cold]
     fn _py_panic_failed(&self, exc: PyBaseExceptionRef, msg: &str) -> ! {
         #[cfg(not(all(target_arch = "wasm32", not(target_os = "wasi"))))]
         {
@@ -831,13 +836,21 @@ impl VirtualMachine {
             panic!("{}; exception backtrace above", msg)
         }
     }
+    #[track_caller]
     pub fn unwrap_pyresult<T>(&self, result: PyResult<T>) -> T {
-        result.unwrap_or_else(|exc| {
-            self._py_panic_failed(exc, "called `vm.unwrap_pyresult()` on an `Err` value")
-        })
+        match result {
+            Ok(x) => x,
+            Err(exc) => {
+                self._py_panic_failed(exc, "called `vm.unwrap_pyresult()` on an `Err` value")
+            }
+        }
     }
+    #[track_caller]
     pub fn expect_pyresult<T>(&self, result: PyResult<T>, msg: &str) -> T {
-        result.unwrap_or_else(|exc| self._py_panic_failed(exc, msg))
+        match result {
+            Ok(x) => x,
+            Err(exc) => self._py_panic_failed(exc, msg),
+        }
     }
 
     pub fn new_scope_with_builtins(&self) -> Scope {
@@ -865,13 +878,13 @@ impl VirtualMachine {
             Ok(obj.clone().downcast().unwrap())
         } else {
             let s = self.call_special_method(obj.clone(), "__str__", ())?;
-            PyStrRef::try_from_object(self, s)
+            s.try_into_value(self)
         }
     }
 
     pub fn to_repr(&self, obj: &PyObjectRef) -> PyResult<PyStrRef> {
         let repr = self.call_special_method(obj.clone(), "__repr__", ())?;
-        PyStrRef::try_from_object(self, repr)
+        repr.try_into_value(self)
     }
 
     pub fn to_index_opt(&self, obj: PyObjectRef) -> Option<PyResult<PyIntRef>> {
@@ -1138,7 +1151,7 @@ impl VirtualMachine {
         descr: PyObjectRef,
         obj: PyObjectRef,
     ) -> Result<PyResult, PyObjectRef> {
-        let cls = obj.clone_class().into_object();
+        let cls = obj.clone_class().into();
         self.call_get_descriptor_specific(descr, Some(obj), Some(cls))
     }
 
@@ -1196,12 +1209,13 @@ impl VirtualMachine {
         }
     }
 
-    #[inline]
-    pub fn invoke<T>(&self, func_ref: &PyObjectRef, args: T) -> PyResult
+    #[inline(always)]
+    pub fn invoke<O, A>(&self, func: &O, args: A) -> PyResult
     where
-        T: IntoFuncArgs,
+        O: AsRef<PyObjectRef>,
+        A: IntoFuncArgs,
     {
-        self._invoke(func_ref, args.into_args(self))
+        self._invoke(func.as_ref(), args.into_args(self))
     }
 
     /// Call registered trace function.
@@ -1270,14 +1284,7 @@ impl VirtualMachine {
                 .map(|obj| func(obj.clone()))
                 .collect()
         } else {
-            let iter = value.clone().get_iter(self)?;
-            let cap = match iterator::length_hint(self, value.clone()) {
-                Err(e) if e.class().is(&self.ctx.exceptions.runtime_error) => return Err(e),
-                Ok(Some(value)) => value,
-                // Use a power of 2 as a default capacity.
-                _ => 4,
-            };
-            iterator::try_map(self, &iter, cap, |obj| func(obj))
+            self.map_pyiter(value, |obj| func(obj))
         }
     }
 
@@ -1318,18 +1325,35 @@ impl VirtualMachine {
             ref t @ PyTuple => Ok(t.as_slice().iter().cloned().map(f).collect()),
             // TODO: put internal iterable type
             obj => {
-                let iter = obj.clone().get_iter(self)?;
-                let cap = match iterator::length_hint(self, obj.clone()) {
-                    Err(e) if e.class().is(&self.ctx.exceptions.runtime_error) => {
-                        return Ok(Err(e))
-                    }
-                    Ok(Some(value)) => value,
-                    // Use a power of 2 as a default capacity.
-                    _ => 4,
-                };
-                Ok(iterator::try_map(self, &iter, cap, f))
+                Ok(self.map_pyiter(obj, f))
             }
         })
+    }
+
+    fn map_pyiter<F, R>(&self, value: &PyObjectRef, mut f: F) -> PyResult<Vec<R>>
+    where
+        F: FnMut(PyObjectRef) -> PyResult<R>,
+    {
+        let iter = value.clone().get_iter(self)?;
+        let cap = match self.length_hint(value.clone()) {
+            Err(e) if e.class().is(&self.ctx.exceptions.runtime_error) => return Err(e),
+            Ok(Some(value)) => Some(value),
+            // Use a power of 2 as a default capacity.
+            _ => None,
+        };
+        // TODO: fix extend to do this check (?), see test_extend in Lib/test/list_tests.py,
+        // https://github.com/python/cpython/blob/v3.9.0/Objects/listobject.c#L922-L928
+        if let Some(cap) = cap {
+            if cap >= isize::max_value() as usize {
+                return Ok(Vec::new());
+            }
+        }
+
+        let mut results = PyIterIter::new(self, iter.as_ref(), cap)
+            .map(|element| f(element?))
+            .collect::<PyResult<Vec<_>>>()?;
+        results.shrink_to_fit();
+        Ok(results)
     }
 
     // get_attribute should be used for full attribute access (usually from user code).
@@ -1440,7 +1464,7 @@ impl VirtualMachine {
         if let Some(method_or_err) = self.get_method(obj.clone(), method) {
             let method = method_or_err?;
             let result = self.invoke(&method, (arg.clone(),))?;
-            if let PyArithmaticValue::Implemented(x) = PyArithmaticValue::from_object(self, result)
+            if let PyArithmeticValue::Implemented(x) = PyArithmeticValue::from_object(self, result)
             {
                 return Ok(x);
             }
@@ -1505,7 +1529,7 @@ impl VirtualMachine {
                         .is_some()
                     {
                         drop(descr_cls);
-                        let cls = PyLease::into_pyref(obj_cls).into_object();
+                        let cls = PyLease::into_pyref(obj_cls).into();
                         return descr_get(descr, Some(obj), Some(cls), self).map(Some);
                     }
                 }
@@ -1528,7 +1552,7 @@ impl VirtualMachine {
         } else if let Some((attr, descr_get)) = cls_attr {
             match descr_get {
                 Some(descr_get) => {
-                    let cls = PyLease::into_pyref(obj_cls).into_object();
+                    let cls = PyLease::into_pyref(obj_cls).into();
                     descr_get(attr, Some(obj), Some(cls), self).map(Some)
                 }
                 None => Ok(Some(attr)),
@@ -1822,7 +1846,7 @@ impl VirtualMachine {
                 .mro_find_map(|cls| cls.slots.richcompare.load())
                 .unwrap();
             Ok(match cmp(obj, other, op, self)? {
-                Either::A(obj) => PyArithmaticValue::from_object(self, obj).map(Either::A),
+                Either::A(obj) => PyArithmeticValue::from_object(self, obj).map(Either::A),
                 Either::B(arithmetic) => arithmetic.map(Either::B),
             })
         };
@@ -1836,16 +1860,16 @@ impl VirtualMachine {
         if is_strict_subclass {
             let res = call_cmp(w, v, swapped)?;
             checked_reverse_op = true;
-            if let PyArithmaticValue::Implemented(x) = res {
+            if let PyArithmeticValue::Implemented(x) = res {
                 return Ok(x);
             }
         }
-        if let PyArithmaticValue::Implemented(x) = call_cmp(v, w, op)? {
+        if let PyArithmeticValue::Implemented(x) = call_cmp(v, w, op)? {
             return Ok(x);
         }
         if !checked_reverse_op {
             let res = call_cmp(w, v, swapped)?;
-            if let PyArithmaticValue::Implemented(x) = res {
+            if let PyArithmeticValue::Implemented(x) = res {
                 return Ok(x);
             }
         }
@@ -1912,11 +1936,57 @@ impl VirtualMachine {
         })
     }
 
+    pub fn length_hint(&self, iter: PyObjectRef) -> PyResult<Option<usize>> {
+        if let Some(len) = self.obj_len_opt(&iter) {
+            match len {
+                Ok(len) => return Ok(Some(len)),
+                Err(e) => {
+                    if !e.isinstance(&self.ctx.exceptions.type_error) {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        let hint = match self.get_method(iter, "__length_hint__") {
+            Some(hint) => hint?,
+            None => return Ok(None),
+        };
+        let result = match self.invoke(&hint, ()) {
+            Ok(res) => {
+                if res.is(&self.ctx.not_implemented) {
+                    return Ok(None);
+                }
+                res
+            }
+            Err(e) => {
+                return if e.isinstance(&self.ctx.exceptions.type_error) {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            }
+        };
+        let hint = result
+            .payload_if_subclass::<PyInt>(self)
+            .ok_or_else(|| {
+                self.new_type_error(format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    result.class().name()
+                ))
+            })?
+            .try_to_primitive::<isize>(self)?;
+        if hint.is_negative() {
+            Err(self.new_value_error("__length_hint__() should return >= 0".to_owned()))
+        } else {
+            Ok(Some(hint as usize))
+        }
+    }
+
     /// Checks that the multiplication is able to be performed. On Ok returns the
     /// index as a usize for sequences to be able to use immediately.
     pub fn check_repeat_or_memory_error(&self, length: usize, n: isize) -> PyResult<usize> {
         let n = n.to_usize().unwrap_or(0);
-        if n > 0 && length > isize::MAX as usize / n {
+        if n > 0 && length > stdlib::sys::MAXSIZE as usize / n {
             // Empty message is currently used in CPython.
             Err(self.new_memory_error("".to_owned()))
         } else {

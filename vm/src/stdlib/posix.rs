@@ -31,15 +31,14 @@ pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
 pub mod module {
     use crate::{
         builtins::{PyDictRef, PyInt, PyListRef, PyStrRef, PyTupleRef, PyTypeRef},
-        exceptions::IntoPyException,
-        function::OptionalArg,
+        function::{IntoPyException, IntoPyObject, OptionalArg},
         slots::SlotConstructor,
         stdlib::os::{
             errno_err, DirFd, FollowSymlinks, PathOrFd, PyPathLike, SupportFunc, TargetIsDirectory,
             _os, fs_metadata, IOErrorBuilder,
         },
         utils::{Either, ToCString},
-        IntoPyObject, ItemProtocol, PyObjectRef, PyResult, PyValue, TryFromObject, VirtualMachine,
+        ItemProtocol, PyObjectRef, PyResult, PyValue, TryFromObject, VirtualMachine,
     };
     use bitflags::bitflags;
     use nix::fcntl;
@@ -696,8 +695,7 @@ pub mod module {
         Ok(x)
     }
 
-    #[pyfunction]
-    fn chmod(
+    fn _chmod(
         path: PyPathLike,
         dir_fd: DirFd<0>,
         mode: u32,
@@ -720,6 +718,54 @@ pub mod module {
         })
     }
 
+    #[cfg(not(target_os = "redox"))]
+    fn _fchmod(fd: RawFd, mode: u32, vm: &VirtualMachine) -> PyResult<()> {
+        nix::sys::stat::fchmod(
+            fd,
+            nix::sys::stat::Mode::from_bits(mode as libc::mode_t).unwrap(),
+        )
+        .map_err(|err| err.into_pyexception(vm))
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    #[pyfunction]
+    fn chmod(
+        path: PathOrFd,
+        dir_fd: DirFd<0>,
+        mode: u32,
+        follow_symlinks: FollowSymlinks,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        match path {
+            PathOrFd::Path(path) => _chmod(path, dir_fd, mode, follow_symlinks, vm),
+            PathOrFd::Fd(fd) => _fchmod(fd, mode, vm),
+        }
+    }
+
+    #[cfg(target_os = "redox")]
+    #[pyfunction]
+    fn chmod(
+        path: PyPathLike,
+        dir_fd: DirFd<0>,
+        mode: u32,
+        follow_symlinks: FollowSymlinks,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        _chmod(path, dir_fd, mode, follow_symlinks, vm)
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    #[pyfunction]
+    fn fchmod(fd: RawFd, mode: u32, vm: &VirtualMachine) -> PyResult<()> {
+        _fchmod(fd, mode, vm)
+    }
+
+    #[cfg(not(target_os = "redox"))]
+    #[pyfunction]
+    fn lchmod(path: PyPathLike, mode: u32, vm: &VirtualMachine) -> PyResult<()> {
+        _chmod(path, DirFd::default(), mode, FollowSymlinks(false), vm)
+    }
+
     #[pyfunction]
     fn execv(
         path: PyPathLike,
@@ -728,7 +774,7 @@ pub mod module {
     ) -> PyResult<()> {
         let path = path.into_cstring(vm)?;
 
-        let argv = vm.extract_elements_func(argv.as_object(), |obj| {
+        let argv = vm.extract_elements_func(argv.as_ref(), |obj| {
             PyStrRef::try_from_object(vm, obj)?.to_cstring(vm)
         })?;
         let argv: Vec<&CStr> = argv.iter().map(|entry| entry.as_c_str()).collect();
@@ -756,7 +802,7 @@ pub mod module {
     ) -> PyResult<()> {
         let path = path.into_cstring(vm)?;
 
-        let argv = vm.extract_elements_func(argv.as_object(), |obj| {
+        let argv = vm.extract_elements_func(argv.as_ref(), |obj| {
             PyStrRef::try_from_object(vm, obj)?.to_cstring(vm)
         })?;
         let argv: Vec<&CStr> = argv.iter().map(|entry| entry.as_c_str()).collect();
@@ -1049,8 +1095,24 @@ pub mod module {
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
-    fn envp_from_dict(dict: PyDictRef, vm: &VirtualMachine) -> PyResult<Vec<CString>> {
-        dict.into_iter()
+    fn envp_from_dict(
+        env: crate::protocol::PyMapping,
+        vm: &VirtualMachine,
+    ) -> PyResult<Vec<CString>> {
+        let keys = env.keys(vm)?;
+        let values = env.values(vm)?;
+
+        let keys = PyListRef::try_from_object(vm, keys)
+            .map_err(|_| vm.new_type_error("env.keys() is not a list".to_owned()))?
+            .borrow_vec()
+            .to_vec();
+        let values = PyListRef::try_from_object(vm, values)
+            .map_err(|_| vm.new_type_error("env.values() is not a list".to_owned()))?
+            .borrow_vec()
+            .to_vec();
+
+        keys.into_iter()
+            .zip(values.into_iter())
             .map(|(k, v)| {
                 let k = PyPathLike::try_from_object(vm, k)?.into_bytes();
                 let v = PyPathLike::try_from_object(vm, v)?.into_bytes();
@@ -1085,7 +1147,7 @@ pub mod module {
         #[pyarg(positional)]
         args: crate::function::ArgIterable<PyPathLike>,
         #[pyarg(positional)]
-        env: crate::builtins::dict::PyMapping,
+        env: crate::protocol::PyMapping,
         #[pyarg(named, default)]
         file_actions: Option<crate::function::ArgIterable<PyTupleRef>>,
         #[pyarg(named, default)]
@@ -1198,7 +1260,7 @@ pub mod module {
                 .map(|s| s.as_ptr() as _)
                 .chain(std::iter::once(std::ptr::null_mut()))
                 .collect();
-            let mut env = envp_from_dict(self.env.into_dict(), vm)?;
+            let mut env = envp_from_dict(self.env, vm)?;
             let envp: Vec<*mut libc::c_char> = env
                 .iter_mut()
                 .map(|s| s.as_ptr() as _)

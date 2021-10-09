@@ -1,7 +1,7 @@
-pub(crate) use decl::make_module;
+pub(crate) use symtable::make_module;
 
-#[pymodule(name = "symtable")]
-mod decl {
+#[pymodule]
+mod symtable {
     use crate::{
         builtins::PyStrRef,
         compile::{self, Symbol, SymbolScope, SymbolTable, SymbolTableType},
@@ -126,7 +126,7 @@ mod decl {
                             .collect(),
                     })
                     .into_ref(vm)
-                    .into_object()
+                    .into()
                 })
                 .collect();
             Ok(vm.ctx.new_list(symbols))
@@ -243,7 +243,7 @@ mod decl {
             } else {
                 Ok(to_py_symbol_table(self.namespaces.first().unwrap().clone())
                     .into_ref(vm)
-                    .into_object())
+                    .into())
             }
         }
     }

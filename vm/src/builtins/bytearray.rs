@@ -1,9 +1,11 @@
 //! Implementation of the python bytearray object.
-use super::{PyBytes, PyBytesRef, PyDictRef, PyIntRef, PyStrRef, PyTupleRef, PyTypeRef};
+use super::{
+    PositionIterInternal, PyBytes, PyBytesRef, PyDictRef, PyIntRef, PyStrRef, PyTupleRef, PyTypeRef,
+};
 use crate::common::{
     borrow::{BorrowedValue, BorrowedValueMut},
     lock::{
-        PyMappedRwLockReadGuard, PyMappedRwLockWriteGuard, PyRwLock, PyRwLockReadGuard,
+        PyMappedRwLockReadGuard, PyMappedRwLockWriteGuard, PyMutex, PyRwLock, PyRwLockReadGuard,
         PyRwLockWriteGuard,
     },
 };
@@ -14,16 +16,18 @@ use crate::{
         ByteInnerNewOptions, ByteInnerPaddingOptions, ByteInnerSplitOptions,
         ByteInnerTranslateOptions, DecodeArgs, PyBytesInner,
     },
-    function::{ArgBytesLike, ArgIterable, FuncArgs, OptionalArg, OptionalOption},
-    protocol::{BufferInternal, BufferOptions, PyBuffer, PyIterReturn, ResizeGuard},
+    function::{ArgBytesLike, ArgIterable, FuncArgs, IntoPyObject, OptionalArg, OptionalOption},
+    protocol::{
+        BufferInternal, BufferOptions, BufferResizeGuard, PyBuffer, PyIterReturn, PyMappingMethods,
+    },
     sliceable::{PySliceableSequence, PySliceableSequenceMut, SequenceIndex},
     slots::{
-        AsBuffer, Callable, Comparable, Hashable, Iterable, IteratorIterable, PyComparisonOp,
-        SlotIterator, Unhashable,
+        AsBuffer, AsMapping, Callable, Comparable, Hashable, Iterable, IteratorIterable,
+        PyComparisonOp, SlotIterator, Unhashable,
     },
     utils::Either,
-    IdProtocol, IntoPyObject, PyClassDef, PyClassImpl, PyComparisonValue, PyContext, PyObjectRef,
-    PyRef, PyResult, PyValue, TypeProtocol, VirtualMachine,
+    IdProtocol, PyClassDef, PyClassImpl, PyComparisonValue, PyContext, PyObjectRef, PyRef,
+    PyResult, PyValue, TypeProtocol, VirtualMachine,
 };
 use bstr::ByteSlice;
 use crossbeam_utils::atomic::AtomicCell;
@@ -95,7 +99,10 @@ pub(crate) fn init(context: &PyContext) {
     PyByteArrayIterator::extend_class(context, &context.types.bytearray_iterator_type);
 }
 
-#[pyimpl(flags(BASETYPE), with(Hashable, Comparable, AsBuffer, Iterable))]
+#[pyimpl(
+    flags(BASETYPE),
+    with(Hashable, Comparable, AsBuffer, AsMapping, Iterable)
+)]
 impl PyByteArray {
     #[pyslot]
     fn slot_new(cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
@@ -120,8 +127,10 @@ impl PyByteArray {
     }
 
     #[pymethod(magic)]
-    fn repr(&self) -> String {
-        self.inner().repr("bytearray(", ")")
+    fn repr(zelf: PyRef<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+        let class_name = zelf.class().name();
+        let s = zelf.inner().repr(Some(&class_name));
+        Ok(s)
     }
 
     #[pymethod(magic)]
@@ -201,9 +210,9 @@ impl PyByteArray {
     }
 
     #[pymethod(magic)]
-    pub fn delitem(&self, needle: SequenceIndex, vm: &VirtualMachine) -> PyResult<()> {
+    pub fn delitem(&self, needle: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
         let elements = &mut self.try_resizable(vm)?.elements;
-        match needle {
+        match SequenceIndex::try_from_object_for(vm, needle, Self::NAME)? {
             SequenceIndex::Int(int) => {
                 if let Some(idx) = elements.wrap_index(int) {
                     elements.remove(idx);
@@ -629,7 +638,7 @@ impl PyByteArray {
 
     #[pymethod]
     fn decode(zelf: PyRef<Self>, args: DecodeArgs, vm: &VirtualMachine) -> PyResult<PyStrRef> {
-        bytes_decode(zelf.into_object(), args, vm)
+        bytes_decode(zelf.into(), args, vm)
     }
 
     #[pymethod(magic)]
@@ -702,7 +711,7 @@ impl BufferInternal for PyRef<PyByteArray> {
     }
 }
 
-impl<'a> ResizeGuard<'a> for PyByteArray {
+impl<'a> BufferResizeGuard<'a> for PyByteArray {
     type Resizable = PyRwLockWriteGuard<'a, PyBytesInner>;
 
     fn try_resizable(&'a self, vm: &VirtualMachine) -> PyResult<Self::Resizable> {
@@ -716,13 +725,47 @@ impl<'a> ResizeGuard<'a> for PyByteArray {
     }
 }
 
+impl AsMapping for PyByteArray {
+    fn as_mapping(_zelf: &PyRef<Self>, _vm: &VirtualMachine) -> PyResult<PyMappingMethods> {
+        Ok(PyMappingMethods {
+            length: Some(Self::length),
+            subscript: Some(Self::subscript),
+            ass_subscript: Some(Self::ass_subscript),
+        })
+    }
+
+    #[inline]
+    fn length(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
+        Self::downcast_ref(&zelf, vm).map(|zelf| Ok(zelf.len()))?
+    }
+
+    #[inline]
+    fn subscript(zelf: PyObjectRef, needle: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        Self::downcast_ref(&zelf, vm).map(|zelf| zelf.getitem(needle, vm))?
+    }
+
+    #[inline]
+    fn ass_subscript(
+        zelf: PyObjectRef,
+        needle: PyObjectRef,
+        value: Option<PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        match value {
+            Some(value) => {
+                Self::downcast(zelf, vm).map(|zelf| Self::setitem(zelf, needle, value, vm))
+            }
+            None => Self::downcast_ref(&zelf, vm).map(|zelf| zelf.delitem(needle, vm)),
+        }?
+    }
+}
+
 impl Unhashable for PyByteArray {}
 
 impl Iterable for PyByteArray {
     fn iter(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult {
         Ok(PyByteArrayIterator {
-            position: AtomicCell::new(0),
-            bytearray: zelf,
+            internal: PyMutex::new(PositionIterInternal::new(zelf, 0)),
         }
         .into_object(vm))
     }
@@ -735,8 +778,7 @@ impl Iterable for PyByteArray {
 #[pyclass(module = false, name = "bytearray_iterator")]
 #[derive(Debug)]
 pub struct PyByteArrayIterator {
-    position: AtomicCell<usize>,
-    bytearray: PyByteArrayRef,
+    internal: PyMutex<PositionIterInternal<PyByteArrayRef>>,
 }
 
 impl PyValue for PyByteArrayIterator {
@@ -746,16 +788,34 @@ impl PyValue for PyByteArrayIterator {
 }
 
 #[pyimpl(with(SlotIterator))]
-impl PyByteArrayIterator {}
+impl PyByteArrayIterator {
+    #[pymethod(magic)]
+    fn length_hint(&self) -> usize {
+        self.internal.lock().length_hint(|obj| obj.len())
+    }
+    #[pymethod(magic)]
+    fn reduce(&self, vm: &VirtualMachine) -> PyObjectRef {
+        self.internal
+            .lock()
+            .builtins_iter_reduce(|x| x.clone().into(), vm)
+    }
+
+    #[pymethod(magic)]
+    fn setstate(&self, state: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        self.internal
+            .lock()
+            .set_state(state, |obj, pos| pos.min(obj.len()), vm)
+    }
+}
 impl IteratorIterable for PyByteArrayIterator {}
 impl SlotIterator for PyByteArrayIterator {
     fn next(zelf: &PyRef<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
-        let pos = zelf.position.fetch_add(1);
-        let r = if let Some(&ret) = zelf.bytearray.borrow_buf().get(pos) {
-            PyIterReturn::Return(ret.into_pyobject(vm))
-        } else {
-            PyIterReturn::StopIteration(None)
-        };
-        Ok(r)
+        zelf.internal.lock().next(|bytearray, pos| {
+            let buf = bytearray.borrow_buf();
+            Ok(match buf.get(pos) {
+                Some(&x) => PyIterReturn::Return(vm.ctx.new_int(x)),
+                None => PyIterReturn::StopIteration(None),
+            })
+        })
     }
 }

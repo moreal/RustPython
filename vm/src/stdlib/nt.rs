@@ -13,8 +13,7 @@ pub(crate) mod module {
     use crate::{
         builtins::{PyStrRef, PyTupleRef},
         crt_fd::Fd,
-        exceptions::IntoPyException,
-        function::OptionalArg,
+        function::{IntoPyException, OptionalArg},
         stdlib::os::{
             errno_err, DirFd, FollowSymlinks, PyPathLike, SupportFunc, TargetIsDirectory, _os,
             errno,
@@ -240,7 +239,7 @@ pub(crate) mod module {
 
         let path = make_widestring(path.as_str())?;
 
-        let argv = vm.extract_elements_func(argv.as_object(), |obj| {
+        let argv = vm.extract_elements_func(argv.as_ref(), |obj| {
             let arg = PyStrRef::try_from_object(vm, obj)?;
             make_widestring(arg.as_str())
         })?;

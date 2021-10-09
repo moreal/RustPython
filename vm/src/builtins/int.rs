@@ -1,13 +1,13 @@
-use super::{float, IntoPyBool, PyByteArray, PyBytes, PyStr, PyStrRef, PyTypeRef};
+use super::{float, PyByteArray, PyBytes, PyStr, PyStrRef, PyTypeRef};
 use crate::{
     bytesinner::PyBytesInner,
     common::hash,
     format::FormatSpec,
-    function::{OptionalArg, OptionalOption},
+    function::{ArgIntoBool, IntoPyObject, IntoPyResult, OptionalArg, OptionalOption},
     slots::{Comparable, Hashable, PyComparisonOp, SlotConstructor},
-    try_value_from_borrowed_object, IdProtocol, IntoPyObject, IntoPyResult, PyArithmaticValue,
-    PyClassImpl, PyComparisonValue, PyContext, PyObjectRef, PyRef, PyResult, PyValue,
-    TryFromBorrowedObject, TypeProtocol, VirtualMachine,
+    try_value_from_borrowed_object, IdProtocol, PyArithmeticValue, PyClassImpl, PyComparisonValue,
+    PyContext, PyObjectRef, PyRef, PyResult, PyValue, TryFromBorrowedObject, TypeProtocol,
+    VirtualMachine,
 };
 use bstr::ByteSlice;
 use num_bigint::{BigInt, BigUint, Sign};
@@ -78,26 +78,14 @@ macro_rules! impl_into_pyobject_int {
     )*};
 }
 
-impl_into_pyobject_int!(isize i8 i16 i32 i64 usize u8 u16 u32 u64 BigInt);
-
-pub(crate) fn try_to_primitive<'a, I>(i: &'a BigInt, vm: &VirtualMachine) -> PyResult<I>
-where
-    I: PrimInt + TryFrom<&'a BigInt>,
-{
-    I::try_from(i).map_err(|_| {
-        vm.new_overflow_error(format!(
-            "Python int too large to convert to Rust {}",
-            std::any::type_name::<I>()
-        ))
-    })
-}
+impl_into_pyobject_int!(isize i8 i16 i32 i64 i128 usize u8 u16 u32 u64 u128 BigInt);
 
 macro_rules! impl_try_from_object_int {
     ($(($t:ty, $to_prim:ident),)*) => {$(
         impl TryFromBorrowedObject for $t {
             fn try_from_borrowed_object(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Self> {
                 try_value_from_borrowed_object(vm, obj, |int: &PyInt| {
-                    try_to_primitive(int.as_bigint(), vm)
+                    int.try_to_primitive(vm)
                 })
             }
         }
@@ -110,18 +98,14 @@ impl_try_from_object_int!(
     (i16, to_i16),
     (i32, to_i32),
     (i64, to_i64),
+    (i128, to_i128),
     (usize, to_usize),
     (u8, to_u8),
     (u16, to_u16),
     (u32, to_u32),
     (u64, to_u64),
+    (u128, to_u128),
 );
-
-impl TryFromBorrowedObject for BigInt {
-    fn try_from_borrowed_object(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Self> {
-        try_value_from_borrowed_object(vm, obj, |int: &PyInt| Ok(int.as_bigint().clone()))
-    }
-}
 
 fn inner_pow(int1: &BigInt, int2: &BigInt, vm: &VirtualMachine) -> PyResult {
     if int2.is_negative() {
@@ -306,18 +290,23 @@ impl PyInt {
     where
         I: PrimInt + TryFrom<&'a BigInt>,
     {
-        try_to_primitive(self.as_bigint(), vm)
+        I::try_from(self.as_bigint()).map_err(|_| {
+            vm.new_overflow_error(format!(
+                "Python int too large to convert to Rust {}",
+                std::any::type_name::<I>()
+            ))
+        })
     }
 
     #[inline]
-    fn int_op<F>(&self, other: PyObjectRef, op: F, vm: &VirtualMachine) -> PyArithmaticValue<BigInt>
+    fn int_op<F>(&self, other: PyObjectRef, op: F, vm: &VirtualMachine) -> PyArithmeticValue<BigInt>
     where
         F: Fn(&BigInt, &BigInt) -> BigInt,
     {
         let r = other
             .payload_if_subclass::<PyInt>(vm)
             .map(|other| op(&self.value, &other.value));
-        PyArithmaticValue::from_option(r)
+        PyArithmeticValue::from_option(r)
     }
 
     #[inline]
@@ -337,23 +326,23 @@ impl PyInt {
 impl PyInt {
     #[pymethod(name = "__radd__")]
     #[pymethod(magic)]
-    fn add(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmaticValue<BigInt> {
+    fn add(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmeticValue<BigInt> {
         self.int_op(other, |a, b| a + b, vm)
     }
 
     #[pymethod(magic)]
-    fn sub(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmaticValue<BigInt> {
+    fn sub(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmeticValue<BigInt> {
         self.int_op(other, |a, b| a - b, vm)
     }
 
     #[pymethod(magic)]
-    fn rsub(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmaticValue<BigInt> {
+    fn rsub(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmeticValue<BigInt> {
         self.int_op(other, |a, b| b - a, vm)
     }
 
     #[pymethod(name = "__rmul__")]
     #[pymethod(magic)]
-    fn mul(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmaticValue<BigInt> {
+    fn mul(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmeticValue<BigInt> {
         self.int_op(other, |a, b| a * b, vm)
     }
 
@@ -399,19 +388,19 @@ impl PyInt {
 
     #[pymethod(name = "__rxor__")]
     #[pymethod(magic)]
-    pub fn xor(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmaticValue<BigInt> {
+    pub fn xor(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmeticValue<BigInt> {
         self.int_op(other, |a, b| a ^ b, vm)
     }
 
     #[pymethod(name = "__ror__")]
     #[pymethod(magic)]
-    pub fn or(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmaticValue<BigInt> {
+    pub fn or(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmeticValue<BigInt> {
         self.int_op(other, |a, b| a | b, vm)
     }
 
     #[pymethod(name = "__rand__")]
     #[pymethod(magic)]
-    pub fn and(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmaticValue<BigInt> {
+    pub fn and(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyArithmeticValue<BigInt> {
         self.int_op(other, |a, b| a & b, vm)
     }
 
@@ -657,9 +646,7 @@ impl PyInt {
             return Err(vm.new_overflow_error("can't convert negative int to unsigned".to_owned()));
         }
 
-        let byte_len = args.length.as_bigint().to_usize().ok_or_else(|| {
-            vm.new_overflow_error("Python int too large to convert to C ssize_t".to_owned())
-        })?;
+        let byte_len = args.length.try_to_primitive(vm)?;
 
         let mut origin_bytes = match (args.byteorder.as_str(), signed) {
             ("big", true) => value.to_signed_bytes_be(),
@@ -765,7 +752,7 @@ struct IntFromByteArgs {
     bytes: PyBytesInner,
     byteorder: PyStrRef,
     #[pyarg(named, optional)]
-    signed: OptionalArg<IntoPyBool>,
+    signed: OptionalArg<ArgIntoBool>,
 }
 
 #[derive(FromArgs)]
@@ -773,7 +760,7 @@ struct IntToByteArgs {
     length: PyIntRef,
     byteorder: PyStrRef,
     #[pyarg(named, optional)]
-    signed: OptionalArg<IntoPyBool>,
+    signed: OptionalArg<ArgIntoBool>,
 }
 
 fn try_int_radix(obj: &PyObjectRef, base: u32, vm: &VirtualMachine) -> PyResult<BigInt> {

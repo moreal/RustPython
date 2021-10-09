@@ -2,10 +2,10 @@ use super::{try_bigint_to_f64, PyBytes, PyInt, PyIntRef, PyStr, PyStrRef, PyType
 use crate::common::{float_ops, hash};
 use crate::{
     format::FormatSpec,
-    function::{OptionalArg, OptionalOption},
+    function::{IntoPyObject, OptionalArg, OptionalOption},
     slots::{Comparable, Hashable, PyComparisonOp, SlotConstructor},
-    IdProtocol, IntoPyObject,
-    PyArithmaticValue::{self, *},
+    IdProtocol,
+    PyArithmeticValue::{self, *},
     PyClassImpl, PyComparisonValue, PyContext, PyObjectRef, PyRef, PyResult, PyValue,
     TryFromObject, TypeProtocol, VirtualMachine,
 };
@@ -165,7 +165,7 @@ impl SlotConstructor for PyFloat {
             OptionalArg::Present(val) => {
                 let val = if cls.is(&vm.ctx.types.float_type) {
                     match val.downcast_exact::<PyFloat>(vm) {
-                        Ok(f) => return Ok(f.into_object()),
+                        Ok(f) => return Ok(f.into()),
                         Err(val) => val,
                     }
                 } else {
@@ -220,7 +220,7 @@ impl PyFloat {
         other: PyObjectRef,
         op: F,
         vm: &VirtualMachine,
-    ) -> PyResult<PyArithmaticValue<f64>>
+    ) -> PyResult<PyArithmeticValue<f64>>
     where
         F: Fn(f64, f64) -> PyResult<f64>,
     {
@@ -247,7 +247,7 @@ impl PyFloat {
         other: PyObjectRef,
         op: F,
         vm: &VirtualMachine,
-    ) -> PyResult<PyArithmaticValue<(f64, f64)>>
+    ) -> PyResult<PyArithmeticValue<(f64, f64)>>
     where
         F: Fn(f64, f64) -> PyResult<(f64, f64)>,
     {
@@ -259,7 +259,7 @@ impl PyFloat {
 
     #[pymethod(name = "__radd__")]
     #[pymethod(magic)]
-    fn add(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmaticValue<f64>> {
+    fn add(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmeticValue<f64>> {
         self.simple_op(other, |a, b| Ok(a + b), vm)
     }
 
@@ -273,7 +273,7 @@ impl PyFloat {
         &self,
         other: PyObjectRef,
         vm: &VirtualMachine,
-    ) -> PyResult<PyArithmaticValue<(f64, f64)>> {
+    ) -> PyResult<PyArithmeticValue<(f64, f64)>> {
         self.tuple_op(other, |a, b| inner_divmod(a, b, vm), vm)
     }
 
@@ -282,7 +282,7 @@ impl PyFloat {
         &self,
         other: PyObjectRef,
         vm: &VirtualMachine,
-    ) -> PyResult<PyArithmaticValue<(f64, f64)>> {
+    ) -> PyResult<PyArithmeticValue<(f64, f64)>> {
         self.tuple_op(other, |a, b| inner_divmod(b, a, vm), vm)
     }
 
@@ -291,7 +291,7 @@ impl PyFloat {
         &self,
         other: PyObjectRef,
         vm: &VirtualMachine,
-    ) -> PyResult<PyArithmaticValue<f64>> {
+    ) -> PyResult<PyArithmeticValue<f64>> {
         self.simple_op(other, |a, b| inner_floordiv(a, b, vm), vm)
     }
 
@@ -300,17 +300,17 @@ impl PyFloat {
         &self,
         other: PyObjectRef,
         vm: &VirtualMachine,
-    ) -> PyResult<PyArithmaticValue<f64>> {
+    ) -> PyResult<PyArithmeticValue<f64>> {
         self.simple_op(other, |a, b| inner_floordiv(b, a, vm), vm)
     }
 
     #[pymethod(name = "__mod__")]
-    fn mod_(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmaticValue<f64>> {
+    fn mod_(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmeticValue<f64>> {
         self.simple_op(other, |a, b| inner_mod(a, b, vm), vm)
     }
 
     #[pymethod(magic)]
-    fn rmod(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmaticValue<f64>> {
+    fn rmod(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmeticValue<f64>> {
         self.simple_op(other, |a, b| inner_mod(b, a, vm), vm)
     }
 
@@ -344,12 +344,12 @@ impl PyFloat {
     }
 
     #[pymethod(magic)]
-    fn sub(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmaticValue<f64>> {
+    fn sub(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmeticValue<f64>> {
         self.simple_op(other, |a, b| Ok(a - b), vm)
     }
 
     #[pymethod(magic)]
-    fn rsub(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmaticValue<f64>> {
+    fn rsub(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmeticValue<f64>> {
         self.simple_op(other, |a, b| Ok(b - a), vm)
     }
 
@@ -359,7 +359,7 @@ impl PyFloat {
     }
 
     #[pymethod(magic)]
-    fn truediv(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmaticValue<f64>> {
+    fn truediv(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmeticValue<f64>> {
         self.simple_op(other, |a, b| inner_div(a, b, vm), vm)
     }
 
@@ -368,13 +368,13 @@ impl PyFloat {
         &self,
         other: PyObjectRef,
         vm: &VirtualMachine,
-    ) -> PyResult<PyArithmaticValue<f64>> {
+    ) -> PyResult<PyArithmeticValue<f64>> {
         self.simple_op(other, |a, b| inner_div(b, a, vm), vm)
     }
 
     #[pymethod(name = "__rmul__")]
     #[pymethod(magic)]
-    fn mul(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmaticValue<f64>> {
+    fn mul(&self, other: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyArithmeticValue<f64>> {
         self.simple_op(other, |a, b| Ok(a * b), vm)
     }
 
@@ -543,33 +543,6 @@ pub type PyFloatRef = PyRef<PyFloat>;
 // Retrieve inner float value:
 pub(crate) fn get_value(obj: &PyObjectRef) -> f64 {
     obj.payload::<PyFloat>().unwrap().value
-}
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-#[repr(transparent)]
-pub struct IntoPyFloat {
-    value: f64,
-}
-
-impl IntoPyFloat {
-    pub fn to_f64(self) -> f64 {
-        self.value
-    }
-
-    pub fn vec_into_f64(v: Vec<Self>) -> Vec<f64> {
-        // TODO: Vec::into_raw_parts once stabilized
-        let mut v = std::mem::ManuallyDrop::new(v);
-        let (p, l, c) = (v.as_mut_ptr(), v.len(), v.capacity());
-        // SAFETY: IntoPyFloat is repr(transparent) over f64
-        unsafe { Vec::from_raw_parts(p.cast(), l, c) }
-    }
-}
-
-impl TryFromObject for IntoPyFloat {
-    fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
-        let value = try_float(&obj, vm)?;
-        Ok(IntoPyFloat { value })
-    }
 }
 
 #[rustfmt::skip] // to avoid line splitting

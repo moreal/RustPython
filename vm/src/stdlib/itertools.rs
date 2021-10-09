@@ -8,11 +8,11 @@ mod decl {
     };
     use crate::{
         builtins::{int, PyInt, PyIntRef, PyTupleRef, PyTypeRef},
-        function::{ArgCallable, FuncArgs, OptionalArg, OptionalOption, PosArgs},
+        function::{ArgCallable, FuncArgs, IntoPyObject, OptionalArg, OptionalOption, PosArgs},
         protocol::{PyIter, PyIterReturn},
         slots::{IteratorIterable, SlotConstructor, SlotIterator},
-        IdProtocol, IntoPyObject, PyObjectRef, PyRef, PyResult, PyValue, PyWeakRef, TypeProtocol,
-        VirtualMachine,
+        stdlib::sys,
+        IdProtocol, PyObjectRef, PyRef, PyResult, PyValue, PyWeakRef, TypeProtocol, VirtualMachine,
     };
     use crossbeam_utils::atomic::AtomicCell;
     use num_bigint::BigInt;
@@ -268,10 +268,7 @@ mod decl {
         ) -> PyResult {
             let times = match times.into_option() {
                 Some(int) => {
-                    let val = int.as_bigint();
-                    if *val > BigInt::from(isize::MAX) {
-                        return Err(vm.new_overflow_error("Cannot fit in isize.".to_owned()));
-                    }
+                    let val: isize = int.try_to_primitive(vm)?;
                     // times always >= 0.
                     Some(PyRwLock::new(val.to_usize().unwrap_or(0)))
                 }
@@ -338,7 +335,7 @@ mod decl {
     #[derive(Debug, PyValue)]
     struct PyItertoolsStarmap {
         function: PyObjectRef,
-        iter: PyIter,
+        iterable: PyIter,
     }
 
     #[derive(FromArgs)]
@@ -357,8 +354,7 @@ mod decl {
             Self::Args { function, iterable }: Self::Args,
             vm: &VirtualMachine,
         ) -> PyResult {
-            let iter = iterable;
-            PyItertoolsStarmap { function, iter }.into_pyresult_with_type(vm, cls)
+            PyItertoolsStarmap { function, iterable }.into_pyresult_with_type(vm, cls)
         }
     }
 
@@ -367,11 +363,11 @@ mod decl {
     impl IteratorIterable for PyItertoolsStarmap {}
     impl SlotIterator for PyItertoolsStarmap {
         fn next(zelf: &PyRef<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
-            let obj = zelf.iter.next(vm)?;
+            let obj = zelf.iterable.next(vm)?;
             let function = &zelf.function;
             match obj {
                 PyIterReturn::Return(obj) => {
-                    PyIterReturn::from_result(vm.invoke(function, vm.extract_elements(&obj)?), vm)
+                    PyIterReturn::from_pyresult(vm.invoke(function, vm.extract_elements(&obj)?), vm)
                 }
                 PyIterReturn::StopIteration(v) => Ok(PyIterReturn::StopIteration(v)),
             }
@@ -496,7 +492,7 @@ mod decl {
                         }
                     };
                     let pred = predicate.clone();
-                    let pred_value = vm.invoke(&pred.into_object(), (obj.clone(),))?;
+                    let pred_value = vm.invoke(&pred, (obj.clone(),))?;
                     if !pred_value.try_to_bool(vm)? {
                         zelf.start_flag.store(true);
                         return Ok(PyIterReturn::Return(obj));
@@ -706,7 +702,7 @@ mod decl {
         step: usize,
     }
 
-    // Restrict obj to ints with value 0 <= val <= sys.maxsize (isize::MAX).
+    // Restrict obj to ints with value 0 <= val <= sys.maxsize
     // On failure (out of range, non-int object) a ValueError is raised.
     fn pyobject_to_opt_usize(
         obj: PyObjectRef,
@@ -717,13 +713,13 @@ mod decl {
         if is_int {
             let value = int::get_value(&obj).to_usize();
             if let Some(value) = value {
-                // Only succeeds for values for which 0 <= value <= isize::MAX
-                if value <= isize::MAX as usize {
+                // Only succeeds for values for which 0 <= value <= sys.maxsize
+                if value <= sys::MAXSIZE as usize {
                     return Ok(value);
                 }
             }
         }
-        // We don't have an int or value was < 0 or > maxsize (isize::MAX)
+        // We don't have an int or value was < 0 or > sys.maxsize
         return Err(vm.new_value_error(format!(
             "{} argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.",
             name
@@ -1021,7 +1017,7 @@ mod decl {
                 tee_vec.push(vm.call_method(&copyable, "__copy__", ())?);
             }
 
-            Ok(PyTupleRef::with_elements(tee_vec, &vm.ctx).into_object())
+            Ok(PyTupleRef::with_elements(tee_vec, &vm.ctx).into())
         }
     }
 
@@ -1037,17 +1033,15 @@ mod decl {
                 index: AtomicCell::new(0),
             }
             .into_ref_with_type(vm, class.clone())?
-            .into_object())
+            .into())
         }
 
         #[pymethod(magic)]
-        fn copy(&self, vm: &VirtualMachine) -> PyResult {
-            Ok(PyItertoolsTee {
+        fn copy(&self) -> Self {
+            Self {
                 tee_data: PyRc::clone(&self.tee_data),
                 index: AtomicCell::new(self.index.load()),
             }
-            .into_ref_with_type(vm, Self::class(vm).clone())?
-            .into_object())
         }
     }
     impl IteratorIterable for PyItertoolsTee {}

@@ -19,7 +19,7 @@ use std::{env, mem, path};
 /*
  * The magic sys module.
  */
-const MAXSIZE: usize = isize::MAX as usize;
+pub(crate) const MAXSIZE: isize = isize::MAX;
 const MAXUNICODE: u32 = std::char::MAX as u32;
 
 fn argv(vm: &VirtualMachine) -> PyObjectRef {
@@ -265,7 +265,7 @@ fn sys_displayhook(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
     // set to none to avoid recursion while printing
     vm.set_attr(&vm.builtins, "_", vm.ctx.none())?;
     // TODO: catch encoding errors
-    let repr = vm.to_repr(&obj)?.into_object();
+    let repr = vm.to_repr(&obj)?.into();
     builtins::print(PosArgs::new(vec![repr]), Default::default(), vm)?;
     vm.set_attr(&vm.builtins, "_", obj)?;
     Ok(())
@@ -655,6 +655,7 @@ settrace() -- set the global debug tracing function
     let base_prefix = option_env!("RUSTPYTHON_BASEPREFIX").unwrap_or(prefix);
     let exec_prefix = option_env!("RUSTPYTHON_EXECPREFIX").unwrap_or(prefix);
     let base_exec_prefix = option_env!("RUSTPYTHON_BASEEXECPREFIX").unwrap_or(exec_prefix);
+    let platlibdir = option_env!("RUSTPYTHON_PLATLIBDIR").unwrap_or("lib");
 
     extend_module!(vm, module, {
       "__name__" => ctx.new_ascii_literal(ascii!("sys")),
@@ -702,6 +703,7 @@ settrace() -- set the global debug tracing function
       "base_prefix" => ctx.new_utf8_str(base_prefix),
       "exec_prefix" => ctx.new_utf8_str(exec_prefix),
       "base_exec_prefix" => ctx.new_utf8_str(base_exec_prefix),
+      "platlibdir" => ctx.new_utf8_str(platlibdir),
       "exit" => named_function!(ctx, sys, exit),
       "abiflags" => ctx.new_utf8_str(ABIFLAGS.to_owned()),
       "audit" => named_function!(ctx, sys, audit),

@@ -12,24 +12,28 @@ mod array {
     };
     use crate::vm::{
         builtins::{
-            IntoPyFloat, PyByteArray, PyBytes, PyBytesRef, PyIntRef, PyList, PyListRef, PySliceRef,
-            PyStr, PyStrRef, PyTypeRef,
+            PyByteArray, PyBytes, PyBytesRef, PyIntRef, PyList, PyListRef, PySliceRef, PyStr,
+            PyStrRef, PyTypeRef,
         },
         class_or_notimplemented,
-        function::{ArgBytesLike, ArgIterable, OptionalArg},
-        protocol::{BufferInternal, BufferOptions, PyBuffer, PyIterReturn, ResizeGuard},
+        function::{
+            ArgBytesLike, ArgIntoFloat, ArgIterable, IntoPyObject, IntoPyResult, OptionalArg,
+        },
+        protocol::{
+            BufferInternal, BufferOptions, BufferResizeGuard, PyBuffer, PyIterReturn,
+            PyMappingMethods,
+        },
         sliceable::{saturate_index, PySliceableSequence, PySliceableSequenceMut, SequenceIndex},
         slots::{
-            AsBuffer, Comparable, Iterable, IteratorIterable, PyComparisonOp, SlotConstructor,
-            SlotIterator,
+            AsBuffer, AsMapping, Comparable, Iterable, IteratorIterable, PyComparisonOp,
+            SlotConstructor, SlotIterator,
         },
-        IdProtocol, IntoPyObject, IntoPyResult, PyComparisonValue, PyObjectRef, PyRef, PyResult,
-        PyValue, TryFromObject, TypeProtocol, VirtualMachine,
+        IdProtocol, PyComparisonValue, PyObjectRef, PyRef, PyResult, PyValue, TryFromObject,
+        TypeProtocol, VirtualMachine,
     };
     use crossbeam_utils::atomic::AtomicCell;
     use itertools::Itertools;
     use lexical_core::Integer;
-    use num_traits::ToPrimitive;
     use std::cmp::Ordering;
     use std::convert::{TryFrom, TryInto};
     use std::{fmt, os::raw};
@@ -424,14 +428,14 @@ mod array {
                     }
                 }
 
-                fn repr(&self, _vm: &VirtualMachine) -> PyResult<String> {
+                fn repr(&self, class_name: &str, _vm: &VirtualMachine) -> PyResult<String> {
                     // we don't need ReprGuard here
                     let s = match self {
                         $(ArrayContentType::$n(v) => {
                             if v.is_empty() {
-                                format!("array('{}')", $c)
+                                format!("{}('{}')", class_name, $c)
                             } else {
-                                format!("array('{}', [{}])", $c, v.iter().format(", "))
+                                format!("{}('{}', [{}])", class_name, $c, v.iter().format(", "))
                             }
                         })*
                     };
@@ -519,11 +523,11 @@ mod array {
     }
 
     fn f32_try_into_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<f32> {
-        IntoPyFloat::try_from_object(vm, obj).map(|x| x.to_f64() as f32)
+        ArgIntoFloat::try_from_object(vm, obj).map(|x| x.to_f64() as f32)
     }
 
     fn f64_try_into_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<f64> {
-        IntoPyFloat::try_from_object(vm, obj).map(|x| x.to_f64())
+        ArgIntoFloat::try_from_object(vm, obj).map(|x| x.to_f64())
     }
 
     impl ArrayElement for WideChar {
@@ -661,11 +665,14 @@ mod array {
             }
 
             let zelf = Self::from(array).into_ref_with_type(vm, cls)?;
-            Ok(zelf.into_object())
+            Ok(zelf.into())
         }
     }
 
-    #[pyimpl(flags(BASETYPE), with(Comparable, AsBuffer, Iterable, SlotConstructor))]
+    #[pyimpl(
+        flags(BASETYPE),
+        with(Comparable, AsBuffer, AsMapping, Iterable, SlotConstructor)
+    )]
     impl PyArray {
         fn read(&self) -> PyRwLockReadGuard<'_, ArrayContentType> {
             self.array.read()
@@ -1002,46 +1009,45 @@ mod array {
         ) -> PyResult<PyRef<Self>> {
             if zelf.is(&other) {
                 zelf.try_resizable(vm)?.imul(2);
-                Ok(zelf)
             } else if let Some(other) = other.payload::<PyArray>() {
-                let result = zelf.try_resizable(vm)?.iadd(&*other.read(), vm);
-                result.map(|_| zelf)
+                zelf.try_resizable(vm)?.iadd(&*other.read(), vm)?;
             } else {
-                Err(vm.new_type_error(format!(
+                return Err(vm.new_type_error(format!(
                     "can only extend array with array (not \"{}\")",
                     other.class().name()
-                )))
+                )));
             }
+            Ok(zelf)
         }
 
         #[pymethod(name = "__rmul__")]
         #[pymethod(magic)]
         fn mul(&self, value: isize, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
-            vm.check_repeat_or_memory_error(self.len(), value)
-                .map(|value| PyArray::from(self.read().mul(value)).into_ref(vm))
+            let value = vm.check_repeat_or_memory_error(self.len(), value)?;
+            Ok(Self::from(self.read().mul(value)).into_ref(vm))
         }
 
         #[pymethod(magic)]
         fn imul(zelf: PyRef<Self>, value: isize, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
-            vm.check_repeat_or_memory_error(zelf.len(), value)
-                .and_then(|value| {
-                    zelf.try_resizable(vm)?.imul(value);
-                    Ok(zelf)
-                })
+            let value = vm.check_repeat_or_memory_error(zelf.len(), value)?;
+            zelf.try_resizable(vm)?.imul(value);
+            Ok(zelf)
         }
 
         #[pymethod(magic)]
         fn repr(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<String> {
+            let class_name = zelf.class().name();
             if zelf.read().typecode() == 'u' {
                 if zelf.len() == 0 {
-                    return Ok("array('u')".into());
+                    return Ok(format!("{}('u')", class_name));
                 }
                 return Ok(format!(
-                    "array('u', {})",
+                    "{}('u', {})",
+                    class_name,
                     PyStr::from(zelf.tounicode(vm)?).repr(vm)?
                 ));
             }
-            zelf.read().repr(vm)
+            zelf.read().repr(&class_name, vm)
         }
 
         #[pymethod(magic)]
@@ -1161,6 +1167,38 @@ mod array {
         }
     }
 
+    impl AsMapping for PyArray {
+        fn as_mapping(_zelf: &PyRef<Self>, _vm: &VirtualMachine) -> PyResult<PyMappingMethods> {
+            Ok(PyMappingMethods {
+                length: Some(Self::length),
+                subscript: Some(Self::subscript),
+                ass_subscript: Some(Self::ass_subscript),
+            })
+        }
+
+        fn length(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
+            Self::downcast_ref(&zelf, vm).map(|zelf| Ok(zelf.len()))?
+        }
+
+        fn subscript(zelf: PyObjectRef, needle: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+            Self::downcast_ref(&zelf, vm).map(|zelf| zelf.getitem(needle, vm))?
+        }
+
+        fn ass_subscript(
+            zelf: PyObjectRef,
+            needle: PyObjectRef,
+            value: Option<PyObjectRef>,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            match value {
+                Some(value) => {
+                    Self::downcast(zelf, vm).map(|zelf| Self::setitem(zelf, needle, value, vm))?
+                }
+                None => Self::downcast(zelf, vm).map(|zelf| Self::delitem(zelf, needle, vm))?,
+            }
+        }
+    }
+
     impl Iterable for PyArray {
         fn iter(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult {
             Ok(PyArrayIter {
@@ -1171,7 +1209,7 @@ mod array {
         }
     }
 
-    impl<'a> ResizeGuard<'a> for PyArray {
+    impl<'a> BufferResizeGuard<'a> for PyArray {
         type Resizable = PyRwLockWriteGuard<'a, ArrayContentType>;
 
         fn try_resizable(&'a self, vm: &VirtualMachine) -> PyResult<Self::Resizable> {
@@ -1284,11 +1322,7 @@ mod array {
                         obj.class().name()
                     ))
                 })?
-                .as_bigint()
-                .to_i32()
-                .ok_or_else(|| {
-                    vm.new_overflow_error("Python int too large to convert to C int".into())
-                })?
+                .try_to_primitive::<i32>(vm)?
                 .try_u8_or_max()
                 .try_into()
                 .map_err(|_| {

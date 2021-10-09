@@ -5,8 +5,6 @@ use super::{
     tuple::PyTupleTyped, PyAsyncGen, PyCode, PyCoroutine, PyDictRef, PyGenerator, PyStrRef,
     PyTupleRef, PyTypeRef,
 };
-#[cfg(feature = "jit")]
-use crate::IntoPyObject;
 use crate::{
     bytecode,
     common::lock::PyMutex,
@@ -17,9 +15,9 @@ use crate::{
     IdProtocol, ItemProtocol, PyClassImpl, PyComparisonValue, PyContext, PyObjectRef, PyRef,
     PyResult, PyValue, TypeProtocol, VirtualMachine,
 };
-use itertools::Itertools;
 #[cfg(feature = "jit")]
-use rustpython_common::lock::OnceCell;
+use crate::{common::lock::OnceCell, function::IntoPyObject};
+use itertools::Itertools;
 #[cfg(feature = "jit")]
 use rustpython_jit::CompiledCode;
 use rustpython_vm::builtins::PyStr;
@@ -30,12 +28,12 @@ pub type PyFunctionRef = PyRef<PyFunction>;
 #[derive(Debug)]
 pub struct PyFunction {
     code: PyRef<PyCode>,
-    #[cfg(feature = "jit")]
-    jitted_code: OnceCell<CompiledCode>,
     globals: PyDictRef,
     closure: Option<PyTupleTyped<PyCellRef>>,
     defaults_and_kwdefaults: PyMutex<(Option<PyTupleRef>, Option<PyDictRef>)>,
     name: PyMutex<PyStrRef>,
+    #[cfg(feature = "jit")]
+    jitted_code: OnceCell<CompiledCode>,
 }
 
 impl PyFunction {
@@ -49,12 +47,12 @@ impl PyFunction {
         let name = PyMutex::new(code.obj_name.clone());
         PyFunction {
             code,
-            #[cfg(feature = "jit")]
-            jitted_code: OnceCell::new(),
             globals,
             closure,
             defaults_and_kwdefaults: PyMutex::new((defaults, kw_only_defaults)),
             name,
+            #[cfg(feature = "jit")]
+            jitted_code: OnceCell::new(),
         }
     }
 
@@ -109,7 +107,7 @@ impl PyFunction {
         // Do we support `**kwargs` ?
         let kwargs = if code.flags.contains(bytecode::CodeFlags::HAS_VARKEYWORDS) {
             let d = vm.ctx.new_dict();
-            fastlocals[vararg_offset] = Some(d.clone().into_object());
+            fastlocals[vararg_offset] = Some(d.clone().into());
             Some(d)
         } else {
             None
@@ -317,6 +315,7 @@ impl PyFunction {
         }
     }
 
+    #[inline(always)]
     pub fn invoke(&self, func_args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         self.invoke_with_locals(func_args, None, vm)
     }
@@ -406,11 +405,12 @@ impl SlotDescriptor for PyFunction {
         vm: &VirtualMachine,
     ) -> PyResult {
         let (zelf, obj) = Self::_unwrap(zelf, obj, vm)?;
-        if vm.is_none(&obj) && !Self::_cls_is(&cls, &obj.class()) {
-            Ok(zelf.into_object())
+        let obj = if vm.is_none(&obj) && !Self::_cls_is(&cls, &obj.class()) {
+            zelf.into()
         } else {
-            Ok(vm.ctx.new_bound_method(zelf.into_object(), obj))
-        }
+            vm.ctx.new_bound_method(zelf.into(), obj)
+        };
+        Ok(obj)
     }
 }
 
@@ -454,7 +454,7 @@ impl Comparable for PyBoundMethod {
 impl SlotGetattro for PyBoundMethod {
     fn getattro(zelf: PyRef<Self>, name: PyStrRef, vm: &VirtualMachine) -> PyResult {
         if let Some(obj) = zelf.get_class_attr(name.as_str()) {
-            return vm.call_if_get_descriptor(obj, zelf.into_object());
+            return vm.call_if_get_descriptor(obj, zelf.into());
         }
         vm.get_attribute(zelf.function.clone(), name)
     }

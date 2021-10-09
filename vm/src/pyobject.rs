@@ -3,9 +3,8 @@ use crate::common::{
     rc::PyRc,
     static_cell,
 };
-pub use crate::pyobjectrc::{PyObject, PyObjectRef, PyObjectWeak, PyRef, PyWeakRef};
+pub use crate::pyobjectrc::{PyObject, PyObjectRef, PyObjectWeak, PyObjectWrap, PyRef, PyWeakRef};
 use crate::{
-    builtins::PyBaseExceptionRef,
     builtins::{
         builtinfunc::PyNativeFuncDef,
         bytearray, bytes,
@@ -14,12 +13,14 @@ use crate::{
         namespace::PyNamespace,
         object, pystr,
         set::{self, PyFrozenSet},
-        PyBoundMethod, PyComplex, PyDict, PyDictRef, PyEllipsis, PyFloat, PyInt, PyIntRef, PyList,
-        PyNone, PyNotImplemented, PyStaticMethod, PyTuple, PyTupleRef, PyType, PyTypeRef,
+        PyBaseExceptionRef, PyBoundMethod, PyComplex, PyDict, PyDictRef, PyEllipsis, PyFloat,
+        PyInt, PyIntRef, PyList, PyNone, PyNotImplemented, PyStaticMethod, PyTuple, PyTupleRef,
+        PyType, PyTypeRef,
     },
     dictdatatype::Dict,
     exceptions,
-    function::{IntoFuncArgs, IntoPyNativeFunc},
+    function::{IntoFuncArgs, IntoPyNativeFunc, IntoPyObject, IntoPyResult},
+    protocol::PyMapping,
     slots::{PyTypeFlags, PyTypeSlots},
     types::{create_type_with_slots, TypeZoo},
     VirtualMachine,
@@ -119,7 +120,7 @@ impl PyContext {
             PyNativeFuncDef::new(PyType::__new__.into_func(), new_str).into_function(),
             &types.builtin_function_or_method_type,
         )
-        .into_object();
+        .into();
 
         let context = PyContext {
             true_value,
@@ -148,15 +149,15 @@ impl PyContext {
     }
 
     pub fn none(&self) -> PyObjectRef {
-        self.none.clone().into_object()
+        self.none.clone().into()
     }
 
     pub fn ellipsis(&self) -> PyObjectRef {
-        self.ellipsis.clone().into_object()
+        self.ellipsis.clone().into()
     }
 
     pub fn not_implemented(&self) -> PyObjectRef {
-        self.not_implemented.clone().into_object()
+        self.not_implemented.clone().into()
     }
 
     #[inline]
@@ -234,11 +235,11 @@ impl PyContext {
         } else {
             &self.false_value
         };
-        value.clone().into_object()
+        value.clone().into()
     }
 
     pub fn new_tuple(&self, elements: Vec<PyObjectRef>) -> PyObjectRef {
-        PyTupleRef::with_elements(elements, self).into_object()
+        PyTupleRef::with_elements(elements, self).into()
     }
 
     pub fn new_list(&self, elements: Vec<PyObjectRef>) -> PyObjectRef {
@@ -448,18 +449,6 @@ pub(crate) fn pyref_type_error(
     ))
 }
 
-impl<'a, T: PyValue> From<&'a PyRef<T>> for &'a PyObjectRef {
-    fn from(obj: &'a PyRef<T>) -> Self {
-        obj.as_object()
-    }
-}
-
-impl<T: PyValue> From<PyRef<T>> for PyObjectRef {
-    fn from(obj: PyRef<T>) -> Self {
-        obj.into_object()
-    }
-}
-
 impl<T: fmt::Display> fmt::Display for PyRef<T>
 where
     T: PyObjectPayload + fmt::Display,
@@ -506,7 +495,7 @@ impl<T: PyValue> Deref for PyRefExact<T> {
 impl<T: PyValue> IntoPyObject for PyRefExact<T> {
     #[inline]
     fn into_pyobject(self, _vm: &VirtualMachine) -> PyObjectRef {
-        self.obj.into_object()
+        self.obj.into()
     }
 }
 impl<T: PyValue> TryIntoRef<T> for PyRefExact<T> {
@@ -639,6 +628,12 @@ where
     T: IntoPyObject,
 {
     fn get_item(&self, key: T, vm: &VirtualMachine) -> PyResult {
+        if let Ok(mapping) = PyMapping::try_from_object(vm, self.clone()) {
+            if let Some(getitem) = mapping.methods(vm).subscript {
+                return getitem(self.clone(), key.into_pyobject(vm), vm);
+            }
+        }
+
         match vm.get_special_method(self.clone(), "__getitem__")? {
             Ok(special_method) => return special_method.invoke((key,), vm),
             Err(obj) => {
@@ -656,6 +651,12 @@ where
     }
 
     fn set_item(&self, key: T, value: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        if let Ok(mapping) = PyMapping::try_from_object(vm, self.clone()) {
+            if let Some(setitem) = mapping.methods(vm).ass_subscript {
+                return setitem(self.clone(), key.into_pyobject(vm), Some(value), vm);
+            }
+        }
+
         vm.get_special_method(self.clone(), "__setitem__")?
             .map_err(|obj| {
                 vm.new_type_error(format!(
@@ -668,6 +669,12 @@ where
     }
 
     fn del_item(&self, key: T, vm: &VirtualMachine) -> PyResult<()> {
+        if let Ok(mapping) = PyMapping::try_from_object(vm, self.clone()) {
+            if let Some(setitem) = mapping.methods(vm).ass_subscript {
+                return setitem(self.clone(), key.into_pyobject(vm), None, vm);
+            }
+        }
+
         vm.get_special_method(self.clone(), "__delitem__")?
             .map_err(|obj| {
                 vm.new_type_error(format!(
@@ -740,6 +747,22 @@ pub trait TryFromBorrowedObject: Sized {
     fn try_from_borrowed_object(vm: &VirtualMachine, obj: &PyObjectRef) -> PyResult<Self>;
 }
 
+impl PyObjectRef {
+    pub fn try_into_value<T>(self, vm: &VirtualMachine) -> PyResult<T>
+    where
+        T: TryFromObject,
+    {
+        T::try_from_object(vm, self)
+    }
+
+    pub fn try_borrow_to_object<T>(&self, vm: &VirtualMachine) -> PyResult<T>
+    where
+        T: TryFromBorrowedObject,
+    {
+        T::try_from_borrowed_object(vm, self)
+    }
+}
+
 /// Marks a type that has the exact same layout as PyObjectRef, e.g. a type that is
 /// `repr(transparent)` over PyObjectRef.
 ///
@@ -778,19 +801,10 @@ where
     }
 }
 
-/// Implemented by any type that can be returned from a built-in Python function.
-///
-/// `IntoPyObject` has a blanket implementation for any built-in object payload,
-/// and should be implemented by many primitive Rust types, allowing a built-in
-/// function to simply return a `bool` or a `usize` for example.
-pub trait IntoPyObject {
-    fn into_pyobject(self, vm: &VirtualMachine) -> PyObjectRef;
-}
-
 impl<T: PyObjectPayload> IntoPyObject for PyRef<T> {
     #[inline]
     fn into_pyobject(self, _vm: &VirtualMachine) -> PyObjectRef {
-        self.into_object()
+        self.into()
     }
 }
 
@@ -811,10 +825,6 @@ where
     fn into_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
         PyValue::into_object(self, vm)
     }
-}
-
-pub trait IntoPyResult {
-    fn into_pyresult(self, vm: &VirtualMachine) -> PyResult;
 }
 
 impl<T> IntoPyResult for T
@@ -850,7 +860,7 @@ pub trait PyValue: fmt::Debug + PyThreadingConstraint + Sized + 'static {
 
     #[inline]
     fn into_object(self, vm: &VirtualMachine) -> PyObjectRef {
-        self.into_ref(vm).into_object()
+        self.into_ref(vm).into()
     }
 
     #[inline(always)]
@@ -983,8 +993,7 @@ pub trait PyClassImpl: PyClassDef {
             class.set_str_attr("__module__", ctx.new_utf8_str(module_name));
         }
         if class.slots.new.load().is_some() {
-            let bound =
-                ctx.new_bound_method(ctx.slot_new_wrapper.clone(), class.clone().into_object());
+            let bound = ctx.new_bound_method(ctx.slot_new_wrapper.clone(), class.clone().into());
             class.set_str_attr("__new__", bound);
         }
     }
@@ -1058,7 +1067,7 @@ pub trait PyStructSequence: StaticType + PyClassImpl + Sized + 'static {
     #[pymethod(magic)]
     fn reduce(zelf: PyRef<PyTuple>, vm: &VirtualMachine) -> PyObjectRef {
         vm.ctx.new_tuple(vec![
-            zelf.clone_class().into_object(),
+            zelf.clone_class().into(),
             vm.ctx
                 .new_tuple(vec![vm.ctx.new_tuple(zelf.as_slice().to_vec())]),
         ])
@@ -1080,9 +1089,9 @@ pub trait PyStructSequence: StaticType + PyClassImpl + Sized + 'static {
     }
 }
 
-result_like::option_like!(pub PyArithmaticValue, Implemented, NotImplemented);
+result_like::option_like!(pub PyArithmeticValue, Implemented, NotImplemented);
 
-impl PyArithmaticValue<PyObjectRef> {
+impl PyArithmeticValue<PyObjectRef> {
     pub fn from_object(vm: &VirtualMachine, obj: PyObjectRef) -> Self {
         if obj.is(&vm.ctx.not_implemented) {
             Self::NotImplemented
@@ -1092,27 +1101,27 @@ impl PyArithmaticValue<PyObjectRef> {
     }
 }
 
-impl<T: TryFromObject> TryFromObject for PyArithmaticValue<T> {
+impl<T: TryFromObject> TryFromObject for PyArithmeticValue<T> {
     fn try_from_object(vm: &VirtualMachine, obj: PyObjectRef) -> PyResult<Self> {
-        PyArithmaticValue::from_object(vm, obj)
+        PyArithmeticValue::from_object(vm, obj)
             .map(|x| T::try_from_object(vm, x))
             .transpose()
     }
 }
 
-impl<T> IntoPyObject for PyArithmaticValue<T>
+impl<T> IntoPyObject for PyArithmeticValue<T>
 where
     T: IntoPyObject,
 {
     fn into_pyobject(self, vm: &VirtualMachine) -> PyObjectRef {
         match self {
-            PyArithmaticValue::Implemented(v) => v.into_pyobject(vm),
-            PyArithmaticValue::NotImplemented => vm.ctx.not_implemented(),
+            PyArithmeticValue::Implemented(v) => v.into_pyobject(vm),
+            PyArithmeticValue::NotImplemented => vm.ctx.not_implemented(),
         }
     }
 }
 
-pub type PyComparisonValue = PyArithmaticValue<bool>;
+pub type PyComparisonValue = PyArithmeticValue<bool>;
 
 #[derive(Clone)]
 pub struct PySequence<T = PyObjectRef>(Vec<T>);
@@ -1165,7 +1174,7 @@ impl PyMethod {
                             .is_some()
                         {
                             drop(descr_cls);
-                            let cls = PyLease::into_pyref(cls).into_object();
+                            let cls = PyLease::into_pyref(cls).into();
                             return descr_get(descr, Some(obj), Some(cls), vm).map(Self::Attribute);
                         }
                     }
@@ -1193,7 +1202,7 @@ impl PyMethod {
                     })
                 }
                 Some(descr_get) => {
-                    let cls = PyLease::into_pyref(cls).into_object();
+                    let cls = PyLease::into_pyref(cls).into();
                     descr_get(attr, Some(obj), Some(cls), vm).map(Self::Attribute)
                 }
                 None => Ok(Self::Attribute(attr)),
@@ -1232,7 +1241,7 @@ impl PyMethod {
             drop(obj_cls);
             Self::Function { target: obj, func }
         } else {
-            let obj_cls = PyLease::into_pyref(obj_cls).into_object();
+            let obj_cls = PyLease::into_pyref(obj_cls).into();
             let attr = vm
                 .call_get_descriptor_specific(func, Some(obj), Some(obj_cls))
                 .unwrap_or_else(Ok)?;

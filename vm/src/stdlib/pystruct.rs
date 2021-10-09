@@ -12,16 +12,13 @@
 #[pymodule]
 pub(crate) mod _struct {
     use crate::{
-        builtins::{
-            float, IntoPyBool, PyBaseExceptionRef, PyBytesRef, PyStr, PyStrRef, PyTupleRef,
-            PyTypeRef,
-        },
+        builtins::{float, PyBaseExceptionRef, PyBytesRef, PyStr, PyStrRef, PyTupleRef, PyTypeRef},
         common::str::wchar_t,
-        function::{ArgBytesLike, ArgMemoryBuffer, PosArgs},
+        function::{ArgBytesLike, ArgIntoBool, ArgMemoryBuffer, IntoPyObject, PosArgs},
         protocol::PyIterReturn,
         slots::{IteratorIterable, SlotConstructor, SlotIterator},
         utils::Either,
-        IntoPyObject, PyObjectRef, PyRef, PyResult, PyValue, TryFromObject, VirtualMachine,
+        PyObjectRef, PyRef, PyResult, PyValue, TryFromObject, VirtualMachine,
     };
     use crossbeam_utils::atomic::AtomicCell;
     use half::f16;
@@ -460,7 +457,9 @@ pub(crate) mod _struct {
         T: PrimInt + for<'a> std::convert::TryFrom<&'a BigInt>,
     {
         match vm.to_index_opt(arg) {
-            Some(index) => index?.try_to_primitive(vm),
+            Some(index) => index?
+                .try_to_primitive(vm)
+                .map_err(|_| new_struct_error(vm, "argument out of range".to_owned())),
             None => Err(new_struct_error(
                 vm,
                 "required argument is not an integer".to_owned(),
@@ -667,7 +666,7 @@ pub(crate) mod _struct {
             arg: PyObjectRef,
             data: &mut [u8],
         ) -> PyResult<()> {
-            let v = IntoPyBool::try_from_object(vm, arg)?.to_bool() as u8;
+            let v = ArgIntoBool::try_from_object(vm, arg)?.to_bool() as u8;
             v.pack_int::<E>(data);
             Ok(())
         }
@@ -840,7 +839,7 @@ pub(crate) mod _struct {
                 if let Some(buf) = buf.get(offset..offset + size) {
                     zelf.format_spec
                         .unpack(buf, vm)
-                        .map(|x| PyIterReturn::Return(x.into_object()))
+                        .map(|x| PyIterReturn::Return(x.into()))
                 } else {
                     Ok(PyIterReturn::StopIteration(None))
                 }
@@ -947,7 +946,7 @@ pub(crate) mod _struct {
     fn _clearcache() {}
 
     #[pyattr(name = "error")]
-    fn struct_error(vm: &VirtualMachine) -> PyTypeRef {
+    fn error_type(vm: &VirtualMachine) -> PyTypeRef {
         rustpython_common::static_cell! {
             static STRUCT_ERROR: PyTypeRef;
         }
@@ -965,7 +964,7 @@ pub(crate) mod _struct {
     fn new_struct_error(vm: &VirtualMachine, msg: String) -> PyBaseExceptionRef {
         // can't just STRUCT_ERROR.get().unwrap() cause this could be called before from buffer
         // machinery, independent of whether _struct was ever imported
-        vm.new_exception_msg(struct_error(vm), msg)
+        vm.new_exception_msg(error_type(vm), msg)
     }
 }
 

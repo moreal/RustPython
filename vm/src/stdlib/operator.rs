@@ -13,8 +13,7 @@ mod _operator {
     use crate::{
         builtins::{PyInt, PyIntRef, PyStrRef, PyTypeRef},
         function::{ArgBytesLike, FuncArgs, KwArgs, OptionalArg},
-        iterator,
-        protocol::{PyIter, PyIterReturn},
+        protocol::PyIter,
         slots::{
             Callable,
             PyComparisonOp::{Eq, Ge, Gt, Le, Lt, Ne},
@@ -220,7 +219,8 @@ mod _operator {
     #[pyfunction(name = "countOf")]
     fn count_of(a: PyIter, b: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
         let mut count: usize = 0;
-        while let PyIterReturn::Return(element) = a.next(vm)? {
+        for element in a.iter_without_hint::<PyObjectRef>(vm)? {
+            let element = element?;
             if element.is(&b) || vm.bool_eq(&b, &element)? {
                 count += 1;
             }
@@ -243,12 +243,11 @@ mod _operator {
     /// Return the number of occurrences of b in a.
     #[pyfunction(name = "indexOf")]
     fn index_of(a: PyIter, b: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
-        let mut index: usize = 0;
-        while let PyIterReturn::Return(element) = a.next(vm)? {
+        for (index, element) in a.iter_without_hint::<PyObjectRef>(vm)?.enumerate() {
+            let element = element?;
             if element.is(&b) || vm.bool_eq(&b, &element)? {
                 return Ok(index);
             }
-            index += 1;
         }
         Err(vm.new_value_error("sequence.index(x): x not in sequence".to_owned()))
     }
@@ -284,7 +283,8 @@ mod _operator {
                 v.payload::<PyInt>().unwrap().try_to_primitive(vm)
             })
             .unwrap_or(Ok(0))?;
-        iterator::length_hint(vm, obj).map(|v| vm.ctx.new_int(v.unwrap_or(default)))
+        vm.length_hint(obj)
+            .map(|v| vm.ctx.new_int(v.unwrap_or(default)))
     }
 
     // Inplace Operators
@@ -473,9 +473,7 @@ mod _operator {
             let attrs = vm
                 .ctx
                 .new_tuple(zelf.attrs.iter().map(|v| v.as_object()).cloned().collect());
-            Ok(vm
-                .ctx
-                .new_tuple(vec![zelf.clone_class().into_object(), attrs]))
+            Ok(vm.new_pyobj((zelf.clone_class(), attrs)))
         }
 
         // Go through dotted parts of string and call getattr on whatever is returned.
@@ -559,8 +557,7 @@ mod _operator {
         #[pymethod(magic)]
         fn reduce(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyObjectRef {
             let items = vm.ctx.new_tuple(zelf.items.to_vec());
-            vm.ctx
-                .new_tuple(vec![zelf.clone_class().into_object(), items])
+            vm.new_pyobj((zelf.clone_class(), items))
         }
 
         fn call(zelf: &PyRef<Self>, obj: PyObjectRef, vm: &VirtualMachine) -> PyResult {
@@ -647,10 +644,9 @@ mod _operator {
             if zelf.args.kwargs.is_empty() {
                 let mut pargs = vec![zelf.name.as_object().to_owned()];
                 pargs.append(&mut zelf.args.args.clone());
-                Ok(vm.ctx.new_tuple(vec![
-                    zelf.clone_class().into_object(),
-                    vm.ctx.new_tuple(pargs),
-                ]))
+                Ok(vm
+                    .ctx
+                    .new_tuple(vec![zelf.clone_class().into(), vm.ctx.new_tuple(pargs)]))
             } else {
                 // If we have kwargs, create a partial function that contains them and pass back that
                 // along with the args.
@@ -658,10 +654,7 @@ mod _operator {
                 let callable = vm.invoke(
                     &partial,
                     FuncArgs::new(
-                        vec![
-                            zelf.clone_class().into_object(),
-                            zelf.name.as_object().to_owned(),
-                        ],
+                        vec![zelf.clone_class().into(), zelf.name.as_object().to_owned()],
                         KwArgs::new(zelf.args.kwargs.clone()),
                     ),
                 )?;
