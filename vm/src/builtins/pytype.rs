@@ -343,12 +343,12 @@ impl PyType {
             .unwrap_or_else(|| vm.ctx.new_str(ascii!("builtins")).into())
     }
 
-    #[pyproperty(magic, setter)]
-    fn set_module(&self, value: PyObjectRef) {
-        self.attributes
-            .write()
-            .insert("__module__".to_owned(), value);
-    }
+    // #[pyproperty(magic, setter)]
+    // fn set_module(&self, value: PyObjectRef) {
+    //     self.attributes
+    //         .write()
+    //         .insert("__module__".to_owned(), value);
+    // }
 
     #[pyclassmethod(magic)]
     fn prepare(
