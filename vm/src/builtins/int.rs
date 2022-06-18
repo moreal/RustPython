@@ -10,7 +10,7 @@ use crate::{
         PyComparisonValue,
     },
     protocol::{PyNumber, PyNumberMethods},
-    types::{AsNumber, Comparable, Constructor, Hashable, PyComparisonOp},
+    types::{AsNumber, Comparable, Constructor, Hashable, PyComparisonOp, SizeOf},
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
     TryFromBorrowedObject, VirtualMachine,
 };
@@ -279,6 +279,12 @@ impl Constructor for PyInt {
     }
 }
 
+impl SizeOf for PyInt {
+    fn sizeof(zelf: &Py<Self>) -> PyResult<usize> {
+        Ok(zelf.sizeof())
+    }
+}
+
 impl PyInt {
     fn with_value<T>(cls: PyTypeRef, value: T, vm: &VirtualMachine) -> PyResult<PyRef<Self>>
     where
@@ -350,7 +356,7 @@ impl PyInt {
     }
 }
 
-#[pyimpl(flags(BASETYPE), with(Comparable, Hashable, Constructor, AsNumber))]
+#[pyimpl(flags(BASETYPE), with(Comparable, Hashable, Constructor, AsNumber, SizeOf))]
 impl PyInt {
     #[pymethod(name = "__radd__")]
     #[pymethod(magic)]
@@ -606,7 +612,6 @@ impl PyInt {
         !self.value.is_zero()
     }
 
-    #[pymethod(magic)]
     fn sizeof(&self) -> usize {
         std::mem::size_of::<Self>() + (((self.value.bits() + 7) & !7) / 8) as usize
     }

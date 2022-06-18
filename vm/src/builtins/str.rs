@@ -15,7 +15,7 @@ use crate::{
     sliceable::{SequenceIndex, SliceableSequenceOp},
     types::{
         AsMapping, AsSequence, Comparable, Constructor, Hashable, IterNext, IterNextIterable,
-        Iterable, PyComparisonOp, Unconstructible,
+        Iterable, PyComparisonOp, Unconstructible, SizeOf,
     },
     AsObject, Context, Py, PyExact, PyObject, PyObjectRef, PyPayload, PyRef, PyRefExact, PyResult,
     TryFromBorrowedObject, VirtualMachine,
@@ -396,7 +396,7 @@ impl PyStr {
 
 #[pyimpl(
     flags(BASETYPE),
-    with(AsMapping, AsSequence, Hashable, Comparable, Iterable, Constructor)
+    with(AsMapping, AsSequence, Hashable, Comparable, Iterable, Constructor, SizeOf)
 )]
 impl PyStr {
     #[pymethod(magic)]
@@ -513,11 +513,6 @@ impl PyStr {
             PyStrKindData::Ascii => true,
             PyStrKindData::Utf8(_) => false,
         }
-    }
-
-    #[pymethod(magic)]
-    fn sizeof(&self) -> usize {
-        std::mem::size_of::<Self>() + self.byte_len() * std::mem::size_of::<u8>()
     }
 
     #[pymethod(name = "__rmul__")]
@@ -1266,6 +1261,12 @@ impl PyStrRef {
         s.push_str(self.as_ref());
         s.push_str(other);
         *self = PyStr::from(s).into_ref(vm);
+    }
+}
+
+impl SizeOf for PyStr {
+    fn sizeof(zelf: &Py<Self>) -> PyResult<usize> {
+        Ok(std::mem::size_of::<Self>() + zelf.byte_len() * std::mem::size_of::<u8>())
     }
 }
 

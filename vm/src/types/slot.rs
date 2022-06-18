@@ -218,6 +218,7 @@ fn slot_as_number(zelf: &PyObject, vm: &VirtualMachine) -> &'static PyNumberMeth
 }
 
 fn hash_wrapper(zelf: &PyObject, vm: &VirtualMachine) -> PyResult<PyHash> {
+    println!("hash_wrapper");
     let hash_obj = vm.call_special_method(zelf.to_owned(), identifier!(vm, __hash__), ())?;
     match hash_obj.payload_if_subclass::<PyInt>(vm) {
         Some(py_int) => Ok(rustpython_common::hash::hash_bigint(py_int.as_bigint())),
@@ -307,11 +308,22 @@ fn descr_set_wrapper(
 }
 
 fn init_wrapper(obj: PyObjectRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult<()> {
+    println!("init_wrapper {:?} {:?}", obj, args);
     let res = vm.call_special_method(obj, identifier!(vm, __init__), args)?;
     if !vm.is_none(&res) {
         return Err(vm.new_type_error("__init__ must return None".to_owned()));
     }
     Ok(())
+}
+
+fn sizeof_wrapper(obj: &PyObject, vm: &VirtualMachine) -> PyResult<usize> {
+    println!("sizeof_wrapper");
+    let res = vm.call_special_method(obj.to_owned(), identifier!(vm, __sizeof__), ())?;
+    if let Some(size) = res.payload_if_subclass::<PyInt>(vm) {
+        Ok(size.as_bigint().to_usize().unwrap())
+    } else {
+        Err(vm.new_type_error("__sizeof__ must return an integer".to_owned()))
+    }
 }
 
 fn new_wrapper(cls: PyTypeRef, mut args: FuncArgs, vm: &VirtualMachine) -> PyResult {
@@ -378,6 +390,9 @@ impl PyType {
             }
             "__int__" | "__index__" | "__float__" => {
                 update_slot!(as_number, slot_as_number);
+            }
+            "__sizeof__" => {
+                update_slot!(sizeof, sizeof_wrapper);
             }
             _ => {}
         }
@@ -951,6 +966,7 @@ where
 
 #[pyimpl]
 pub trait SizeOf: PyPayload {
+    #[inline]
     #[pyslot]
     fn slot_sizeof(zelf: &PyObject, vm: &VirtualMachine) -> PyResult<usize> {
         if let Some(zelf) = zelf.downcast_ref() {
@@ -960,11 +976,15 @@ pub trait SizeOf: PyPayload {
         }
     }
 
-    fn sizeof(zelf: &Py<Self>) -> PyResult<usize>;
-
     #[inline]
     #[pymethod]
-    fn __sizeof__(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult {
-        Self::slot_sizeof(&zelf, vm).to_pyresult(vm)
+    fn __sizeof__(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult<usize> {
+        let sizeof = zelf
+            .class()
+            .mro_find_map(|cls| cls.slots.sizeof.load())
+            .unwrap(); // hash always exist
+        sizeof(&zelf, vm)
     }
+
+    fn sizeof(zelf: &Py<Self>) -> PyResult<usize>;
 }

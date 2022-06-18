@@ -118,6 +118,7 @@ impl PyType {
         );
 
         for attr_name in new_type.attributes.read().keys() {
+            println!("attr_name = {}.{}", name, attr_name);
             if attr_name.as_str().starts_with("__") && attr_name.as_str().ends_with("__") {
                 new_type.update_slot(attr_name, true);
             }
