@@ -20,7 +20,7 @@ enum AttrName {
     Method,
     ClassMethod,
     StaticMethod,
-    GetSet,
+    Property,
     Slot,
     Attr,
     ExtendClass,
@@ -32,7 +32,7 @@ impl std::fmt::Display for AttrName {
             Self::Method => "pymethod",
             Self::ClassMethod => "pyclassmethod",
             Self::StaticMethod => "pystaticmethod",
-            Self::GetSet => "pyproperty",
+            Self::Property => "pyproperty",
             Self::Slot => "pyslot",
             Self::Attr => "pyattr",
             Self::ExtendClass => "extend_class",
@@ -48,7 +48,7 @@ impl FromStr for AttrName {
             "pymethod" => Self::Method,
             "pyclassmethod" => Self::ClassMethod,
             "pystaticmethod" => Self::StaticMethod,
-            "pyproperty" => Self::GetSet,
+            "pyproperty" => Self::Property,
             "pyslot" => Self::Slot,
             "pyattr" => Self::Attr,
             "extend_class" => Self::ExtendClass,
@@ -62,7 +62,7 @@ impl FromStr for AttrName {
 #[derive(Default)]
 struct ImplContext {
     impl_extend_items: ItemNursery,
-    getset_items: GetSetNursery,
+    getset_items: PropertyNursery,
     extend_slots_items: ItemNursery,
     class_extensions: Vec<TokenStream>,
     errors: Vec<syn::Error>,
@@ -658,27 +658,27 @@ where
 
 #[derive(Default)]
 #[allow(clippy::type_complexity)]
-struct GetSetNursery {
+struct PropertyNursery {
     map: HashMap<(String, Vec<Attribute>), (Option<Ident>, Option<Ident>, Option<Ident>)>,
     validated: bool,
 }
 
-enum GetSetItemKind {
+enum PropertyItemKind {
     Get,
     Set,
     Delete,
 }
 
-impl GetSetNursery {
+impl PropertyNursery {
     fn add_item(
         &mut self,
         name: String,
         cfgs: Vec<Attribute>,
-        kind: GetSetItemKind,
+        kind: PropertyItemKind,
         item_ident: Ident,
     ) -> Result<()> {
         assert!(!self.validated, "new item is not allowed after validation");
-        if !matches!(kind, GetSetItemKind::Get) && !cfgs.is_empty() {
+        if !matches!(kind, PropertyItemKind::Get) && !cfgs.is_empty() {
             return Err(syn::Error::new_spanned(
                 item_ident,
                 "Only the getter can have #[cfg]",
@@ -686,9 +686,9 @@ impl GetSetNursery {
         }
         let entry = self.map.entry((name.clone(), cfgs)).or_default();
         let func = match kind {
-            GetSetItemKind::Get => &mut entry.0,
-            GetSetItemKind::Set => &mut entry.1,
-            GetSetItemKind::Delete => &mut entry.2,
+            PropertyItemKind::Get => &mut entry.0,
+            PropertyItemKind::Set => &mut entry.1,
+            PropertyItemKind::Delete => &mut entry.2,
         };
         if func.is_some() {
             return Err(syn::Error::new_spanned(
@@ -716,7 +716,7 @@ impl GetSetNursery {
     }
 }
 
-impl ToTokens for GetSetNursery {
+impl ToTokens for PropertyNursery {
     fn to_tokens(&self, tokens: &mut TokenStream) {
         assert!(self.validated, "Call `validate()` before token generation");
         let properties = self
@@ -795,13 +795,13 @@ impl ItemMeta for PropertyItemMeta {
 }
 
 impl PropertyItemMeta {
-    fn property_name(&self) -> Result<(String, GetSetItemKind)> {
+    fn property_name(&self) -> Result<(String, PropertyItemKind)> {
         let inner = self.inner();
         let magic = inner._bool("magic")?;
         let kind = match (inner._bool("setter")?, inner._bool("deleter")?) {
-            (false, false) => GetSetItemKind::Get,
-            (true, false) => GetSetItemKind::Set,
-            (false, true) => GetSetItemKind::Delete,
+            (false, false) => PropertyItemKind::Get,
+            (true, false) => PropertyItemKind::Set,
+            (false, true) => PropertyItemKind::Delete,
             (true, true) => {
                 return Err(syn::Error::new_spanned(
                     &inner.meta_ident,
@@ -845,9 +845,9 @@ impl PropertyItemMeta {
                 }
             };
             let name = match kind {
-                GetSetItemKind::Get => sig_name,
-                GetSetItemKind::Set => extract_prefix_name("set_", "setter")?,
-                GetSetItemKind::Delete => extract_prefix_name("del_", "deleter")?,
+                PropertyItemKind::Get => sig_name,
+                PropertyItemKind::Set => extract_prefix_name("set_", "setter")?,
+                PropertyItemKind::Delete => extract_prefix_name("del_", "deleter")?,
             };
             if magic {
                 format!("__{}__", name)
@@ -1032,7 +1032,7 @@ where
                 inner: ContentItemInner { index, attr_name },
             })
         }
-        GetSet => Box::new(PropertyItem {
+        Property => Box::new(PropertyItem {
             inner: ContentItemInner { index, attr_name },
         }),
         Slot => Box::new(SlotItem {
