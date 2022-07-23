@@ -67,7 +67,8 @@ impl PyNativeFuncDef {
 #[pyclass(name = "builtin_function_or_method", module = false)]
 pub struct PyBuiltinFunction {
     value: PyNativeFuncDef,
-    module: Option<PyObjectRef>,
+    zelf: Option<PyObjectRef>,
+    class: Option<&'static Py<PyType>>,
 }
 
 impl PyPayload for PyBuiltinFunction {
@@ -86,14 +87,25 @@ impl From<PyNativeFuncDef> for PyBuiltinFunction {
     fn from(value: PyNativeFuncDef) -> Self {
         Self {
             value,
-            module: None,
+            zelf: None,
+            class: None,
         }
     }
 }
 
 impl PyBuiltinFunction {
     pub fn with_module(mut self, module: PyObjectRef) -> Self {
-        self.module = Some(module);
+        self.zelf = Some(module);
+        self
+    }
+
+    pub fn with_self(mut self, zelf: PyObjectRef) -> Self {
+        self.zelf = Some(zelf);
+        self
+    }
+
+    pub fn with_class(mut self, class: &'static Py<PyType>) -> Self {
+        self.class = Some(class);
         self
     }
 
@@ -122,7 +134,7 @@ impl Callable for PyBuiltinFunction {
 impl PyBuiltinFunction {
     #[pyproperty(magic)]
     fn module(&self, vm: &VirtualMachine) -> PyObjectRef {
-        vm.unwrap_or_none(self.module.clone())
+        vm.unwrap_or_none(self.zelf.clone())
     }
     #[pyproperty(magic)]
     fn name(&self) -> PyStrRef {
