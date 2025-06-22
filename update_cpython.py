@@ -228,7 +228,17 @@ class TestModifier(cst.CSTTransformer):
     ) -> cst.ClassDef:
         class_name = original_node.name.value
 
+        expected_failure_decorator = cst.Decorator(
+            decorator=cst.Attribute(
+                value=cst.Name("unittest"), attr=cst.Name("expectedFailure")
+            )
+        )
+        todo_rustpython_comment = cst.EmptyLine(
+            comment=cst.Comment("# TODO: RUSTPYTHON")
+        )
+
         # Check function definitions in the class and add decorators to failing methods
+        marked_methods = set()
         new_body = []
         for item in updated_node.body.body:
             if isinstance(item, cst.FunctionDef):
@@ -236,31 +246,54 @@ class TestModifier(cst.CSTTransformer):
                 class_method = f"{class_name}.{method_name}"
 
                 # Check if in failure list
-                if class_method in self.failures or method_name in self.failures:
-                    # Add unittest.expectedFailure decorator
-                    expected_failure = cst.Decorator(
-                        decorator=cst.Attribute(
-                            value=cst.Name("unittest"), attr=cst.Name("expectedFailure")
-                        )
-                    )
-
-                    # Add RUSTPYTHON marker
-                    todo_rustpython_comment = cst.EmptyLine(
-                        comment=cst.Comment("# TODO: RUSTPYTHON")
-                    )
-
+                if class_method in self.failures:
                     # Add new decorators to existing decorators
-                    new_decorators = list(
-                        (
-                            todo_rustpython_comment,
-                            expected_failure,
-                        )
-                    ) + list(item.decorators)
+                    new_decorators = [
+                        todo_rustpython_comment,
+                        expected_failure_decorator,
+                        *item.decorators,
+                    ]
+                    marked_methods.add(class_method)
 
                     # Create modified function definition
                     item = item.with_changes(decorators=new_decorators)
 
             new_body.append(item)
+
+        unmarked_methods = sorted(
+            set(filter(lambda x: x.startswith(f"{class_name}."), self.failures))
+            - marked_methods
+        )
+        for method in unmarked_methods:
+            # If there are unmarked methods, we can add a comment or log it
+            logger.debug(
+                f"Mark {method} manually with unittest.expectedFailure decorator"
+            )
+
+            method_name = method.split(".")[-1]
+            # Create a new function definition for the unmarked method
+            new_function = cst.FunctionDef(
+                name=cst.Name(method_name),
+                params=cst.Parameters([cst.Param(name=cst.Name("self"))]),
+                body=cst.SimpleStatementSuite(
+                    [
+                        cst.Expr(
+                            value=cst.Call(
+                                func=cst.Attribute(
+                                    value=cst.Call(func=cst.Name("super")),
+                                    attr=cst.Name(method_name),
+                                )
+                            )
+                        )
+                    ]
+                ),
+                decorators=[expected_failure_decorator],
+                leading_lines=[
+                    cst.EmptyLine(),
+                    cst.EmptyLine(comment=cst.Comment("# TODO: RUSTPYTHON")),
+                ],
+            )
+            new_body.append(new_function)
 
         # Update ClassDef with modified body
         return updated_node.with_changes(
