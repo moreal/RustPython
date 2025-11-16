@@ -271,7 +271,7 @@ impl Context {
     }
 
     fn init_genesis() -> Self {
-        flame_guard!("init Context");
+        // flame_guard!("init Context");
         let types = TypeZoo::init();
         let exceptions = exceptions::ExceptionZoo::init();
 
