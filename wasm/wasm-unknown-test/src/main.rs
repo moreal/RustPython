@@ -1,8 +1,4 @@
-use rustpython_vm::{
-    AsObject, Context, Interpreter, eval,
-    object::{debug_assertion, debug_init_type_hierarchy},
-    types::TypeZoo,
-};
+use rustpython_vm::{AsObject, Context, Interpreter, eval, types::TypeZoo};
 
 fn main() -> () {
     let src = "1";

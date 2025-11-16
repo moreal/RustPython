@@ -1,8 +1,9 @@
-use rustpython_vm::{
-    AsObject, Context, Interpreter, eval,
-    object::{debug_assertion, debug_init_type_hierarchy},
-    types::TypeZoo,
-};
+use rustpython_vm::{AsObject, Context, Interpreter, convert::IntoObject, eval, types::TypeZoo};
+
+#[inline(never)]
+fn debug_fnaaaa(s: &str) -> usize {
+    s.len()
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn eval(s: *const u8, l: usize) -> u32 {
@@ -19,6 +20,8 @@ pub unsafe extern "C" fn eval(s: *const u8, l: usize) -> u32 {
             Ok(res) => res,
             Err(e) => {
                 if e.class().is(vm.ctx.exceptions.syntax_error) {
+                    let s = format!("{:?}", e.into_object().dict().unwrap());
+                    debug_fnaaaa(&s);
                     return 4001;
                 } else {
                     return 4000;

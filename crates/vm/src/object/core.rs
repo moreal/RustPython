@@ -33,7 +33,6 @@ use std::{
     borrow::Borrow,
     cell::UnsafeCell,
     fmt,
-    hash::RandomState,
     marker::PhantomData,
     mem::ManuallyDrop,
     ops::Deref,
@@ -1193,50 +1192,6 @@ macro_rules! partially_init {
         }
         m
     }};
-}
-
-pub fn debug_assertion() -> u32 {
-    use crate::class::PyClassImpl;
-    use once_cell::race::OnceBox;
-
-    // Assertion doesn't matter.
-    // use std::mem::MaybeUninit;
-    // static_assertions::assert_eq_size!(MaybeUninit<PyInner<PyType>>, PyInner<PyType>);
-    // static_assertions::assert_eq_align!(MaybeUninit<PyInner<PyType>>, PyInner<PyType>);
-
-    // PyRwLock doesn't matter.
-    let bases_lock = PyRwLock::default();
-    let mro_lock = PyRwLock::default();
-    let subclasses_lock = PyRwLock::default();
-
-    // std::hash::RandomState::default() doesn't matter.
-    // let random_state = std::hash::RandomState::default();
-
-    // Panic on ahash::RandomState::default()
-    // ahash::RandomState::default() == ahash::RandomState::new()
-    let random_state = ahash::RandomState::new();
-
-    static ONCE_BOX: OnceBox<Box<u32>> = OnceBox::new();
-    let data = ONCE_BOX.get_or_init(|| Box::new(Box::new(32u32)));
-    return 3;
-    let test_index_map = indexmap::map::IndexMap::default();
-    return 4;
-    let attributes_lock = PyRwLock::new(test_index_map);
-
-    let type_payload = PyType {
-        base: None,
-        bases: bases_lock,
-        mro: mro_lock,
-        subclasses: subclasses_lock,
-        attributes: attributes_lock,
-        slots: PyType::make_slots(),
-        heaptype_ext: None,
-    };
-    return 1;
-}
-
-pub fn debug_init_type_hierarchy() -> (PyTypeRef, PyTypeRef, PyTypeRef) {
-    init_type_hierarchy()
 }
 
 pub(crate) fn init_type_hierarchy() -> (PyTypeRef, PyTypeRef, PyTypeRef) {

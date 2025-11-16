@@ -41,9 +41,19 @@ unsafe impl<T: Traverse> Traverse for Dict<T> {
     }
 }
 
-impl<T> fmt::Debug for Dict<T> {
+impl<T: fmt::Debug> fmt::Debug for Dict<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Debug").finish()
+        let inner = self.inner.read();
+        let entries: Vec<_> = inner
+            .entries
+            .iter()
+            .filter_map(|e| e.as_ref().map(|entry| (&entry.key, &entry.value)))
+            .collect();
+        f.debug_struct("Dict")
+            .field("used", &inner.used)
+            .field("filled", &inner.filled)
+            .field("entries", &entries)
+            .finish()
     }
 }
 
