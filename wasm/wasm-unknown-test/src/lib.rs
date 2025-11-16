@@ -19,7 +19,7 @@ pub unsafe extern "C" fn eval(s: *const u8, l: usize) -> u32 {
             Ok(res) => res,
             Err(e) => {
                 if e.class().is(vm.ctx.exceptions.syntax_error) {
-                    return src.len() as u32;
+                    return 4001;
                 } else {
                     return 4000;
                 }
