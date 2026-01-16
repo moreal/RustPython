@@ -1,3 +1,6 @@
 def a():
-    print('a')
-def b(): pass
+    print("a")
+
+
+def b():
+    pass
