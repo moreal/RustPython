@@ -109,6 +109,7 @@ jobs:
         if: steps.check-changes.outputs.has_changes == 'true'
         uses: marocchino/sticky-pull-request-comment@v2
         with:
+          header: auto-format
           number: ${{ github.event.pull_request.number }}
           message: |
             **Code has been automatically formatted**
@@ -119,3 +120,12 @@ jobs:
             ```bash
             git pull origin ${{ github.event.pull_request.head.ref }}
             ```
+
+      - name: Hide previous format comment if no changes
+        if: steps.check-changes.outputs.has_changes == 'false'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: auto-format
+          number: ${{ github.event.pull_request.number }}
+          hide: true
+          hide_classify: "OUTDATED"
