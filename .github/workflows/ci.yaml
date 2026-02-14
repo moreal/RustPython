@@ -326,13 +326,6 @@ jobs:
         run: target/release/rustpython -m test -j 1 -u all --slowest --fail-env-changed --timeout 600 -v ${{ env.PLATFORM_INDEPENDENT_TESTS }}
         timeout-minutes: 45
 
-      - if: runner.os == 'Linux'
-        name: run cpython platform-dependent tests (Linux)
-        env:
-          RUSTPYTHON_SKIP_ENV_POLLUTERS: true
-        run: target/release/rustpython -m test -j 1 -u all --slowest --fail-env-changed --timeout 600 -v -x ${{ env.PLATFORM_INDEPENDENT_TESTS }}
-        timeout-minutes: 45
-
       - if: runner.os == 'macOS'
         name: run cpython platform-dependent tests (MacOS)
         env:
@@ -454,6 +447,196 @@ jobs:
         name: Check whats_left is not broken (macOS)
         shell: bash
         run: python -I scripts/whats_left.py --no-default-features --features "$(sed -e 's/--[^ ]*//g' <<< "${{ env.CARGO_ARGS }}" | tr -d '[:space:]'),threading" # no jit on macOS for now
+
+  prepare_platform_dependent_resource_matrix:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip:ci') }}
+    name: Prepare platform-dependent resource matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      matrix: ${{ steps.generate.outputs.matrix }}
+      selected_count: ${{ steps.generate.outputs.selected_count }}
+      summary: ${{ steps.generate.outputs.summary }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build rustpython (Linux)
+        run: cargo build --release --verbose --features=threading ${{ env.CARGO_ARGS }},jit
+      - name: collect platform-dependent test names on Linux
+        run: target/release/rustpython -m test --list-tests -x ${{ env.PLATFORM_INDEPENDENT_TESTS }} > /tmp/platform_dependent_tests_linux.txt
+      - name: generate resource shard matrix
+        id: generate
+        shell: bash
+        run: |
+          python3 scripts/list_resource_gates.py --json > /tmp/resource_gates.json
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import sys
+          from collections import defaultdict
+
+          ALL_TESTS_PATH = pathlib.Path("/tmp/platform_dependent_tests_linux.txt")
+          GATES_PATH = pathlib.Path("/tmp/resource_gates.json")
+
+          OS_POLICIES = {
+              # Toggle this to extend sharding to other OS in the future.
+              "ubuntu-latest": {"enabled": True, "artifact_name": "rustpython-release-linux"},
+              "macos-latest": {"enabled": False, "artifact_name": "rustpython-release-macos"},
+              "windows-2025": {"enabled": False, "artifact_name": "rustpython-release-windows"},
+          }
+
+          def parse_available_tests(path: pathlib.Path) -> list[str]:
+              tests = []
+              for raw in path.read_text(encoding="utf-8").splitlines():
+                  name = raw.strip()
+                  if re.match(r"^test[0-9A-Za-z_.]*$", name):
+                      tests.append(name)
+              return tests
+
+          def top_level_test_name(file_path: str) -> str | None:
+              p = pathlib.Path(file_path)
+              try:
+                  rel = p.relative_to(pathlib.Path("Lib/test"))
+              except ValueError:
+                  return None
+
+              if not rel.parts:
+                  return None
+
+              # test_x.py -> test_x
+              if rel.parent == pathlib.Path(".") and rel.stem.startswith("test_"):
+                  return rel.stem
+
+              # test_pkg/test_mod.py -> test_pkg (package entrypoint)
+              top = rel.parts[0]
+              if top.startswith("test_"):
+                  return top
+
+              return None
+
+          available_tests = parse_available_tests(ALL_TESTS_PATH)
+          available_set = set(available_tests)
+
+          data = json.loads(GATES_PATH.read_text(encoding="utf-8"))
+          resources_by_top_test: dict[str, set[str]] = defaultdict(set)
+
+          for item in data.get("files_with_strict_resources", []):
+              name = top_level_test_name(item["file"])
+              if not name:
+                  continue
+              if name not in available_set:
+                  continue
+              resources_by_top_test[name].update(item["resources"])
+
+          combos_to_tests: dict[str, list[str]] = defaultdict(list)
+          for test_name in sorted(resources_by_top_test):
+              resources = sorted(resources_by_top_test[test_name])
+              if not resources:
+                  continue
+              combo = ",".join(resources)
+              combos_to_tests[combo].append(test_name)
+
+          resource_marked = set()
+          for tests in combos_to_tests.values():
+              resource_marked.update(tests)
+
+          base_tests = [t for t in available_tests if t not in resource_marked]
+
+          include = []
+          for os_name, policy in OS_POLICIES.items():
+              if not policy.get("enabled", False):
+                  continue
+
+              if base_tests:
+                  include.append(
+                      {
+                          "os": os_name,
+                          "kind": "base",
+                          "resource_key": "none",
+                          "u_arg": "none",
+                          "count": len(base_tests),
+                          "tests": " ".join(base_tests),
+                          "artifact_name": policy["artifact_name"],
+                      }
+                  )
+
+              for combo, tests in sorted(combos_to_tests.items()):
+                  if not tests:
+                      continue
+                  include.append(
+                      {
+                          "os": os_name,
+                          "kind": "resource",
+                          "resource_key": combo,
+                          "u_arg": combo,
+                          "count": len(tests),
+                          "tests": " ".join(tests),
+                          "artifact_name": policy["artifact_name"],
+                      }
+                  )
+
+          selected_count = len(base_tests) + sum(len(tests) for tests in combos_to_tests.values())
+          if selected_count == 0:
+              raise SystemExit("No platform-dependent tests selected for sharding.")
+          if not include:
+              raise SystemExit("No matrix entries generated. Check OS policy settings.")
+
+          summary = {
+              "available_platform_dependent_tests": len(available_tests),
+              "resource_marked_tests": len(resource_marked),
+              "base_tests": len(base_tests),
+              "combo_count": len(combos_to_tests),
+              "selected_count": selected_count,
+              "matrix_entries": len(include),
+          }
+
+          print(json.dumps(summary, indent=2, sort_keys=True))
+
+          output_path = os.environ["GITHUB_OUTPUT"]
+          with open(output_path, "a", encoding="utf-8") as f:
+              f.write("matrix<<EOF\n")
+              f.write(json.dumps({"include": include}, sort_keys=True))
+              f.write("\nEOF\n")
+              f.write(f"selected_count={selected_count}\n")
+              f.write("summary<<EOF\n")
+              f.write(json.dumps(summary, sort_keys=True))
+              f.write("\nEOF\n")
+          PY
+      - name: upload rustpython release binary (Linux)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustpython-release-linux
+          path: target/release/rustpython
+          if-no-files-found: error
+
+  run_platform_dependent_resource_shards:
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip:ci') }}
+    name: Run platform-dependent cpython tests by resource
+    needs: prepare_platform_dependent_resource_matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare_platform_dependent_resource_matrix.outputs.matrix) }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - name: download rustpython release binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/release
+      - name: ensure rustpython binary is executable
+        shell: bash
+        run: chmod +x target/release/rustpython
+      - name: run shard
+        env:
+          RUSTPYTHON_SKIP_ENV_POLLUTERS: true
+        run: |
+          echo "Running shard kind=${{ matrix.kind }} resource=${{ matrix.resource_key }} count=${{ matrix.count }}"
+          target/release/rustpython -m test -j 1 --slowest --fail-env-changed --timeout 600 -v -u "${{ matrix.u_arg }}" ${{ matrix.tests }}
 
   lint:
     name: Check Rust code with clippy
