@@ -6,6 +6,7 @@ mod _symtable {
         Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
         builtins::{PyDictRef, PyStrRef},
         compiler,
+        function::ArgStrOrBytesLike,
         types::Representable,
     };
     use alloc::fmt;
@@ -111,25 +112,97 @@ mod _symtable {
 
     #[pyfunction]
     fn symtable(
-        source: PyStrRef,
+        source: ArgStrOrBytesLike,
         filename: PyStrRef,
         mode: PyStrRef,
         vm: &VirtualMachine,
     ) -> PyResult<PyRef<PySymbolTable>> {
+        let from_bytes = matches!(source, ArgStrOrBytesLike::Buf(_));
+        let source_bytes = source.borrow_bytes();
+        let source_bytes: &[u8] = source_bytes.as_ref();
+        if source_bytes.contains(&0) {
+            return Err(vm.new_exception_msg(
+                vm.ctx.exceptions.syntax_error.to_owned(),
+                "source code string cannot contain null bytes".to_owned(),
+            ));
+        }
+        let source = core::str::from_utf8(source_bytes).map_err(|err| {
+            let msg = format!(
+                "(unicode error) 'utf-8' codec can't decode byte 0x{:x?} in position {}: invalid start byte",
+                source_bytes[err.valid_up_to()],
+                err.valid_up_to()
+            );
+            vm.new_exception_msg(vm.ctx.exceptions.syntax_error.to_owned(), msg)
+        })?;
+
         let mode = mode
             .as_str()
             .parse::<compiler::Mode>()
             .map_err(|err| vm.new_value_error(err.to_string()))?;
 
-        let symtable = compiler::compile_symtable(source.as_str(), mode, filename.as_str())
-            .map_err(|err| vm.new_syntax_error(&err, Some(source.as_str())))?;
+        let symtable = compiler::compile_symtable(source, mode, filename.as_str())
+            .map_err(|err| vm.new_syntax_error(&err, Some(source)))?;
 
-        let py_symbol_table = to_py_symbol_table(symtable);
+        let py_symbol_table = to_py_symbol_table(symtable, from_bytes);
         Ok(py_symbol_table.into_ref(&vm.ctx))
     }
 
-    const fn to_py_symbol_table(symtable: SymbolTable) -> PySymbolTable {
-        PySymbolTable { symtable }
+    fn cpython_flags(symbol: &Symbol) -> i32 {
+        let mut flags = 0;
+        if symbol.flags.contains(SymbolFlags::GLOBAL) {
+            flags |= DEF_GLOBAL;
+        }
+        if symbol.flags.contains(SymbolFlags::ASSIGNED) {
+            flags |= DEF_LOCAL;
+        }
+        if symbol.flags.contains(SymbolFlags::PARAMETER) {
+            flags |= DEF_PARAM;
+        }
+        if symbol.flags.contains(SymbolFlags::NONLOCAL) {
+            flags |= DEF_NONLOCAL;
+        }
+        if symbol.flags.contains(SymbolFlags::REFERENCED) {
+            flags |= USE;
+        }
+        if matches!(symbol.scope, SymbolScope::Free) {
+            flags |= DEF_FREE;
+        }
+        if symbol.flags.contains(SymbolFlags::FREE_CLASS) {
+            flags |= DEF_FREE_CLASS;
+        }
+        if symbol.flags.contains(SymbolFlags::IMPORTED) {
+            flags |= DEF_IMPORT;
+        }
+        if symbol.flags.contains(SymbolFlags::ANNOTATED) {
+            flags |= DEF_ANNOT;
+        }
+        if symbol.flags.contains(SymbolFlags::COMP_ITER) || symbol.flags.contains(SymbolFlags::ITER)
+        {
+            flags |= DEF_COMP_ITER;
+        }
+        if symbol.flags.contains(SymbolFlags::TYPE_PARAM) {
+            flags |= DEF_TYPE_PARAM;
+        }
+        if symbol.flags.contains(SymbolFlags::COMP_CELL) {
+            flags |= DEF_COMP_CELL;
+        }
+
+        let scope = match symbol.scope {
+            SymbolScope::Unknown => 0,
+            SymbolScope::Local => LOCAL,
+            SymbolScope::GlobalExplicit => GLOBAL_EXPLICIT,
+            SymbolScope::GlobalImplicit => GLOBAL_IMPLICIT,
+            SymbolScope::Free => FREE,
+            SymbolScope::Cell => CELL,
+        };
+        flags | (scope << SCOPE_OFFSET)
+    }
+
+    const fn to_py_symbol_table(symtable: SymbolTable, from_bytes: bool) -> PySymbolTable {
+        PySymbolTable {
+            symtable,
+            from_bytes,
+        }
     }
 
     #[pyattr]
@@ -137,6 +210,7 @@ mod _symtable {
     #[derive(PyPayload)]
     struct PySymbolTable {
         symtable: SymbolTable,
+        from_bytes: bool,
     }
 
     impl fmt::Debug for PySymbolTable {
@@ -174,7 +248,7 @@ mod _symtable {
                 .symtable
                 .sub_tables
                 .iter()
-                .map(|t| to_py_symbol_table(t.clone()).into_pyobject(vm))
+                .map(|t| to_py_symbol_table(t.clone(), self.from_bytes).into_pyobject(vm))
                 .collect();
             Ok(children)
         }
@@ -199,8 +273,12 @@ mod _symtable {
         fn symbols(&self, vm: &VirtualMachine) -> PyResult<PyDictRef> {
             let dict = vm.ctx.new_dict();
             for (name, symbol) in &self.symtable.symbols {
-                dict.set_item(name, vm.new_pyobj(symbol.flags.bits()), vm)
-                    .unwrap();
+                let flags = if self.from_bytes {
+                    cpython_flags(symbol)
+                } else {
+                    symbol.flags.bits().into()
+                };
+                dict.set_item(name, vm.new_pyobj(flags), vm).unwrap();
             }
             Ok(dict)
         }
@@ -312,7 +390,7 @@ mod _symtable {
             let namespaces = self
                 .namespaces
                 .iter()
-                .map(|table| to_py_symbol_table(table.clone()).into_pyobject(vm))
+                .map(|table| to_py_symbol_table(table.clone(), false).into_pyobject(vm))
                 .collect();
             Ok(namespaces)
         }
@@ -322,9 +400,11 @@ mod _symtable {
             if self.namespaces.len() != 1 {
                 return Err(vm.new_value_error("namespace is bound to multiple namespaces"));
             }
-            Ok(to_py_symbol_table(self.namespaces.first().unwrap().clone())
-                .into_ref(&vm.ctx)
-                .into())
+            Ok(
+                to_py_symbol_table(self.namespaces.first().unwrap().clone(), false)
+                    .into_ref(&vm.ctx)
+                    .into(),
+            )
         }
     }
 }

@@ -580,7 +580,6 @@ class ComprehensionTests(unittest.TestCase):
 class CommandLineTest(unittest.TestCase):
     maxDiff = None
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
     def test_file(self):
         filename = os_helper.TESTFN
         self.addCleanup(os_helper.unlink, filename)
