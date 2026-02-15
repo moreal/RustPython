@@ -6616,6 +6616,44 @@ impl Compiler {
         let (last_value, values) = values.split_last().unwrap();
 
         for value in values {
+            // Optimization: when a non-last value is a BoolOp with the opposite
+            // operator, redirect its short-circuit exits to skip the outer's
+            // redundant __bool__ test (jump threading).
+            if let ast::Expr::BoolOp(ast::ExprBoolOp {
+                op: inner_op,
+                values: inner_values,
+                ..
+            }) = value
+            {
+                if inner_op != op {
+                    let pop_block = self.new_block();
+                    self.compile_bool_op_inner(inner_op, inner_values, Some(pop_block))?;
+                    // Test the inner result for the outer BoolOp
+                    emit!(self, Instruction::Copy { index: 1_u32 });
+                    match op {
+                        ast::BoolOp::And => {
+                            emit!(
+                                self,
+                                Instruction::PopJumpIfFalse {
+                                    target: after_block,
+                                }
+                            );
+                        }
+                        ast::BoolOp::Or => {
+                            emit!(
+                                self,
+                                Instruction::PopJumpIfTrue {
+                                    target: after_block,
+                                }
+                            );
+                        }
+                    }
+                    self.switch_to_block(pop_block);
+                    emit!(self, Instruction::PopTop);
+                    continue;
+                }
+            }
+
             self.compile_expression(value)?;
 
             emit!(self, Instruction::Copy { index: 1_u32 });
@@ -6633,6 +6671,54 @@ impl Compiler {
                         self,
                         Instruction::PopJumpIfTrue {
                             target: after_block,
+                        }
+                    );
+                }
+            }
+
+            emit!(self, Instruction::PopTop);
+        }
+
+        // If all values did not qualify, take the value of the last value:
+        self.compile_expression(last_value)?;
+        self.switch_to_block(after_block);
+        Ok(())
+    }
+
+    /// Compile a boolean operation as an expression, with an optional
+    /// short-circuit target override. When `short_circuit_target` is `Some`,
+    /// the short-circuit jumps go to that block instead of the default
+    /// `after_block`, enabling jump threading to avoid redundant `__bool__` calls.
+    fn compile_bool_op_inner(
+        &mut self,
+        op: &ast::BoolOp,
+        values: &[ast::Expr],
+        short_circuit_target: Option<BlockIdx>,
+    ) -> CompileResult<()> {
+        let after_block = self.new_block();
+
+        let (last_value, values) = values.split_last().unwrap();
+
+        let target = short_circuit_target.unwrap_or(after_block);
+
+        for value in values {
+            self.compile_expression(value)?;
+
+            emit!(self, Instruction::Copy { index: 1_u32 });
+            match op {
+                ast::BoolOp::And => {
+                    emit!(
+                        self,
+                        Instruction::PopJumpIfFalse {
+                            target,
+                        }
+                    );
+                }
+                ast::BoolOp::Or => {
+                    emit!(
+                        self,
+                        Instruction::PopJumpIfTrue {
+                            target,
                         }
                     );
                 }
