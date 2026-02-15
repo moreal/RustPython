@@ -9093,6 +9093,15 @@ if (True and False) or (False and True):
     }
 
     #[test]
+    fn test_nested_bool_op() {
+        assert_dis_snapshot!(compile_exec(
+            "\
+x = Test() and False or False
+"
+        ));
+    }
+
+    #[test]
     fn test_nested_double_async_with() {
         assert_dis_snapshot!(compile_exec(
             "\
