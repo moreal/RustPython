@@ -6624,34 +6624,33 @@ impl Compiler {
                 values: inner_values,
                 ..
             }) = value
+                && inner_op != op
             {
-                if inner_op != op {
-                    let pop_block = self.new_block();
-                    self.compile_bool_op_inner(inner_op, inner_values, Some(pop_block))?;
-                    // Test the inner result for the outer BoolOp
-                    emit!(self, Instruction::Copy { index: 1_u32 });
-                    match op {
-                        ast::BoolOp::And => {
-                            emit!(
-                                self,
-                                Instruction::PopJumpIfFalse {
-                                    target: after_block,
-                                }
-                            );
-                        }
-                        ast::BoolOp::Or => {
-                            emit!(
-                                self,
-                                Instruction::PopJumpIfTrue {
-                                    target: after_block,
-                                }
-                            );
-                        }
+                let pop_block = self.new_block();
+                self.compile_bool_op_inner(inner_op, inner_values, Some(pop_block))?;
+                // Test the inner result for the outer BoolOp
+                emit!(self, Instruction::Copy { index: 1_u32 });
+                match op {
+                    ast::BoolOp::And => {
+                        emit!(
+                            self,
+                            Instruction::PopJumpIfFalse {
+                                target: after_block,
+                            }
+                        );
                     }
-                    self.switch_to_block(pop_block);
-                    emit!(self, Instruction::PopTop);
-                    continue;
+                    ast::BoolOp::Or => {
+                        emit!(
+                            self,
+                            Instruction::PopJumpIfTrue {
+                                target: after_block,
+                            }
+                        );
+                    }
                 }
+                self.switch_to_block(pop_block);
+                emit!(self, Instruction::PopTop);
+                continue;
             }
 
             self.compile_expression(value)?;
@@ -6707,20 +6706,10 @@ impl Compiler {
             emit!(self, Instruction::Copy { index: 1_u32 });
             match op {
                 ast::BoolOp::And => {
-                    emit!(
-                        self,
-                        Instruction::PopJumpIfFalse {
-                            target,
-                        }
-                    );
+                    emit!(self, Instruction::PopJumpIfFalse { target });
                 }
                 ast::BoolOp::Or => {
-                    emit!(
-                        self,
-                        Instruction::PopJumpIfTrue {
-                            target,
-                        }
-                    );
+                    emit!(self, Instruction::PopJumpIfTrue { target });
                 }
             }
 
