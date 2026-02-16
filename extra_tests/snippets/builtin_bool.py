@@ -210,10 +210,14 @@ with assert_raises(TypeError):
 
 # Issue #3567: nested BoolOps should not call __bool__ redundantly
 _n = 0
+
+
 class _BoolCounter:
     def __bool__(self):
         global _n
         _n += 1
         return False
+
+
 _BoolCounter() and False or False
 assert _n == 1, f"__bool__ called {_n} times, expected 1"
