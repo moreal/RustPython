@@ -33,4 +33,4 @@ while ExplodingBool(False) and False:
 #     pass
 
 # Issue #3567: nested BoolOps should not call __bool__ redundantly
-assert ExplodingBool(False) and False or False
+assert (ExplodingBool(False) and False or False) == False
