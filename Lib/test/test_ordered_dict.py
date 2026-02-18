@@ -669,7 +669,7 @@ class OrderedDictTests:
         dict.update(od, [('spam', 1)])
         self.assertNotIn('NULL', repr(od))
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
+    @unittest.expectedFailure  # TODO: RUSTPYTHON; AssertionError: <class 'test.test_ordered_dict.OrderedDictTests.test_reference_loop.<locals>.A'> is not None
     def test_reference_loop(self):
         # Issue 25935
         OrderedDict = self.OrderedDict
@@ -681,7 +681,7 @@ class OrderedDictTests:
         gc.collect()
         self.assertIsNone(r())
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
+    @unittest.expectedFailure  # TODO: RUSTPYTHON; AssertionError: False is not true
     def test_free_after_iterating(self):
         support.check_free_after_iterating(self, iter, self.OrderedDict)
         support.check_free_after_iterating(self, lambda d: iter(d.keys()), self.OrderedDict)
@@ -807,6 +807,7 @@ class CPythonOrderedDictSideEffects:
         msg = re.escape("OrderedDict mutated during iteration")
         self.assertRaisesRegex(RuntimeError, msg, operator.eq, dict1, dict2)
 
+    @unittest.expectedFailure  # TODO: RUSTPYTHON; AssertionError: RuntimeError not raised by eq
     def test_issue119004_change_size_by_clear(self):
         class Key(_TriggerSideEffectOnEqual):
             def side_effect(self):
@@ -819,6 +820,7 @@ class CPythonOrderedDictSideEffects:
         self.assertDictEqual(dict1, {})
         self.assertDictEqual(dict2, dict.fromkeys((0, Key(), 4.2)))
 
+    @unittest.expectedFailure  # TODO: RUSTPYTHON; AttributeError: 'NoneType' object has no attribute 'key'
     def test_issue119004_change_size_by_delete_key(self):
         class Key(_TriggerSideEffectOnEqual):
             def side_effect(self):
@@ -832,6 +834,7 @@ class CPythonOrderedDictSideEffects:
         self.assertDictEqual(dict1, dict.fromkeys((0, 4.2)))
         self.assertDictEqual(dict2, dict.fromkeys((0, Key(), 4.2)))
 
+    @unittest.expectedFailure  # TODO: RUSTPYTHON; AssertionError: RuntimeError not raised by eq
     def test_issue119004_change_linked_list_by_clear(self):
         class Key(_TriggerSideEffectOnEqual):
             def side_effect(self):
@@ -845,6 +848,7 @@ class CPythonOrderedDictSideEffects:
         self.assertDictEqual(dict1, dict.fromkeys(('a', 'b'), 'c'))
         self.assertDictEqual(dict2, dict.fromkeys((0, Key(), 4.2)))
 
+    @unittest.expectedFailure  # TODO: RUSTPYTHON; AttributeError: 'NoneType' object has no attribute 'key'
     def test_issue119004_change_linked_list_by_delete_key(self):
         class Key(_TriggerSideEffectOnEqual):
             def side_effect(self):
@@ -859,6 +863,7 @@ class CPythonOrderedDictSideEffects:
         self.assertDictEqual(dict1, {0: None, 'a': 'c', 4.2: None})
         self.assertDictEqual(dict2, dict.fromkeys((0, Key(), 4.2)))
 
+    @unittest.expectedFailure  # TODO: RUSTPYTHON; AssertionError: 1 != 2
     def test_issue119004_change_size_by_delete_key_in_dict_eq(self):
         class Key(_TriggerSideEffectOnEqual):
             trigger = 0
@@ -918,7 +923,7 @@ class CPythonOrderedDictTests(OrderedDictTests,
         check(iter(od.items()), itersize)
         check(iter(od.values()), itersize)
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON
+    @unittest.expectedFailure  # TODO: RUSTPYTHON; AssertionError: RuntimeError not raised
     def test_key_change_during_iteration(self):
         OrderedDict = self.OrderedDict
 
