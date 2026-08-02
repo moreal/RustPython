@@ -258,30 +258,50 @@ pub enum SequenceIndex {
 }
 
 impl SequenceIndex {
+    /// Returns `None` when `obj` is not usable as an index, leaving the
+    /// `TypeError` wording to the caller (CPython gives each type its own).
+    pub fn try_from_borrowed_object_opt(
+        vm: &VirtualMachine,
+        obj: &PyObject,
+    ) -> Option<PyResult<Self>> {
+        if let Some(i) = obj.downcast_ref::<PyInt>() {
+            // TODO: number protocol
+            Some(
+                i.try_to_primitive(vm)
+                    .map_err(|_| {
+                        vm.new_index_error("cannot fit 'int' into an index-sized integer")
+                    })
+                    .map(Self::Int),
+            )
+        } else if let Some(slice) = obj.downcast_ref::<PySlice>() {
+            Some(slice.to_saturated(vm).map(Self::Slice))
+        } else {
+            obj.try_index_opt(vm).map(|i| {
+                // TODO: __index__ for indices is no more supported?
+                i.and_then(|i| {
+                    i.try_to_primitive(vm).map_err(|_| {
+                        vm.new_index_error("cannot fit 'int' into an index-sized integer")
+                    })
+                })
+                .map(Self::Int)
+            })
+        }
+    }
+
     pub fn try_from_borrowed_object(
         vm: &VirtualMachine,
         obj: &PyObject,
         type_name: &str,
     ) -> PyResult<Self> {
-        if let Some(i) = obj.downcast_ref::<PyInt>() {
-            // TODO: number protocol
-            i.try_to_primitive(vm)
-                .map_err(|_| vm.new_index_error("cannot fit 'int' into an index-sized integer"))
-                .map(Self::Int)
-        } else if let Some(slice) = obj.downcast_ref::<PySlice>() {
-            slice.to_saturated(vm).map(Self::Slice)
-        } else if let Some(i) = obj.try_index_opt(vm) {
-            // TODO: __index__ for indices is no more supported?
-            i?.try_to_primitive(vm)
-                .map_err(|_| vm.new_index_error("cannot fit 'int' into an index-sized integer"))
-                .map(Self::Int)
-        } else {
-            Err(vm.new_type_error(format!(
-                "{} indices must be integers or slices or classes that override __index__ operator, not '{}'",
-                type_name,
-                obj.class()
-            )))
-        }
+        Self::try_from_borrowed_object_opt(vm, obj)
+            .transpose()?
+            .ok_or_else(|| {
+                vm.new_type_error(format!(
+                    "{} indices must be integers or slices or classes that override __index__ operator, not '{}'",
+                    type_name,
+                    obj.class()
+                ))
+            })
     }
 }
 

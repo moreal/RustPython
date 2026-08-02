@@ -668,7 +668,17 @@ impl PyStr {
     }
 
     fn _getitem(&self, needle: &PyObject, vm: &VirtualMachine) -> PyResult {
-        let item = match SequenceIndex::try_from_borrowed_object(vm, needle, "str")? {
+        // CPython's unicode_subscript has its own TypeError wording,
+        // distinct from the shared sequence message.
+        let index = SequenceIndex::try_from_borrowed_object_opt(vm, needle)
+            .transpose()?
+            .ok_or_else(|| {
+                vm.new_type_error(format!(
+                    "string indices must be integers, not '{}'",
+                    needle.class()
+                ))
+            })?;
+        let item = match index {
             SequenceIndex::Int(i) => self.getitem_by_index(vm, i)?.to_pyobject(vm),
             SequenceIndex::Slice(slice) => self.getitem_by_slice(vm, slice)?.to_pyobject(vm),
         };
