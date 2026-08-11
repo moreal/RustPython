@@ -1,8 +1,11 @@
 """Tests for copy_lib.py - library copying with dependencies."""
 
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
+from unittest.mock import ANY, patch
 
 
 class TestCopySingle(unittest.TestCase):
@@ -69,6 +72,56 @@ class TestCopyLib(unittest.TestCase):
             copy_lib(pathlib.Path("some/path/without/lib.py"))
 
         self.assertIn("/Lib/", str(ctx.exception))
+
+
+class TestGenerateFiles(unittest.TestCase):
+    """Tests for repository-owned generated module dependencies."""
+
+    @patch("update_lib.cmd_copy_lib.subprocess.run")
+    def test_opcode_generates_python_and_rust_metadata(self, mock_run):
+        from update_lib.cmd_copy_lib import _generate_files
+
+        repo_root = pathlib.Path(__file__).parents[3].resolve()
+        cpython_root = pathlib.Path("cpython").resolve()
+        outputs = _generate_files("opcode", "cpython", verbose=False)
+
+        self.assertEqual(
+            outputs,
+            [
+                repo_root / "Lib/_opcode_metadata.py",
+                repo_root / "crates/compiler-core/src/bytecode/opcode_metadata.rs",
+            ],
+        )
+        self.assertEqual(mock_run.call_count, 2)
+        mock_run.assert_any_call(
+            [
+                sys.executable,
+                "tools/opcode_metadata/generate_py_opcode_metadata.py",
+            ],
+            cwd=repo_root,
+            env=ANY,
+            check=True,
+        )
+        mock_run.assert_any_call(
+            [
+                sys.executable,
+                "tools/opcode_metadata/generate_rs_opcode_metadata.py",
+            ],
+            cwd=repo_root,
+            env=ANY,
+            check=True,
+        )
+        for call in mock_run.call_args_list:
+            self.assertEqual(call.kwargs["env"]["CPYTHON_ROOT"], str(cpython_root))
+
+    @patch("update_lib.cmd_copy_lib.subprocess.run")
+    def test_generator_failure_is_reported(self, mock_run):
+        from update_lib.cmd_copy_lib import _generate_files
+
+        mock_run.side_effect = subprocess.CalledProcessError(1, "generator")
+
+        with self.assertRaises(subprocess.CalledProcessError):
+            _generate_files("opcode", "cpython", verbose=False)
 
 
 if __name__ == "__main__":

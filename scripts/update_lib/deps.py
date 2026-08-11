@@ -251,9 +251,16 @@ def clear_import_graph_caches() -> None:
 
 
 # Manual dependency table for irregular cases
-# Format: "name" -> {"lib": [...], "test": [...], "data": [...], "hard_deps": [...]}
+# Format: "name" -> {
+#     "lib": [...],
+#     "test": [...],
+#     "data": [...],
+#     "hard_deps": [...],
+#     "generated": [{"script": ..., "output": ...}],
+# }
 # - lib: override default path (default: name.py or name/)
 # - hard_deps: additional files to copy alongside the main module
+# - generated: repository files to regenerate after copying the main module
 DEPENDENCIES = {
     # regrtest is in Lib/test/libregrtest/, not Lib/libregrtest/
     "regrtest": {
@@ -310,7 +317,16 @@ DEPENDENCIES = {
         "hard_deps": ["_sitebuiltins.py"],
     },
     "opcode": {
-        "hard_deps": ["_opcode_metadata.py"],
+        "generated": [
+            {
+                "script": "tools/opcode_metadata/generate_py_opcode_metadata.py",
+                "output": "Lib/_opcode_metadata.py",
+            },
+            {
+                "script": "tools/opcode_metadata/generate_rs_opcode_metadata.py",
+                "output": "crates/compiler-core/src/bytecode/opcode_metadata.rs",
+            },
+        ],
         "test": [
             "test_opcode.py",
             "test__opcode.py",
@@ -734,10 +750,11 @@ DEPENDENCIES = {
 
 
 def resolve_hard_dep_parent(name: str, cpython_prefix: str) -> str | None:
-    """Resolve a hard_dep name to its parent module.
+    """Resolve a hard dependency or generated file to its parent module.
 
     Only returns a parent if the file is actually tracked:
     - Explicitly listed in DEPENDENCIES as a hard_dep
+    - Declared as a generated output for a module
     - Or auto-detected _py{module}.py pattern where the parent module exists
 
     Args:
@@ -751,12 +768,17 @@ def resolve_hard_dep_parent(name: str, cpython_prefix: str) -> str | None:
     if name.endswith(".py"):
         name = name[:-3]
 
-    # Check DEPENDENCIES table first (explicit hard_deps)
+    # Check DEPENDENCIES table first (explicit hard_deps and generated files)
     for module_name, dep_info in DEPENDENCIES.items():
-        hard_deps = dep_info.get("hard_deps", [])
-        for dep in hard_deps:
+        deps = list(dep_info.get("hard_deps", []))
+        for spec in dep_info.get("generated", []):
+            output = pathlib.Path(spec["output"])
+            if output.parts[0] == "Lib":
+                deps.append(output.name)
+        for dep in deps:
             # Normalize dep: remove .py extension
-            dep_normalized = dep[:-3] if dep.endswith(".py") else dep
+            dep_name = pathlib.Path(dep).name
+            dep_normalized = dep_name[:-3] if dep_name.endswith(".py") else dep_name
             if dep_normalized == name:
                 return module_name
 

@@ -11,6 +11,7 @@ from update_lib.deps import (
     get_test_paths,
     parse_lib_imports,
     parse_test_imports,
+    resolve_hard_dep_parent,
 )
 
 
@@ -99,6 +100,31 @@ class TestGetLibPaths(unittest.TestCase):
 
             paths = get_lib_paths("foo", str(tmpdir))
             self.assertEqual(paths, (tmpdir / "Lib" / "foo",))
+
+    def test_generated_file_is_not_copied_from_cpython(self):
+        """Generated files are not regular hard dependencies."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir = pathlib.Path(tmpdir)
+            lib_dir = tmpdir / "Lib"
+            lib_dir.mkdir()
+            (lib_dir / "opcode.py").write_text("# opcode")
+            (lib_dir / "_opcode_metadata.py").write_text("# CPython metadata")
+
+            paths = get_lib_paths("opcode", str(tmpdir))
+
+            self.assertEqual(paths, (lib_dir / "opcode.py",))
+
+
+class TestResolveHardDepParent(unittest.TestCase):
+    """Tests for grouping copied and generated dependencies."""
+
+    def test_generated_output_resolves_to_parent(self):
+        self.assertEqual(
+            resolve_hard_dep_parent("_opcode_metadata", "cpython"), "opcode"
+        )
+
+    def test_generated_non_lib_output_is_not_a_module_dependency(self):
+        self.assertIsNone(resolve_hard_dep_parent("opcode_metadata", "cpython"))
 
 
 class TestGetTestPaths(unittest.TestCase):

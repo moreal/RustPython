@@ -390,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.copy:
                 from update_lib.cmd_copy_lib import copy_lib
 
-                copy_lib(src_path)
+                hard_deps_for_commit.extend(copy_lib(src_path))
 
             # Get all test paths from DEPENDENCIES (or fall back to default)
             module_name = get_module_name(original_src)

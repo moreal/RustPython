@@ -11,8 +11,10 @@ Usage:
 """
 
 import argparse
+import os
 import pathlib
 import shutil
+import subprocess
 import sys
 
 
@@ -46,10 +48,39 @@ def _copy_single(
         shutil.copy2(src_path, lib_path)
 
 
+def _generate_files(
+    name: str,
+    cpython_prefix: str,
+    verbose: bool = True,
+) -> list[pathlib.Path]:
+    """Generate repository-owned files associated with a CPython module."""
+    from update_lib.deps import DEPENDENCIES
+
+    repo_root = pathlib.Path(__file__).parents[2].resolve()
+    env = os.environ.copy()
+    env["CPYTHON_ROOT"] = str(pathlib.Path(cpython_prefix).resolve())
+    outputs = []
+
+    for spec in DEPENDENCIES.get(name, {}).get("generated", []):
+        script = pathlib.Path(spec["script"])
+        output = repo_root / spec["output"]
+        if verbose:
+            print(f"Generating file: {script} -> {output.relative_to(repo_root)}")
+        subprocess.run(
+            [sys.executable, str(script)],
+            cwd=repo_root,
+            env=env,
+            check=True,
+        )
+        outputs.append(output)
+
+    return outputs
+
+
 def copy_lib(
     src_path: pathlib.Path,
     verbose: bool = True,
-) -> None:
+) -> list[pathlib.Path]:
     """
     Copy library file or directory from CPython.
 
@@ -58,6 +89,9 @@ def copy_lib(
     Args:
         src_path: Source path (e.g., cpython/Lib/dataclasses.py or cpython/Lib/json)
         verbose: Print progress messages
+
+    Returns:
+        Generated repository paths that should be included in the update commit.
     """
     from update_lib.deps import get_lib_paths
     from update_lib.file_utils import parse_lib_path
@@ -81,6 +115,8 @@ def copy_lib(
         if src.exists():
             lib_path = parse_lib_path(src)
             _copy_single(src, lib_path, verbose)
+
+    return _generate_files(name, cpython_prefix, verbose)
 
 
 def main(argv: list[str] | None = None) -> int:
