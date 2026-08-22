@@ -89,6 +89,14 @@ pub(super) unsafe fn default_dealloc<T: PyPayload>(obj: *mut PyObject) {
         return; // resurrected by __del__
     }
 
+    // Remove from the GC tracking table while the memory is still valid, so
+    // the table never holds a dangling pointer.
+    if obj_ref.is_gc_tracked() {
+        unsafe {
+            crate::gc_state::gc_state().untrack_object(NonNull::new_unchecked(obj));
+        }
+    }
+
     // Extract child references before deallocation to break circular refs (tp_clear).
     // This ensures that when edges are dropped after the object is freed,
     // any pointers back to this object are already gone.
@@ -147,6 +155,10 @@ bitflags::bitflags! {
         const SHARED_INLINE = 1 << 5;
         /// Use deferred reference counting
         const DEFERRED = 1 << 6;
+        /// At least one weakref to this object has been created at some point.
+        /// Never cleared once set; lets deallocation skip the weakref-clearing
+        /// stripe lock for the vast majority of objects.
+        const HAS_WEAKREFS = 1 << 7;
     }
 }
 
@@ -316,6 +328,13 @@ impl WeakRefList {
         dict: Option<PyDictRef>,
     ) -> PyRef<PyWeak> {
         let is_generic = cls_is_weakref && callback.is_none();
+
+        // Record that this object has (or had) weakrefs. The flag is monotonic
+        // and becomes visible to the deallocating thread via the release/acquire
+        // ordering of the final refcount decrement, since a weakref can only be
+        // created while a strong reference exists.
+        obj.set_gc_bit(GcBits::HAS_WEAKREFS);
+
         let _lock = weakref_lock::lock(obj as *const PyObject as usize);
 
         // try_reuse_basic_ref: reuse cached generic weakref
@@ -1021,6 +1040,22 @@ impl PyObject {
         GcBits::from_bits_retain(self.0.gc_bits.load(Ordering::Relaxed)).contains(GcBits::FINALIZED)
     }
 
+    /// Whether a weakref to this object has ever been created.
+    #[inline]
+    fn has_weakrefs(&self) -> bool {
+        GcBits::from_bits_retain(self.0.gc_bits.load(Ordering::Relaxed))
+            .contains(GcBits::HAS_WEAKREFS)
+    }
+
+    /// Attempt to clone a strong reference, failing if the object is already
+    /// being destroyed (refcount 0). Used by GC introspection.
+    pub(crate) fn try_to_owned(&self) -> Option<PyObjectRef> {
+        self.0
+            .ref_count
+            .safe_inc()
+            .then(|| unsafe { PyObjectRef::from_raw(NonNull::from(self)) })
+    }
+
     /// Mark the object as finalized. Should be called before __del__.
     /// _PyGC_SET_FINALIZED in Py_GIL_DISABLED mode.
     #[inline]
@@ -1100,7 +1135,11 @@ impl PyObject {
         // Note: This differs from GC behavior which clears weakrefs before finalizers,
         // but for direct deallocation (drop_slow_inner), we need to allow the finalizer
         // to run without triggering use-after-free from WeakRefList operations.
-        if let Some(wrl) = self.weak_ref_list() {
+        // Skipped entirely when no weakref was ever created for this object
+        // (the common case), avoiding the stripe lock on every deallocation.
+        if self.has_weakrefs()
+            && let Some(wrl) = self.weak_ref_list()
+        {
             wrl.clear(self);
         }
 

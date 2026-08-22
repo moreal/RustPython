@@ -41,6 +41,15 @@ impl Drop for SignalHandlerGuard {
 #[cfg_attr(feature = "flame-it", flame)]
 #[inline(always)]
 pub fn check_signals(vm: &VirtualMachine) -> PyResult<()> {
+    // Plain load fast path: this runs for every bytecode instruction, and an
+    // atomic swap (a locked RMW) on a shared cache line is much more expensive
+    // than a relaxed load. A signal set between the load and the next check is
+    // picked up one instruction later, which matches CPython's eval-breaker
+    // semantics.
+    if !ANY_TRIGGERED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
     if vm.signal_handlers.get().is_none() {
         return Ok(());
     }

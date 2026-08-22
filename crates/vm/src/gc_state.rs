@@ -1,13 +1,20 @@
 //! Garbage Collection State and Algorithm
 //!
 //! This module implements CPython-compatible generational garbage collection
-//! for RustPython, using an intrusive doubly-linked list approach.
+//! for RustPython.
+//!
+//! Tracking is kept deliberately cheap: objects are recorded in a single
+//! pointer-keyed table mapping each tracked object to its generation, using a
+//! trivial pointer hash. Objects are removed from the table when they are
+//! deallocated (see `default_dealloc`), so the table never contains dangling
+//! pointers.
 
 use crate::common::lock::PyMutex;
 use crate::{PyObject, PyObjectRef};
+use core::hash::BuildHasherDefault;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
 
 bitflags::bitflags! {
@@ -35,7 +42,7 @@ pub struct GcStats {
     pub uncollectable: usize,
 }
 
-/// A single GC generation with intrusive linked list
+/// A single GC generation
 pub struct GcGeneration {
     /// Number of objects in this generation
     count: AtomicUsize,
@@ -59,15 +66,15 @@ impl GcGeneration {
     }
 
     pub fn count(&self) -> usize {
-        self.count.load(Ordering::SeqCst)
+        self.count.load(Ordering::Relaxed)
     }
 
     pub fn threshold(&self) -> u32 {
-        self.threshold.load(Ordering::SeqCst)
+        self.threshold.load(Ordering::Relaxed)
     }
 
     pub fn set_threshold(&self, value: u32) {
-        self.threshold.store(value, Ordering::SeqCst);
+        self.threshold.store(value, Ordering::Relaxed);
     }
 
     pub fn stats(&self) -> GcStats {
@@ -85,6 +92,13 @@ impl GcGeneration {
         guard.collected += collected;
         guard.uncollectable += uncollectable;
     }
+
+    /// Decrement the count, saturating at zero.
+    fn dec_count(&self) {
+        let _ = self
+            .count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_sub(1));
+    }
 }
 
 /// Wrapper for raw pointer to make it Send + Sync
@@ -95,6 +109,43 @@ struct GcObjectPtr(NonNull<PyObject>);
 unsafe impl Send for GcObjectPtr {}
 unsafe impl Sync for GcObjectPtr {}
 
+/// A trivial hasher for object pointers. Tracking runs on every allocation of
+/// a GC-eligible object, so hashing must be as cheap as possible; a single
+/// multiply disperses the (already mostly unique) address bits well enough for
+/// a hash table, unlike the default SipHash which costs far more per key.
+#[derive(Default)]
+struct PtrHasher(u64);
+
+impl core::hash::Hasher for PtrHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        self.write_u64(n as u64);
+    }
+}
+
+/// Generation index stored for frozen (permanent) objects.
+const PERMANENT_GEN: u8 = 3;
+
+/// Map from tracked object to the generation it currently lives in
+/// (0-2, or `PERMANENT_GEN` for frozen objects).
+type TrackedMap = HashMap<GcObjectPtr, u8, BuildHasherDefault<PtrHasher>>;
+
 /// Global GC state
 pub struct GcState {
     /// 3 generations (0 = youngest, 2 = oldest)
@@ -103,11 +154,8 @@ pub struct GcState {
     pub permanent: GcGeneration,
     /// GC enabled flag
     pub enabled: AtomicBool,
-    /// Per-generation object tracking (for correct gc_refs algorithm)
-    /// Objects start in gen0, survivors move to gen1, then gen2
-    generation_objects: [RwLock<HashSet<GcObjectPtr>>; 3],
-    /// Frozen/permanent objects (excluded from normal GC)
-    permanent_objects: RwLock<HashSet<GcObjectPtr>>,
+    /// All tracked objects and the generation each lives in
+    tracked: RwLock<TrackedMap>,
     /// Debug flags
     pub debug: AtomicU32,
     /// gc.garbage list (uncollectable objects with __del__)
@@ -118,13 +166,6 @@ pub struct GcState {
     /// Used by collect_inner when the actual collection algorithm is enabled.
     #[allow(dead_code)]
     collecting: Mutex<()>,
-    /// Allocation counter for gen0
-    alloc_count: AtomicUsize,
-    /// Registry of all tracked objects (for cycle detection)
-    tracked_objects: RwLock<HashSet<GcObjectPtr>>,
-    /// Objects that have been finalized (__del__ already called)
-    /// Prevents calling __del__ multiple times on resurrected objects
-    finalized_objects: RwLock<HashSet<GcObjectPtr>>,
 }
 
 // SAFETY: All fields are either inherently Send/Sync (atomics, RwLock, Mutex) or protected by PyMutex.
@@ -149,45 +190,37 @@ impl GcState {
             ],
             permanent: GcGeneration::new(0),
             enabled: AtomicBool::new(true),
-            generation_objects: [
-                RwLock::new(HashSet::new()),
-                RwLock::new(HashSet::new()),
-                RwLock::new(HashSet::new()),
-            ],
-            permanent_objects: RwLock::new(HashSet::new()),
+            tracked: RwLock::new(TrackedMap::default()),
             debug: AtomicU32::new(0),
             garbage: PyMutex::new(Vec::new()),
             callbacks: PyMutex::new(Vec::new()),
             collecting: Mutex::new(()),
-            alloc_count: AtomicUsize::new(0),
-            tracked_objects: RwLock::new(HashSet::new()),
-            finalized_objects: RwLock::new(HashSet::new()),
         }
     }
 
     /// Check if GC is enabled
     pub fn is_enabled(&self) -> bool {
-        self.enabled.load(Ordering::SeqCst)
+        self.enabled.load(Ordering::Relaxed)
     }
 
     /// Enable GC
     pub fn enable(&self) {
-        self.enabled.store(true, Ordering::SeqCst);
+        self.enabled.store(true, Ordering::Relaxed);
     }
 
     /// Disable GC
     pub fn disable(&self) {
-        self.enabled.store(false, Ordering::SeqCst);
+        self.enabled.store(false, Ordering::Relaxed);
     }
 
     /// Get debug flags
     pub fn get_debug(&self) -> GcDebugFlags {
-        GcDebugFlags::from_bits_truncate(self.debug.load(Ordering::SeqCst))
+        GcDebugFlags::from_bits_truncate(self.debug.load(Ordering::Relaxed))
     }
 
     /// Set debug flags
     pub fn set_debug(&self, flags: GcDebugFlags) {
-        self.debug.store(flags.bits(), Ordering::SeqCst);
+        self.debug.store(flags.bits(), Ordering::Relaxed);
     }
 
     /// Get thresholds for all generations
@@ -240,18 +273,10 @@ impl GcState {
         let obj_ref = unsafe { obj.as_ref() };
         obj_ref.set_gc_tracked();
 
-        // Add to generation 0 tracking first (for correct gc_refs algorithm)
-        // Only increment count if we successfully add to the set
-        if let Ok(mut gen0) = self.generation_objects[0].write()
-            && gen0.insert(gc_ptr)
+        if let Ok(mut tracked) = self.tracked.write()
+            && tracked.insert(gc_ptr, 0).is_none()
         {
-            self.generations[0].count.fetch_add(1, Ordering::SeqCst);
-            self.alloc_count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        // Also add to global tracking (for get_objects, etc.)
-        if let Ok(mut tracked) = self.tracked_objects.write() {
-            tracked.insert(gc_ptr);
+            self.generations[0].count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -263,121 +288,52 @@ impl GcState {
     pub unsafe fn untrack_object(&self, obj: NonNull<PyObject>) {
         let gc_ptr = GcObjectPtr(obj);
 
-        // Remove from generation tracking lists and decrement the correct generation's count
-        for (gen_idx, generation) in self.generation_objects.iter().enumerate() {
-            if let Ok(mut gen_set) = generation.write()
-                && gen_set.remove(&gc_ptr)
-            {
-                // Decrement count for the generation we removed from
-                let count = self.generations[gen_idx].count.load(Ordering::SeqCst);
-                if count > 0 {
-                    self.generations[gen_idx]
-                        .count
-                        .fetch_sub(1, Ordering::SeqCst);
-                }
-                break; // Object can only be in one generation
-            }
-        }
-
-        // Remove from global tracking
-        if let Ok(mut tracked) = self.tracked_objects.write() {
-            tracked.remove(&gc_ptr);
-        }
-
-        // Remove from permanent tracking
-        if let Ok(mut permanent) = self.permanent_objects.write()
-            && permanent.remove(&gc_ptr)
-        {
-            let count = self.permanent.count.load(Ordering::SeqCst);
-            if count > 0 {
-                self.permanent.count.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-
-        // Remove from finalized set
-        if let Ok(mut finalized) = self.finalized_objects.write() {
-            finalized.remove(&gc_ptr);
-        }
-    }
-
-    /// Check if an object has been finalized
-    pub fn is_finalized(&self, obj: NonNull<PyObject>) -> bool {
-        let gc_ptr = GcObjectPtr(obj);
-        if let Ok(finalized) = self.finalized_objects.read() {
-            finalized.contains(&gc_ptr)
-        } else {
-            false
-        }
-    }
-
-    /// Mark an object as finalized
-    pub fn mark_finalized(&self, obj: NonNull<PyObject>) {
-        let gc_ptr = GcObjectPtr(obj);
-        if let Ok(mut finalized) = self.finalized_objects.write() {
-            finalized.insert(gc_ptr);
+        let removed = match self.tracked.write() {
+            Ok(mut tracked) => tracked.remove(&gc_ptr),
+            Err(_) => None,
+        };
+        match removed {
+            Some(generation @ 0..=2) => self.generations[generation as usize].dec_count(),
+            Some(_) => self.permanent.dec_count(),
+            None => {}
         }
     }
 
     /// Get tracked objects (for gc.get_objects)
     /// If generation is None, returns all tracked objects.
     /// If generation is Some(n), returns objects in generation n only.
+    ///
+    /// Objects in the table are guaranteed to be alive: deallocation removes
+    /// them under the same lock before their memory is freed. Objects that are
+    /// mid-destruction (refcount 0) fail `try_to_owned` and are skipped.
     pub fn get_objects(&self, generation: Option<i32>) -> Vec<PyObjectRef> {
-        match generation {
-            None => {
-                // Return all tracked objects
-                if let Ok(tracked) = self.tracked_objects.read() {
-                    tracked
-                        .iter()
-                        .filter_map(|ptr| {
-                            let obj = unsafe { ptr.0.as_ref() };
-                            if obj.strong_count() > 0 {
-                                Some(obj.to_owned())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
+        let Ok(tracked) = self.tracked.read() else {
+            return Vec::new();
+        };
+        tracked
+            .iter()
+            .filter_map(|(ptr, &obj_gen)| {
+                if let Some(g) = generation
+                    && obj_gen != g as u8
+                {
+                    return None;
                 }
-            }
-            Some(g) if (0..=2).contains(&g) => {
-                // Return objects in specific generation
-                let gen_idx = g as usize;
-                if let Ok(gen_set) = self.generation_objects[gen_idx].read() {
-                    gen_set
-                        .iter()
-                        .filter_map(|ptr| {
-                            let obj = unsafe { ptr.0.as_ref() };
-                            if obj.strong_count() > 0 {
-                                Some(obj.to_owned())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            }
-            _ => Vec::new(),
-        }
+                let obj = unsafe { ptr.0.as_ref() };
+                obj.try_to_owned()
+            })
+            .collect()
     }
 
     /// Check if automatic GC should run and run it if needed.
     /// Called after object allocation.
     /// Returns true if GC was run, false otherwise.
     pub fn maybe_collect(&self) -> bool {
-        if !self.is_enabled() {
-            return false;
-        }
-
         // _PyObject_GC_Alloc checks thresholds
 
         // Check gen0 threshold
-        let count0 = self.generations[0].count.load(Ordering::SeqCst) as u32;
+        let count0 = self.generations[0].count.load(Ordering::Relaxed) as u32;
         let threshold0 = self.generations[0].threshold();
-        if threshold0 > 0 && count0 >= threshold0 {
+        if threshold0 > 0 && count0 >= threshold0 && self.is_enabled() {
             self.collect(0);
             return true;
         }
@@ -393,7 +349,7 @@ impl GcState {
     pub fn collect(&self, _generation: usize) -> (usize, usize) {
         // gc_collect_main
         // Reset gen0 count even though we're not actually collecting
-        self.generations[0].count.store(0, Ordering::SeqCst);
+        self.generations[0].count.store(0, Ordering::Relaxed);
         (0, 0)
     }
 
@@ -402,7 +358,7 @@ impl GcState {
     /// Currently a stub.
     pub fn collect_force(&self, _generation: usize) -> (usize, usize) {
         // Reset gen0 count even though we're not actually collecting
-        self.generations[0].count.store(0, Ordering::SeqCst);
+        self.generations[0].count.store(0, Ordering::Relaxed);
         (0, 0)
     }
 
@@ -413,42 +369,35 @@ impl GcState {
 
     /// Freeze all tracked objects (move to permanent generation)
     pub fn freeze(&self) {
-        // Move all objects from gen0-2 to permanent
-        let mut objects_to_freeze: Vec<GcObjectPtr> = Vec::new();
-
-        for (gen_idx, generation) in self.generation_objects.iter().enumerate() {
-            if let Ok(mut gen_set) = generation.write() {
-                objects_to_freeze.extend(gen_set.drain());
-                self.generations[gen_idx].count.store(0, Ordering::SeqCst);
+        if let Ok(mut tracked) = self.tracked.write() {
+            let mut frozen = 0usize;
+            for obj_gen in tracked.values_mut() {
+                if *obj_gen != PERMANENT_GEN {
+                    *obj_gen = PERMANENT_GEN;
+                    frozen += 1;
+                }
             }
-        }
-
-        // Add to permanent set
-        if let Ok(mut permanent) = self.permanent_objects.write() {
-            let count = objects_to_freeze.len();
-            for ptr in objects_to_freeze {
-                permanent.insert(ptr);
+            for generation in &self.generations {
+                generation.count.store(0, Ordering::Relaxed);
             }
-            self.permanent.count.fetch_add(count, Ordering::SeqCst);
+            self.permanent.count.fetch_add(frozen, Ordering::Relaxed);
         }
     }
 
     /// Unfreeze all objects (move from permanent to gen2)
     pub fn unfreeze(&self) {
-        let mut objects_to_unfreeze: Vec<GcObjectPtr> = Vec::new();
-
-        if let Ok(mut permanent) = self.permanent_objects.write() {
-            objects_to_unfreeze.extend(permanent.drain());
-            self.permanent.count.store(0, Ordering::SeqCst);
-        }
-
-        // Add to generation 2
-        if let Ok(mut gen2) = self.generation_objects[2].write() {
-            let count = objects_to_unfreeze.len();
-            for ptr in objects_to_unfreeze {
-                gen2.insert(ptr);
+        if let Ok(mut tracked) = self.tracked.write() {
+            let mut unfrozen = 0usize;
+            for obj_gen in tracked.values_mut() {
+                if *obj_gen == PERMANENT_GEN {
+                    *obj_gen = 2;
+                    unfrozen += 1;
+                }
             }
-            self.generations[2].count.fetch_add(count, Ordering::SeqCst);
+            self.permanent.count.store(0, Ordering::Relaxed);
+            self.generations[2]
+                .count
+                .fetch_add(unfrozen, Ordering::Relaxed);
         }
     }
 }
