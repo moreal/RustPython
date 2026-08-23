@@ -17,7 +17,13 @@
 # script), are immune to CPU contention and frequency scaling, and stay
 # comparable even when measurements run concurrently. The trade-off is a
 # ~50x slowdown under callgrind, which the workload sizes in
-# scripts/perf_ci.py are tuned for. See benches/perf_ci/README.md.
+# scripts/perf_ci.py are tuned for.
+#
+# Workloads are split into three tiers -- boot, micro, macro -- because they
+# measure different things: boot and macro report whole-process counts, while
+# micro workloads are measured at two iteration counts so that interpreter
+# startup and imports cancel out of the reported number. See
+# benches/perf_ci/README.md.
 #
 # Budget: measurement (both binaries, excluding builds) is parallelized and
 # targets well under 10 minutes; builds reuse the shared cargo cache and the
@@ -37,6 +43,8 @@ on:
       - "crates/**"
       - "src/**"
       - "benches/perf_ci/**"
+      # The macro tier drives these directly rather than vendoring copies.
+      - "benches/benchmarks/**"
       - "scripts/perf_ci.py"
       - ".github/workflows/perf-ci.yaml"
   workflow_dispatch:

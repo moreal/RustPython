@@ -35,13 +35,44 @@ with the binary it is about to measure, then measures with `-B` so the timed
 runs cannot mutate it. Both binaries are thus compared in the same steady
 state, and the numbers do not depend on measurement order.
 
+## The three tiers
+
+Workloads measure three different things, and one measurement recipe cannot
+serve all of them. `scripts/perf_ci.py list` shows each workload's tier.
+
+**`boot`** — `startup` (`-c pass`) and `import_stdlib`. The whole process is
+the subject, so the raw instruction count is reported. An in-process harness
+such as the criterion benches structurally cannot measure these.
+
+**`micro`** — one interpreter axis in a tight loop (`micro/`). Here the process
+is *not* the subject: booting the VM costs ~135M instructions, which is 6-24%
+of a micro workload's raw count, so a regression in the loop body would show up
+diluted, and by a different factor for each workload — a 10% regression reads
+as anywhere from 4.6% to 9.4%, which means one threshold would silently mean
+something different everywhere. Each micro workload is therefore measured
+twice, at N and at N/10 iterations, and the reported value is the difference.
+Every fixed cost — boot, imports, setup — cancels exactly, so 10% reads as 10%
+on every workload. This costs about 15% extra time on the micro tier.
+
+The linearity that relies on was checked: fitting the two points and
+extrapolating back to zero iterations lands within 1-3% of the standalone
+`-c pass` floor across workloads whose per-iteration cost spans a factor of 24.
+A zero-iteration baseline would be cheaper still, but is not safe — some
+workloads degenerate at N=0 (an empty list has no `lst[0]`).
+
+**`macro`** — whole programs: numeric kernels (nbody, spectral_norm, scimark,
+fannkuch, mandelbrot, float, nqueens) and application-style benchmarks
+(richards, deltablue, raytrace, chaos, json_loads). End-to-end cost is the
+question being asked, boot is a smaller share (4.5-24%), and not all of them
+expose an iteration knob, so the raw count is reported. These catch regressions
+that only appear when features interact — an optimization can win on a micro
+axis and lose in realistic code.
+
 ## Layout
 
-* `micro/` — targeted microbenchmarks written for this gate, one interpreter
-  axis per file: integer/float arithmetic, function calls, method calls,
-  instance attribute loads, dict/list/str operations, class creation,
-  exception handling, and stdlib import cost. Interpreter startup (`-c pass`)
-  is measured directly by `scripts/perf_ci.py`.
+* `micro/` — microbenchmarks written for this gate, one axis per file. Each
+  reads its iteration count from `PERF_CI_N` so the two-point measurement can
+  drive it.
 * `pyperformance/` — benchmark kernels vendored from
   [pyperformance](https://github.com/python/pyperformance) 1.14.0 (MIT
   license, see `pyperformance/COPYING`). Modifications are limited to
@@ -50,6 +81,17 @@ state, and the numbers do not depend on measurement order.
   `pyperformance/pyperf.py` is a minimal local stand-in for
   the real pyperf harness so the kernels run unmodified; it is our code, not
   vendored.
+* `../benchmarks/` — the benchmarks that predate this gate. They are standalone
+  scripts, so the gate drives them directly rather than vendoring copies:
+  `nbody`, `fannkuch`, `mandelbrot`, `json_loads`. `benches/execution.rs` still
+  runs the same files under criterion.
+
+Note that `../microbenchmarks/` is *not* used here. Those files are fragments
+split on `# ---` with an externally injected `ITERATIONS`, not standalone
+scripts, so they only run under the in-process criterion harness. They also
+lack the axes this gate most needs — no file there touches attribute access —
+and eight of the twenty-one are disabled in `microbenchmarks.rs` for memory
+blowups.
 
 The full pyperformance harness is not used because it hard-requires building
 `psutil` (a CPython C extension) into a venv managed by the measured
@@ -71,7 +113,13 @@ python3 scripts/perf_ci.py measure --binary target/release/rustpython -o base.js
 python3 scripts/perf_ci.py compare base.json head.json
 ```
 
+Useful flags: `--bench <name>` (repeatable) to measure one workload while
+iterating, `--jobs N` for parallelism, `--threshold 0.05` to loosen the gate.
+
 Workload sizes are tuned so one full measurement of one binary takes a few
-minutes (callgrind slows execution ~50x). When adding a workload, keep its
-native runtime in the 50-500 ms range and make it deterministic: fixed seeds,
-no wall-clock dependence, no filesystem or network I/O in the hot path.
+minutes (callgrind slows execution ~50x). When adding one, make it
+deterministic — fixed seeds, no wall-clock dependence, no filesystem or network
+I/O in the hot path — then add an entry to `WORKLOADS` in
+`scripts/perf_ci.py`. A `micro` entry must read its loop count from
+`PERF_CI_N` and stay well-defined at N/10; a `macro` or `boot` entry should run
+in 50-500 ms natively.

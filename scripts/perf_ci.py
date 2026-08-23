@@ -21,6 +21,30 @@ Instruction count is a proxy for time (it cannot see cache/branch effects),
 but for an interpreter hot-loop it tracks real cost closely and, above all,
 it makes the gate reproducible: a red gate is always caused by the diff.
 
+Workloads fall into three tiers, because they measure three different things
+and a single measurement recipe cannot serve all of them:
+
+* "boot" -- interpreter startup and the import machinery. The whole process
+  *is* the subject, so the raw count is reported. An in-process harness
+  structurally cannot see these.
+* "micro" -- one interpreter axis in a tight loop. Here the process is not
+  the subject: booting the VM costs ~135M instructions, which is 6-24% of a
+  micro workload's raw count, so a regression in the loop body shows up
+  diluted and by a different factor per workload. Each micro workload is
+  therefore measured twice, at N and at N/10 iterations, and the reported
+  value is the difference: every fixed cost (boot, imports, setup) cancels
+  exactly, so a 10% regression in the body reads as 10% everywhere and one
+  threshold means the same thing for every workload. Measured intercepts land
+  within 1-3% of the standalone `-c pass` floor across workloads whose
+  per-iteration cost spans a factor of 24, so the linearity this relies on
+  holds. A zero-iteration baseline would be cheaper but is not safe: some
+  workloads degenerate at N=0 (an empty list has no lst[0]).
+* "macro" -- whole programs, both numeric kernels (nbody, spectral_norm,
+  scimark) and application-style benchmarks (richards, deltablue, raytrace).
+  End-to-end cost is the question being asked, boot is a smaller share
+  (4.5-24%), and not all of them expose an iteration knob, so the raw count
+  is reported.
+
 The interpreter is run with PYTHONHASHSEED=0 so that str/bytes hashing, and
 therefore dict layout, is identical across runs. Each measurement run first
 purges the bytecode cache and then repopulates it with the binary it is about
@@ -49,33 +73,99 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PERF_DIR = os.path.join("benches", "perf_ci")
 MICRO = os.path.join(PERF_DIR, "micro")
 PYPERF = os.path.join(PERF_DIR, "pyperformance")
+# Benchmarks that predate this gate and are also driven by benches/execution.rs.
+BENCHMARKS = os.path.join("benches", "benchmarks")
 
-# Workload table. Each entry: name -> (argv after the binary, extra env).
-# Sizes are tuned so that a single run takes roughly 50-500 ms natively
-# (a few seconds under callgrind) while still executing enough guest code
-# that interpreter startup (~135M Ir) stays a small fraction of the total.
+# How much smaller the second measurement point of a micro workload is. The
+# baseline run costs roughly (fixed + body/10), so this buys exact fixed-cost
+# cancellation for about 15% extra time on the micro tier.
+MICRO_BASELINE_DIVISOR = 10
+
+# Workload table. Each entry carries its tier (see the module docstring), the
+# argv passed after the binary, optional extra environment, and -- for micro
+# workloads -- the iteration count fed to the script through PERF_CI_N.
+#
+# Macro and boot workloads are sized so that a single run takes roughly
+# 50-500 ms natively, a few seconds under callgrind's ~50x slowdown.
 WORKLOADS = {
-    # Interpreter startup cost: process creation to exit with a no-op program.
-    "startup": (["-c", "pass"], {}),
-    # Import machinery: startup plus a handful of common stdlib imports.
-    "import_stdlib": ([os.path.join(MICRO, "import_stdlib.py")], {}),
-    # Targeted microbenchmarks, one interpreter axis each.
-    "int_arith": ([os.path.join(MICRO, "int_arith.py")], {}),
-    "float_arith": ([os.path.join(MICRO, "float_arith.py")], {}),
-    "call_function": ([os.path.join(MICRO, "call_function.py")], {}),
-    "method_call": ([os.path.join(MICRO, "method_call.py")], {}),
-    "attr_load": ([os.path.join(MICRO, "attr_load.py")], {}),
-    "dict_ops": ([os.path.join(MICRO, "dict_ops.py")], {}),
-    "list_ops": ([os.path.join(MICRO, "list_ops.py")], {}),
-    "str_ops": ([os.path.join(MICRO, "str_ops.py")], {}),
-    "class_create": ([os.path.join(MICRO, "class_create.py")], {}),
-    "exceptions": ([os.path.join(MICRO, "exceptions.py")], {}),
-    # Vendored pyperformance kernels (see benches/perf_ci/pyperformance/).
-    # Workload sizes are shrunk from upstream defaults via CLI args or env so
-    # each run stays affordable under callgrind's ~50x slowdown.
-    "nbody": ([os.path.join(PYPERF, "bm_nbody.py"), "--iterations", "500"], {}),
-    "chaos": (
-        [
+    # -- boot: the process itself is the subject ---------------------------
+    "startup": {"tier": "boot", "argv": ["-c", "pass"]},
+    "import_stdlib": {
+        "tier": "boot",
+        "argv": [os.path.join(MICRO, "import_stdlib.py")],
+    },
+    # -- micro: one interpreter axis each, fixed cost cancelled ------------
+    "int_arith": {
+        "tier": "micro",
+        "argv": [os.path.join(MICRO, "int_arith.py")],
+        "iterations": 200000,
+    },
+    "float_arith": {
+        "tier": "micro",
+        "argv": [os.path.join(MICRO, "float_arith.py")],
+        "iterations": 200000,
+    },
+    "call_function": {
+        "tier": "micro",
+        "argv": [os.path.join(MICRO, "call_function.py")],
+        "iterations": 100000,
+    },
+    "method_call": {
+        "tier": "micro",
+        "argv": [os.path.join(MICRO, "method_call.py")],
+        "iterations": 100000,
+    },
+    "attr_load": {
+        "tier": "micro",
+        "argv": [os.path.join(MICRO, "attr_load.py")],
+        "iterations": 100000,
+    },
+    "dict_ops": {
+        "tier": "micro",
+        "argv": [os.path.join(MICRO, "dict_ops.py")],
+        "iterations": 50000,
+    },
+    "list_ops": {
+        "tier": "micro",
+        "argv": [os.path.join(MICRO, "list_ops.py")],
+        "iterations": 50000,
+    },
+    "str_ops": {
+        "tier": "micro",
+        "argv": [os.path.join(MICRO, "str_ops.py")],
+        "iterations": 20000,
+    },
+    "class_create": {
+        "tier": "micro",
+        "argv": [os.path.join(MICRO, "class_create.py")],
+        "iterations": 2000,
+    },
+    "exceptions": {
+        "tier": "micro",
+        "argv": [os.path.join(MICRO, "exceptions.py")],
+        "iterations": 50000,
+    },
+    # -- macro: whole programs, already in the repo ------------------------
+    "nbody": {"tier": "macro", "argv": [os.path.join(BENCHMARKS, "nbody.py")]},
+    "fannkuch": {
+        "tier": "macro",
+        "argv": [os.path.join(BENCHMARKS, "fannkuch.py")],
+        "env": {"PERF_CI_FANNKUCH_ARG": "8"},
+    },
+    "mandelbrot": {
+        "tier": "macro",
+        "argv": [os.path.join(BENCHMARKS, "mandelbrot.py")],
+    },
+    "json_loads": {
+        "tier": "macro",
+        "argv": [os.path.join(BENCHMARKS, "json_loads.py")],
+    },
+    # -- macro: vendored from pyperformance (see that directory's README) --
+    # Sizes are shrunk from upstream defaults via CLI args or env so each run
+    # stays affordable under callgrind.
+    "chaos": {
+        "tier": "macro",
+        "argv": [
             os.path.join(PYPERF, "bm_chaos.py"),
             "--iterations",
             "500",
@@ -84,47 +174,67 @@ WORKLOADS = {
             "--height",
             "128",
         ],
-        {},
-    ),
-    "raytrace": (
-        [os.path.join(PYPERF, "bm_raytrace.py"), "--width", "24", "--height", "24"],
-        {},
-    ),
-    "deltablue": (
-        [os.path.join(PYPERF, "bm_deltablue.py")],
-        {"PERF_CI_DELTABLUE_N": "30"},
-    ),
-    "float": ([os.path.join(PYPERF, "bm_float.py")], {"PERF_CI_FLOAT_POINTS": "20000"}),
-    "nqueens": (
-        [os.path.join(PYPERF, "bm_nqueens.py")],
-        {"PERF_CI_NQUEENS_COUNT": "7"},
-    ),
-    "fannkuch": (
-        [os.path.join(PYPERF, "bm_fannkuch.py")],
-        {"PERF_CI_FANNKUCH_ARG": "8"},
-    ),
-    "spectral_norm": (
-        [os.path.join(PYPERF, "bm_spectral_norm.py")],
-        {"PERF_CI_SPECTRAL_NORM_N": "60"},
-    ),
-    "richards": ([os.path.join(PYPERF, "bm_richards.py")], {}),
-    "scimark_sor": (
-        [os.path.join(PYPERF, "bm_scimark.py"), "sor"],
-        {"PERF_CI_SCIMARK_SOR_N": "40"},
-    ),
-    "scimark_monte_carlo": (
-        [os.path.join(PYPERF, "bm_scimark.py"), "monte_carlo"],
-        {"PERF_CI_SCIMARK_MONTE_CARLO_N": "20000"},
-    ),
+    },
+    "raytrace": {
+        "tier": "macro",
+        "argv": [
+            os.path.join(PYPERF, "bm_raytrace.py"),
+            "--width",
+            "24",
+            "--height",
+            "24",
+        ],
+    },
+    "deltablue": {
+        "tier": "macro",
+        "argv": [os.path.join(PYPERF, "bm_deltablue.py")],
+        "env": {"PERF_CI_DELTABLUE_N": "30"},
+    },
+    "float": {
+        "tier": "macro",
+        "argv": [os.path.join(PYPERF, "bm_float.py")],
+        "env": {"PERF_CI_FLOAT_POINTS": "20000"},
+    },
+    "nqueens": {
+        "tier": "macro",
+        "argv": [os.path.join(PYPERF, "bm_nqueens.py")],
+        "env": {"PERF_CI_NQUEENS_COUNT": "7"},
+    },
+    "spectral_norm": {
+        "tier": "macro",
+        "argv": [os.path.join(PYPERF, "bm_spectral_norm.py")],
+        "env": {"PERF_CI_SPECTRAL_NORM_N": "60"},
+    },
+    "richards": {"tier": "macro", "argv": [os.path.join(PYPERF, "bm_richards.py")]},
+    "scimark_sor": {
+        "tier": "macro",
+        "argv": [os.path.join(PYPERF, "bm_scimark.py"), "sor"],
+        "env": {"PERF_CI_SCIMARK_SOR_N": "40"},
+    },
+    "scimark_monte_carlo": {
+        "tier": "macro",
+        "argv": [os.path.join(PYPERF, "bm_scimark.py"), "monte_carlo"],
+        "env": {"PERF_CI_SCIMARK_MONTE_CARLO_N": "20000"},
+    },
 }
+
+TIER_ORDER = ("boot", "micro", "macro")
 
 DEFAULT_THRESHOLD = 0.02
 
 
-def measure_one(binary, name, out_dir):
-    argv, extra_env = WORKLOADS[name]
-    out_file = os.path.join(out_dir, "callgrind.%s.out" % name)
-    env = workload_env(extra_env)
+def workload_env(spec, iterations=None):
+    env = dict(os.environ)
+    env["PYTHONHASHSEED"] = "0"
+    env.setdefault("RUSTPYTHONPATH", os.path.join(REPO_ROOT, "Lib"))
+    env.update(spec.get("env", {}))
+    if iterations is not None:
+        env["PERF_CI_N"] = str(iterations)
+    return env
+
+
+def run_callgrind(binary, spec, out_file, iterations=None):
+    """Run one workload under callgrind and return its instruction count."""
     cmd = [
         "valgrind",
         "--tool=callgrind",
@@ -136,18 +246,45 @@ def measure_one(binary, name, out_dir):
         # workload can neither pay to compile bytecode for a later one nor
         # race another measurement writing the same file.
         "-B",
-    ] + argv
-    start = time.monotonic()
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, env=env, capture_output=True, text=True)
-    elapsed = time.monotonic() - start
+    ] + spec["argv"]
+    proc = subprocess.run(
+        cmd,
+        cwd=REPO_ROOT,
+        env=workload_env(spec, iterations),
+        capture_output=True,
+        text=True,
+    )
     if proc.returncode != 0:
         raise RuntimeError(
-            "workload %r failed (exit %d):\n%s\n%s"
-            % (name, proc.returncode, proc.stdout[-2000:], proc.stderr[-2000:])
+            "workload failed (exit %d): %s\n%s\n%s"
+            % (proc.returncode, " ".join(cmd), proc.stdout[-2000:], proc.stderr[-2000:])
         )
     ir = parse_ir(out_file)
     os.unlink(out_file)
-    return name, ir, elapsed
+    return ir
+
+
+def measure_one(binary, name, out_dir):
+    spec = WORKLOADS[name]
+    out_file = os.path.join(out_dir, "callgrind.%s.out" % name)
+    start = time.monotonic()
+    if spec["tier"] == "micro":
+        # Two points, so every fixed cost cancels in the difference.
+        hi_n = spec["iterations"]
+        lo_n = hi_n // MICRO_BASELINE_DIVISOR
+        hi = run_callgrind(binary, spec, out_file, hi_n)
+        lo = run_callgrind(binary, spec, out_file, lo_n)
+        record = {
+            "ir": hi - lo,
+            "tier": "micro",
+            "ir_at_n": hi,
+            "ir_at_baseline": lo,
+            "iterations": hi_n,
+            "baseline_iterations": lo_n,
+        }
+    else:
+        record = {"ir": run_callgrind(binary, spec, out_file), "tier": spec["tier"]}
+    return name, record, time.monotonic() - start
 
 
 def parse_ir(out_file):
@@ -164,14 +301,6 @@ def parse_ir(out_file):
     raise RuntimeError("no summary line in %s" % out_file)
 
 
-def workload_env(extra_env):
-    env = dict(os.environ)
-    env["PYTHONHASHSEED"] = "0"
-    env.setdefault("RUSTPYTHONPATH", os.path.join(REPO_ROOT, "Lib"))
-    env.update(extra_env)
-    return env
-
-
 def purge_bytecode_cache():
     """Delete every __pycache__ directory the workloads could import from.
 
@@ -185,7 +314,12 @@ def purge_bytecode_cache():
     is measured second, which is the direction that hides a regression.
     """
     removed = 0
-    for root in (os.path.join(REPO_ROOT, "Lib"), os.path.join(REPO_ROOT, PERF_DIR)):
+    roots = (
+        os.path.join(REPO_ROOT, "Lib"),
+        os.path.join(REPO_ROOT, PERF_DIR),
+        os.path.join(REPO_ROOT, BENCHMARKS),
+    )
+    for root in roots:
         for dirpath, dirnames, _ in os.walk(root):
             if "__pycache__" in dirnames:
                 dirnames.remove("__pycache__")
@@ -206,14 +340,20 @@ def warm_bytecode_cache(binary, names):
     the comparison symmetric -- each binary compiles its own bytecode -- while
     the measured runs observe steady-state execution.
 
+    Micro workloads are warmed at their baseline iteration count: the point is
+    to compile the imports, not to do the work twice.
+
     Run sequentially: concurrent writers of the same .pyc would race.
     """
     for name in names:
-        argv, extra_env = WORKLOADS[name]
+        spec = WORKLOADS[name]
+        iterations = None
+        if spec["tier"] == "micro":
+            iterations = spec["iterations"] // MICRO_BASELINE_DIVISOR
         proc = subprocess.run(
-            [binary] + argv,
+            [binary] + spec["argv"],
             cwd=REPO_ROOT,
-            env=workload_env(extra_env),
+            env=workload_env(spec, iterations),
             capture_output=True,
             text=True,
         )
@@ -222,6 +362,10 @@ def warm_bytecode_cache(binary, names):
                 "warm-up of workload %r failed (exit %d):\n%s"
                 % (name, proc.returncode, proc.stderr[-2000:])
             )
+
+
+def tier_sort_key(name):
+    return (TIER_ORDER.index(WORKLOADS[name]["tier"]), name)
 
 
 def cmd_measure(args):
@@ -248,17 +392,23 @@ def cmd_measure(args):
                 pool.submit(measure_one, binary, name, out_dir) for name in names
             ]
             for fut in concurrent.futures.as_completed(futures):
-                name, ir, elapsed = fut.result()
-                results[name] = ir
+                name, record, elapsed = fut.result()
+                results[name] = record
+                note = ""
+                if record["tier"] == "micro":
+                    note = " = %s - %s" % (
+                        format(record["ir_at_n"], ","),
+                        format(record["ir_at_baseline"], ","),
+                    )
                 print(
-                    "%-22s %14s Ir  (%.1fs under callgrind)"
-                    % (name, format(ir, ","), elapsed),
+                    "%-22s %-6s %14s Ir%s  (%.1fs under callgrind)"
+                    % (name, record["tier"], format(record["ir"], ","), note, elapsed),
                     flush=True,
                 )
     wall = time.monotonic() - wall
     payload = {
         "binary": binary,
-        "unit": "instructions (callgrind Ir)",
+        "unit": "instructions (callgrind Ir); micro tier is fixed-cost corrected",
         "results": results,
     }
     with open(args.output, "w") as f:
@@ -267,47 +417,72 @@ def cmd_measure(args):
     print("measured %d workloads in %.0fs -> %s" % (len(results), wall, args.output))
 
 
-def cmd_compare(args):
-    with open(args.base) as f:
-        base = json.load(f)["results"]
-    with open(args.head) as f:
-        head = json.load(f)["results"]
+def read_measurements(path):
+    with open(path) as f:
+        results = json.load(f)["results"]
+    # Measurements written before the tiering change stored a bare integer.
+    return {
+        name: value if isinstance(value, dict) else {"ir": value, "tier": "?"}
+        for name, value in results.items()
+    }
 
-    common = sorted(set(base) & set(head))
+
+def cmd_compare(args):
+    base = read_measurements(args.base)
+    head = read_measurements(args.head)
+
+    common = set(base) & set(head)
     if not common:
         sys.exit("no common workloads between %s and %s" % (args.base, args.head))
+    common = sorted(
+        common, key=lambda n: tier_sort_key(n) if n in WORKLOADS else (9, n)
+    )
     only_base = sorted(set(base) - set(head))
     only_head = sorted(set(head) - set(base))
 
     rows = []
     regressions = []
     for name in common:
-        delta = (head[name] - base[name]) / base[name]
+        b, h = base[name]["ir"], head[name]["ir"]
+        delta = (h - b) / b
         status = "ok"
         if delta > args.threshold:
             status = "REGRESSION"
             regressions.append((name, delta))
         elif delta < -args.threshold:
             status = "improved"
-        rows.append((name, base[name], head[name], delta, status))
+        tier = head[name].get("tier") or base[name].get("tier") or "?"
+        rows.append((name, tier, b, h, delta, status))
 
     geomean = (
-        math.exp(sum(math.log(head[n] / base[n]) for n in common) / len(common)) - 1.0
+        math.exp(
+            sum(math.log(head[n]["ir"] / base[n]["ir"]) for n in common) / len(common)
+        )
+        - 1.0
     )
 
     lines = []
-    lines.append("| workload | base Ir | head Ir | delta | status |")
-    lines.append("|---|---:|---:|---:|---|")
-    for name, b, h, delta, status in rows:
+    lines.append(
+        "| workload | tier | base instructions | head instructions | delta | status |"
+    )
+    lines.append("|---|---|---:|---:|---:|---|")
+    for name, tier, b, h, delta, status in rows:
         mark = {"REGRESSION": "❌", "improved": "✅", "ok": ""}[status]
         lines.append(
-            "| %s | %s | %s | %+.2f%% | %s %s |"
-            % (name, format(b, ","), format(h, ","), delta * 100, mark, status)
+            "| %s | %s | %s | %s | %+.2f%% | %s %s |"
+            % (name, tier, format(b, ","), format(h, ","), delta * 100, mark, status)
         )
     lines.append("")
     lines.append(
         "Geometric mean delta: **%+.2f%%** (threshold per workload: +%.1f%%)"
         % (geomean * 100, args.threshold * 100)
+    )
+    lines.append("")
+    lines.append(
+        "`micro` rows are corrected for fixed cost: each is measured at N and "
+        "N/%d iterations and the difference is reported, so interpreter boot "
+        "and imports cancel out. `boot` and `macro` rows are whole-process "
+        "counts." % MICRO_BASELINE_DIVISOR
     )
     for name in only_base:
         lines.append("- `%s` only present in base measurement" % name)
@@ -337,10 +512,18 @@ def cmd_compare(args):
 
 
 def cmd_list(_args):
-    for name in sorted(WORKLOADS):
-        argv, env = WORKLOADS[name]
-        extra = " ".join("%s=%s" % kv for kv in sorted(env.items()))
-        print("%-22s %s %s" % (name, " ".join(argv), extra))
+    for name in sorted(WORKLOADS, key=tier_sort_key):
+        spec = WORKLOADS[name]
+        extra = " ".join("%s=%s" % kv for kv in sorted(spec.get("env", {}).items()))
+        if spec["tier"] == "micro":
+            extra = (
+                "PERF_CI_N=%d (baseline %d) "
+                % (
+                    spec["iterations"],
+                    spec["iterations"] // MICRO_BASELINE_DIVISOR,
+                )
+            ) + extra
+        print("%-22s %-6s %s %s" % (name, spec["tier"], " ".join(spec["argv"]), extra))
 
 
 def main():

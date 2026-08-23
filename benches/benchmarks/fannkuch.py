@@ -50,6 +50,11 @@ def fannkuch(n):
 
 if __name__ == "__main__":
     #runner = pyperf.Runner()
-    arg = DEFAULT_ARG
+    # RUSTPYTHON perf_ci: let the PR performance gate shrink the workload, which
+    # otherwise costs ~2.5s natively and does not fit under callgrind. Unset
+    # (the criterion harness in benches/execution.rs) keeps the upstream size.
+    import os
+
+    arg = int(os.environ.get("PERF_CI_FANNKUCH_ARG", DEFAULT_ARG))
     #runner.bench_func('fannkuch', fannkuch, arg)
     fannkuch(arg)
