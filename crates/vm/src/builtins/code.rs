@@ -22,7 +22,11 @@ use core::{
 };
 use malachite_bigint::BigInt;
 use num_traits::Zero;
-use rustpython_compiler_core::{OneIndexed, bytecode::CodeUnits, bytecode::PyCodeLocationInfoKind};
+use rustpython_compiler_core::{
+    OneIndexed,
+    bytecode::{CodeUnits, PyCodeLocationInfoKind},
+    marshal::linetable_to_locations,
+};
 
 /// State for iterating through code address ranges
 struct PyCodeAddressRange<'a> {
@@ -1527,6 +1531,11 @@ impl PyCode {
             OptionalArg::Present(linetable) => linetable.as_bytes().to_vec().into_boxed_slice(),
             OptionalArg::Missing => self.code.linetable.clone(),
         };
+        let locations = linetable_to_locations(
+            &linetable,
+            first_line_number.map_or(0, |line| line.get() as i32),
+            instructions.len(),
+        );
 
         let exceptiontable = match co_exceptiontable {
             OptionalArg::Present(exceptiontable) => {
@@ -1547,9 +1556,7 @@ impl PyCode {
 
             max_stackdepth,
             instructions,
-            // FIXME: invalid locations. Actually locations is a duplication of linetable.
-            // It can be removed once we move every other code to use linetable only.
-            locations: self.code.locations.clone(),
+            locations,
             constants: constants.into_iter().map(Literal).collect(),
             names: intern_all(names, "co_names")?,
             varnames,
@@ -1681,4 +1688,40 @@ impl<'a> LineTableReader<'a> {
 
 pub(crate) fn init(ctx: &'static Context) {
     PyCode::extend_class(ctx, ctx.types.code_type);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Interpreter, compiler::Mode};
+
+    #[test]
+    fn replace_linetable_updates_traceback_locations() {
+        Interpreter::without_stdlib(Default::default()).enter(|vm| {
+            let source = r#"def original():
+    raise RuntimeError("boom")
+
+def template():
+
+
+    raise RuntimeError("boom")
+
+code = original.__code__.replace(co_linetable=template.__code__.co_linetable)
+assert list(code.co_lines()) == [(0, 2, 1), (2, 24, 4)]
+positions = list(code.co_positions())
+assert positions[0] == (1, 1, 0, 0)
+assert positions[1][0:2] == (4, 4)
+original.__code__ = code
+try:
+    original()
+except RuntimeError as exc:
+    assert exc.__traceback__.tb_next.tb_lineno == 4
+else:
+    raise AssertionError("replacement code did not raise")
+"#;
+            let code = vm
+                .compile(source, Mode::Exec, "<code-replace-test>")
+                .unwrap();
+            vm.run_code_obj(code, vm.new_scope_with_builtins()).unwrap();
+        });
+    }
 }
