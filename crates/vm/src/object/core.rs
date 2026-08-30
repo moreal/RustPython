@@ -2975,6 +2975,51 @@ pub(crate) fn init_type_hierarchy() -> BootstrapTypeHierarchy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        builtins::object::PyBaseObject,
+        types::{PyTypeFlags, PyTypeSlots},
+    };
+
+    fn new_test_type(
+        type_type: PyTypeRef,
+        object_type: PyTypeRef,
+        name: &'static str,
+        flags: PyTypeFlags,
+    ) -> PyTypeRef {
+        let slots = PyTypeSlots {
+            name,
+            flags: PyTypeFlags::heap_type_flags() | flags,
+            ..PyTypeSlots::default()
+        };
+        let bases = type_type.bases.read().clone();
+        let typ = PyRef::new_ref(
+            PyType {
+                base: Some(object_type.clone()).into(),
+                bases: PyRwLock::new(bases),
+                mro: PyRwLock::new(vec![object_type]),
+                subclasses: PyRwLock::default(),
+                attributes: Default::default(),
+                slots,
+                heaptype_ext: None,
+                tp_version_tag: core::sync::atomic::AtomicU32::new(0),
+                abc_tpflags: core::sync::atomic::AtomicU64::new(0),
+            },
+            type_type,
+            None,
+        );
+        typ.mro.write().insert(0, typ.clone());
+        typ
+    }
+
+    fn new_base_object_with_prefixes(
+        type_type: PyTypeRef,
+        object_type: PyTypeRef,
+        name: &'static str,
+        flags: PyTypeFlags,
+    ) -> PyRef<PyBaseObject> {
+        let typ = new_test_type(type_type, object_type, name, flags);
+        PyRef::new_ref(PyBaseObject, typ, None)
+    }
 
     #[test]
     fn miri_test_type_initialization() {
@@ -3009,6 +3054,80 @@ mod tests {
         let ctx = crate::Context::genesis();
         let obj = ctx.new_bytes(b"dfghjkl".to_vec());
         drop(obj);
+    }
+
+    #[test]
+    fn miri_test_owned_clone_and_drop_balance() {
+        let ctx = crate::Context::genesis();
+        let obj = ctx.new_bytes(b"owned reference".to_vec());
+        assert_eq!(obj.as_object().strong_count(), 1);
+
+        let cloned = obj.clone();
+        assert_eq!(obj.as_object().strong_count(), 2);
+
+        drop(cloned);
+        assert_eq!(obj.as_object().strong_count(), 1);
+    }
+
+    #[test]
+    fn miri_test_interned_reference_stays_live() {
+        let ctx = crate::Context::genesis();
+        let obj = ctx.new_bytes(b"interned reference".to_vec());
+        unsafe { obj.as_object().mark_intern() };
+
+        let cloned = obj.clone();
+        drop(cloned);
+
+        assert!(obj.as_object().is_interned());
+        assert_eq!(obj.as_object().strong_count(), 1);
+    }
+
+    #[test]
+    fn miri_test_optional_prefix_recovery() {
+        let hierarchy = init_type_hierarchy();
+        let cases = [
+            ("NoPrefixes", PyTypeFlags::empty(), false, false),
+            ("DictPrefix", PyTypeFlags::HAS_DICT, true, false),
+            ("WeakrefPrefix", PyTypeFlags::HAS_WEAKREF, false, true),
+            (
+                "BothPrefixes",
+                PyTypeFlags::HAS_DICT | PyTypeFlags::HAS_WEAKREF,
+                true,
+                true,
+            ),
+        ];
+
+        for (name, flags, has_ext, has_weakref) in cases {
+            let obj = new_base_object_with_prefixes(
+                hierarchy.type_type.clone(),
+                hierarchy.object_type.clone(),
+                name,
+                flags,
+            );
+            assert_eq!(obj.0.ext_ref().is_some(), has_ext, "{name}");
+            assert_eq!(obj.0.weakref_list_ref().is_some(), has_weakref, "{name}");
+        }
+    }
+
+    #[test]
+    fn miri_test_weakref_unlinks_on_drop() {
+        let hierarchy = init_type_hierarchy();
+        let target = new_base_object_with_prefixes(
+            hierarchy.type_type,
+            hierarchy.object_type,
+            "WeakrefTarget",
+            PyTypeFlags::HAS_WEAKREF,
+        );
+        assert_eq!(target.as_object().weak_count(), Some(0));
+
+        let weak = target
+            .as_object()
+            .downgrade_with_weakref_typ_opt(None, hierarchy.weakref_type)
+            .unwrap();
+        assert_eq!(target.as_object().weak_count(), Some(1));
+
+        drop(weak);
+        assert_eq!(target.as_object().weak_count(), Some(0));
     }
 
     /// A weakref node stays linked into its target's list until its own
