@@ -397,6 +397,23 @@ const _: () = assert!(
 );
 const _: () = assert!(core::mem::align_of::<WeakRefList>() >= core::mem::align_of::<PyInner<()>>());
 
+const fn align_offset(size: usize, align: usize) -> usize {
+    (size + align - 1) & !(align - 1)
+}
+
+// Every existing optional-prefix combination places PyInner at the sum of
+// its prefix sizes. Keep these compile-time checks beside the negative-offset
+// constants so an alignment change cannot silently invalidate recovery.
+const _: () = assert!(
+    align_offset(EXT_OFFSET, core::mem::align_of::<PyInner<()>>()) == EXT_OFFSET
+        && align_offset(WEAKREF_OFFSET, core::mem::align_of::<PyInner<()>>()) == WEAKREF_OFFSET
+        && align_offset(EXT_OFFSET, core::mem::align_of::<WeakRefList>()) == EXT_OFFSET
+        && align_offset(
+            EXT_OFFSET + WEAKREF_OFFSET,
+            core::mem::align_of::<PyInner<()>>()
+        ) == EXT_OFFSET + WEAKREF_OFFSET
+);
+
 /// This is an actual python object. It consists of a `typ` which is the
 /// python class, and carries some rust payload optionally. This rust
 /// payload can be a rust float or rust int in case of float and int objects.
