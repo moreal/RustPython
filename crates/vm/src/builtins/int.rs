@@ -56,7 +56,8 @@ thread_local! {
 }
 
 impl PyPayload for PyInt {
-    const MAX_FREELIST: usize = 100;
+    // Cache moderate arithmetic bursts while keeping per-thread retention bounded.
+    const MAX_FREELIST: usize = 256;
     const HAS_FREELIST: bool = true;
 
     #[inline]
@@ -869,4 +870,27 @@ pub(crate) fn init(context: &'static Context) {
         .slots
         .vectorcall
         .store(Some(vectorcall_int));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PyPayload;
+
+    #[test]
+    fn int_freelist_caches_a_typical_arithmetic_burst() {
+        const BURST: usize = 256;
+        let ctx = Context::genesis();
+        let values = (0..BURST)
+            .map(|index| PyInt::from((BigInt::one() << 80) + index).into_ref(ctx))
+            .collect::<Vec<_>>();
+        drop(values);
+
+        INT_FREELIST.with(|freelist| {
+            let list = freelist.take();
+            let cached = list.len();
+            freelist.set(list);
+            assert_eq!(cached, BURST);
+        });
+    }
 }
