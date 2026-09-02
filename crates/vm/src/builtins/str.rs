@@ -1720,6 +1720,10 @@ pub(crate) fn encode_string(
         None => crate::codecs::DEFAULT_ENCODING,
         Some(s) => s.as_str(),
     };
+    if let Some(fast) = crate::codecs::FastTextCodec::from_name(encoding) {
+        let bytes = fast.encode(&s, errors.as_deref(), vm)?;
+        return Ok(vm.ctx.new_bytes(bytes));
+    }
     vm.state.codec_registry.encode_text(s, encoding, errors, vm)
 }
 
