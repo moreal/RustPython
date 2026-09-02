@@ -400,6 +400,13 @@ impl Constructor for PyStr {
     type Args = StrArgs;
 
     fn slot_new(cls: PyTypeRef, func_args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+        // Optimization: str() returns the interned empty-string singleton
+        // instead of allocating a fresh empty string, matching CPython's
+        // guarantee that str() is str().
+        if cls.is(vm.ctx.types.str_type) && func_args.args.is_empty() && func_args.kwargs.is_empty()
+        {
+            return Ok(vm.ctx.empty_str.to_owned().into());
+        }
         // Optimization: return exact str as-is (only when no encoding/errors provided)
         if cls.is(vm.ctx.types.str_type)
             && func_args.args.len() == 1
@@ -1417,10 +1424,24 @@ impl PyStr {
             )
         })?;
 
+        // Fast path: for a dict table (the common case, e.g. built by
+        // str.maketrans), use the non-raising lookup instead of building and
+        // catching a KeyError exception for every unmapped character.
+        let dict = table.downcast_ref::<PyDict>();
+
         let mut translated = Wtf8Buf::new();
         for cp in self.as_wtf8().code_points() {
-            match table.get_item(&*cp.to_u32().to_pyobject(vm), vm) {
-                Ok(value) => {
+            let key = cp.to_u32().to_pyobject(vm);
+            let value = match dict {
+                Some(dict) => dict.get_item_opt(&*key, vm)?,
+                None => match table.get_item(&*key, vm) {
+                    Ok(value) => Some(value),
+                    Err(e) if e.fast_isinstance(vm.ctx.exceptions.key_error) => None,
+                    Err(e) => return Err(e),
+                },
+            };
+            match value {
+                Some(value) => {
                     if let Some(text) = value.downcast_ref::<Self>() {
                         translated.push_wtf8(text.as_wtf8());
                     } else if let Some(bigint) = value.downcast_ref::<PyInt>() {
@@ -1438,8 +1459,7 @@ impl PyStr {
                         );
                     }
                 }
-                Err(e) if e.fast_isinstance(vm.ctx.exceptions.key_error) => translated.push(cp),
-                Err(e) => return Err(e),
+                None => translated.push(cp),
             }
         }
         Ok(translated)
