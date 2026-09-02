@@ -10,8 +10,8 @@ mod builtins {
     use crate::{
         AsObject, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
         builtins::{
-            PyByteArray, PyBytes, PyDictRef, PyStr, PyStrRef, PyTuple, PyTupleRef, PyType,
-            PyUtf8StrRef,
+            PyByteArray, PyBytes, PyDictRef, PyFloat, PyInt, PyStr, PyStrRef, PyTuple, PyTupleRef,
+            PyType, PyUtf8StrRef,
             enumerate::PyReverseSequenceIterator,
             function::{PyCell, PyCellRef, PyFunction},
             int::PyIntRef,
@@ -25,7 +25,7 @@ mod builtins {
             ArgStrOrBytesLike, Either, FsPath, FuncArgs, KwArgs, OptionalArg, OptionalOption,
             PosArgs,
         },
-        protocol::{PyIter, PyIterReturn},
+        protocol::{PyIter, PyIterIter, PyIterReturn},
         py_io,
         readline::{Readline, ReadlineResult},
         stdlib::sys,
@@ -1208,7 +1208,81 @@ mod builtins {
             _ => (),
         });
 
-        for item in iterable.iter(vm)? {
+        let mut iter = iterable.iter(vm)?;
+
+        // Fast path: accumulate exact `int`/`float` elements directly in a
+        // machine-native `i64`/`f64` (like CPython's `builtin_sum_impl`),
+        // falling back to the general `vm._add` path on the first element
+        // that isn't an exact `int`/`float`, or on `i64` overflow. This
+        // avoids a `BigInt` allocation and `_add` slot dispatch per element
+        // for the common case. `downcast_ref_if_exact` requires the exact
+        // `int`/`float` type (not a subclass), so overridden `__add__` on a
+        // subclass, and `bool` (which has its own type), always take the
+        // general path below and behave exactly as before.
+        if let Some(int_start) = sum.downcast_ref_if_exact::<PyInt>(vm)
+            && let Some(mut acc) = int_start.try_to_i64_fast()
+        {
+            loop {
+                let Some(item) = iter.next() else {
+                    return Ok(vm.ctx.new_int(acc).into());
+                };
+                let item = item?;
+                if let Some(int_item) = item.downcast_ref_if_exact::<PyInt>(vm)
+                    && let Some(v) = int_item.try_to_i64_fast()
+                    && let Some(next_acc) = acc.checked_add(v)
+                {
+                    acc = next_acc;
+                    continue;
+                }
+                if let Some(float_item) = item.downcast_ref_if_exact::<PyFloat>(vm) {
+                    let float_acc = acc as f64 + float_item.to_f64();
+                    return sum_float(float_acc, iter, vm);
+                }
+                let acc_obj: PyObjectRef = vm.ctx.new_int(acc).into();
+                sum = vm._add(&acc_obj, &item)?;
+                return sum_generic(sum, iter, vm);
+            }
+        }
+
+        if let Some(float_start) = sum.downcast_ref_if_exact::<PyFloat>(vm) {
+            return sum_float(float_start.to_f64(), iter, vm);
+        }
+
+        sum_generic(sum, iter, vm)
+    }
+
+    fn sum_float(
+        mut acc: f64,
+        mut iter: PyIterIter<'_, PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult {
+        loop {
+            let Some(item) = iter.next() else {
+                return Ok(vm.ctx.new_float(acc).into());
+            };
+            let item = item?;
+            if let Some(int_item) = item.downcast_ref_if_exact::<PyInt>(vm)
+                && let Some(v) = int_item.try_to_i64_fast()
+            {
+                acc += v as f64;
+                continue;
+            }
+            if let Some(float_item) = item.downcast_ref_if_exact::<PyFloat>(vm) {
+                acc += float_item.to_f64();
+                continue;
+            }
+            let acc_obj: PyObjectRef = vm.ctx.new_float(acc).into();
+            let sum = vm._add(&acc_obj, &item)?;
+            return sum_generic(sum, iter, vm);
+        }
+    }
+
+    fn sum_generic(
+        mut sum: PyObjectRef,
+        iter: PyIterIter<'_, PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult {
+        for item in iter {
             sum = vm._add(&sum, &*item?)?;
         }
         Ok(sum)

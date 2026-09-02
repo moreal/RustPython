@@ -79,7 +79,7 @@ impl SelfIter for PyMap {}
 
 impl IterNext for PyMap {
     fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
-        let mut next_objs = Vec::new();
+        let mut next_objs = Vec::with_capacity(zelf.iterators.len());
         for (idx, iterator) in zelf.iterators.iter().enumerate() {
             let item = match iterator.next(vm)? {
                 PyIterReturn::Return(obj) => obj,
