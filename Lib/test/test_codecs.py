@@ -2582,7 +2582,6 @@ class WithStmtTest(unittest.TestCase):
 
 
 class TypesTest(unittest.TestCase):
-    @unittest.expectedFailure  # TODO: RUSTPYTHON; AttributeError: module 'codecs' has no attribute 'utf_32_ex_decode'. Did you mean: 'utf_16_ex_decode'?
     def test_decode_unicode(self):
         # Most decoders don't accept unicode input
         decoders = [
