@@ -108,6 +108,21 @@ impl RefCount {
     /// Increment strong count
     #[inline]
     pub fn inc(&self) {
+        // Immortal (leaked) objects — today, interned strings such as every
+        // attribute and identifier name — are borrowed constantly in hot
+        // loops. A relaxed load is essentially free next to the fetch_add
+        // every other object pays for, so check it first and skip the RMW
+        // entirely.
+        //
+        // LEAKED is sticky: `leak()` only ever sets it, never clears it, so
+        // once this load observes it set it stays true forever and this
+        // early return is always sound. A stale `false` (the flag was set on
+        // another thread but not yet visible here) just falls through to the
+        // ordinary atomic path below, which remains correct either way — the
+        // relaxed load is a pure optimization, not a synchronization point.
+        if State::from_raw(self.state.load(Ordering::Relaxed)).leaked() {
+            return;
+        }
         let val = State::from_raw(self.state.fetch_add(COUNT, Ordering::Relaxed));
         if val.destructed() || val.strong() > STRONG - 1 {
             refcount_overflow();
@@ -156,6 +171,16 @@ impl RefCount {
     #[inline]
     #[must_use]
     pub fn dec(&self) -> bool {
+        // Same immortal fast path as `inc`: check LEAKED with a relaxed load
+        // before touching the shared cache line with a fetch_sub. See the
+        // comment in `inc` for why a relaxed load is sound here — the flag
+        // is sticky and a stale `false` only costs a fallthrough to the slow
+        // (still correct) path below, which re-checks `leaked()` against the
+        // fetch_sub's own snapshot in case the object was leaked concurrently
+        // between the two loads.
+        if State::from_raw(self.state.load(Ordering::Relaxed)).leaked() {
+            return false;
+        }
         let old = State::from_raw(self.state.fetch_sub(COUNT, Ordering::Release));
 
         // LEAKED objects never reach 0
