@@ -535,8 +535,41 @@ fn call_wrapper(zelf: &PyObject, args: FuncArgs, vm: &VirtualMachine) -> PyResul
 }
 
 fn getattro_wrapper(zelf: &PyObject, name: &Py<PyStr>, vm: &VirtualMachine) -> PyResult {
+    use crate::builtins::{
+        PyBaseObject,
+        descriptor::{PyWrapper, SlotFunc},
+    };
+
     let __getattribute__ = identifier!(vm, __getattribute__);
     let __getattr__ = identifier!(vm, __getattr__);
+
+    // Fast path mirroring CPython's slot_tp_getattr_hook: when __getattribute__
+    // is still the default `object.__getattribute__`, skip the special-method
+    // call machinery and go straight to generic_getattr_opt, which reports a
+    // miss as `None` instead of building (and, on success, discarding) a full
+    // AttributeError.
+    let is_default_getattribute = zelf
+        .class()
+        .get_attr(__getattribute__)
+        .and_then(|attr| attr.downcast_ref::<PyWrapper>().map(|w| w.wrapped))
+        .is_some_and(|wrapped| {
+            matches!(
+                wrapped,
+                SlotFunc::GetAttro(f)
+                    if fn_addr(f) == fn_addr(PyBaseObject::getattro as GetattroFunc)
+            )
+        });
+
+    if is_default_getattribute {
+        return match zelf.generic_getattr_opt(name, None, vm)? {
+            Some(res) => Ok(res),
+            None if zelf.class().has_attr(__getattr__) => {
+                vm.call_special_method(zelf, __getattr__, (name.to_owned(),))
+            }
+            None => Err(vm.new_no_attribute_error(zelf.to_owned(), name.to_owned())),
+        };
+    }
+
     match vm.call_special_method(zelf, __getattribute__, (name.to_owned(),)) {
         Ok(r) => Ok(r),
         Err(e)
