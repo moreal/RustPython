@@ -631,7 +631,7 @@ impl Py<PyStr> {
 }
 
 #[pyclass(
-    flags(BASETYPE, _MATCH_SELF),
+    flags(BASETYPE, _MATCH_SELF, UNICODE_SUBCLASS),
     with(
         AsMapping,
         AsNumber,

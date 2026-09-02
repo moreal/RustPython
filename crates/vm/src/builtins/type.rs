@@ -56,6 +56,24 @@ pub struct PyType {
     /// Type version tag for inline caching. 0 means unassigned/invalidated.
     pub tp_version_tag: AtomicU32,
     pub abc_tpflags: AtomicU64,
+    /// Set (to a single bit) only on the eight canonical builtin base types
+    /// tracked by `PyTypeFlags::SUBCLASS_FLAGS` (int, list, tuple, bytes,
+    /// str, dict, BaseException, type). Used by `has_subclass_flag` callers
+    /// that statically know which flag corresponds to a given class (e.g.
+    /// "is this exactly `int`") to build correct O(1) checks. Empty for
+    /// every other type, including subclasses of these builtins — the flag
+    /// only proves "derives from the original builtin", not from an
+    /// arbitrary subclass of it, so anything else must still be resolved
+    /// through the normal subclass check.
+    pub(crate) builtin_subclass_flag: PyTypeFlags,
+    /// Set once `__bases__` is reassigned on this type (or on any ancestor
+    /// reachable at the time of that reassignment). While clear (the common
+    /// case: this type's ancestry was fixed at construction), `slots.flags`
+    /// SUBCLASS_FLAGS bits are authoritative and `has_subclass_flag` can
+    /// answer in O(1). Once set, they are no longer trusted and
+    /// `has_subclass_flag` falls back to a full MRO scan, which is always
+    /// correct.
+    pub(crate) subclass_flags_stale: AtomicBool,
 }
 
 /// Monotonic counter for type version tags. Once it reaches `u32::MAX`,
@@ -613,18 +631,6 @@ fn downcast_qualname(value: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyRef<
     }
 }
 
-fn is_subtype_with_mro(a_mro: &[PyTypeRef], a: &Py<PyType>, b: &Py<PyType>) -> bool {
-    if a.is(b) {
-        return true;
-    }
-    for item in a_mro {
-        if item.is(b) {
-            return true;
-        }
-    }
-    false
-}
-
 impl PyType {
     #[inline]
     fn with_type_lock<R>(vm: &VirtualMachine, f: impl FnOnce() -> R) -> R {
@@ -835,6 +841,18 @@ impl PyType {
         0
     }
 
+    /// Union of the `*_SUBCLASS` marker bits (see `PyTypeFlags::SUBCLASS_FLAGS`)
+    /// contributed by every ancestor in `mro`. Reads only each ancestor's
+    /// `builtin_subclass_flag` (immutable, nonzero only for the eight
+    /// canonical builtin base types), never `slots.flags` directly, so the
+    /// result is correct even if an ancestor's own `slots.flags` bits are
+    /// stale after a `__bases__` reassignment elsewhere in the graph.
+    fn builtin_subclass_flags_from_mro(mro: &[PyTypeRef]) -> PyTypeFlags {
+        mro.iter().fold(PyTypeFlags::empty(), |acc, anc| {
+            acc | anc.builtin_subclass_flag
+        })
+    }
+
     pub fn has_patma_collection_flag(&self, flag: PyTypeFlags) -> bool {
         debug_assert!(matches!(flag, PyTypeFlags::SEQUENCE | PyTypeFlags::MAPPING));
         const COLLECTION_FLAGS: PyTypeFlags = PyTypeFlags::from_bits_truncate(
@@ -988,6 +1006,12 @@ impl PyType {
         }
 
         let inherited_abc_tpflags = Self::inherited_abc_tpflags(&bases);
+        // Capture the *declared-only* subclass marker (nonzero only for the
+        // eight canonical builtin base types) before merging in whatever
+        // this type inherits from its ancestors, so `builtin_subclass_flag`
+        // never conflates "is exactly int" with "is a subclass of int".
+        let builtin_subclass_flag = slots.flags & PyTypeFlags::SUBCLASS_FLAGS;
+        slots.flags |= Self::builtin_subclass_flags_from_mro(&mro);
         let new_type = PyRef::new_ref(
             Self {
                 base: Some(base).into(),
@@ -999,6 +1023,8 @@ impl PyType {
                 heaptype_ext: Some(Pin::new(Box::new(heaptype_ext))),
                 tp_version_tag: AtomicU32::new(0),
                 abc_tpflags: AtomicU64::new(inherited_abc_tpflags),
+                builtin_subclass_flag,
+                subclass_flags_stale: AtomicBool::new(false),
             },
             metaclass,
             None,
@@ -1047,9 +1073,14 @@ impl PyType {
         }
 
         let inherited_abc_tpflags = Self::inherited_abc_tpflags(core::slice::from_ref(&base));
+        let mro = base.mro_map_collect(|x| x.to_owned());
+        // Capture the *declared-only* subclass marker before merging in
+        // whatever this type inherits from its ancestors (see the matching
+        // comment in `new_heap_inner`).
+        let builtin_subclass_flag = slots.flags & PyTypeFlags::SUBCLASS_FLAGS;
+        slots.flags |= Self::builtin_subclass_flags_from_mro(&mro);
         let bases =
             PyTuple::new_ref_typed_with_type(vec![base.clone()], PyTuple::static_type().to_owned());
-        let mro = base.mro_map_collect(|x| x.to_owned());
 
         let new_type = PyRef::new_ref(
             Self {
@@ -1062,6 +1093,8 @@ impl PyType {
                 heaptype_ext: None,
                 tp_version_tag: AtomicU32::new(0),
                 abc_tpflags: AtomicU64::new(inherited_abc_tpflags),
+                builtin_subclass_flag,
+                subclass_flags_stale: AtomicBool::new(false),
             },
             metaclass,
             None,
@@ -1591,7 +1624,7 @@ impl PyType {
 
 impl Py<PyType> {
     pub fn is_subtype(&self, other: &Self) -> bool {
-        is_subtype_with_mro(&self.mro.read(), self, other)
+        self.fast_issubclass(other)
     }
 
     /// Equivalent to CPython's PyType_CheckExact macro
@@ -1605,6 +1638,28 @@ impl Py<PyType> {
     /// method.
     pub fn fast_issubclass(&self, cls: &impl Borrow<PyObject>) -> bool {
         self.as_object().is(cls.borrow()) || self.mro.read()[1..].iter().any(|c| c.is(cls.borrow()))
+    }
+
+    /// O(1) check for a `*_SUBCLASS` marker flag (e.g. "is this `int` or a
+    /// subclass of `int`?"). Only sound when the caller already knows
+    /// statically which flag corresponds to the target class (e.g. a check
+    /// against `vm.ctx.types.int_type` specifically) — unlike
+    /// `fast_issubclass`, this does not inspect `cls` at all, so misusing it
+    /// for an arbitrary/unrelated class silently gives the wrong answer.
+    /// `subclass_flags_stale` gates this on the (essentially unreachable in
+    /// practice, since it always implies an instance-layout change) chance
+    /// that `self`'s ancestry was changed via `__bases__` after
+    /// construction, in which case `slots.flags` may no longer be accurate
+    /// and the MRO is scanned directly instead.
+    pub fn has_subclass_flag(&self, flag: PyTypeFlags) -> bool {
+        debug_assert!(PyTypeFlags::SUBCLASS_FLAGS.contains(flag));
+        if !self.subclass_flags_stale.load(Ordering::Relaxed) {
+            return self.slots.flags.contains(flag);
+        }
+        self.mro
+            .read()
+            .iter()
+            .any(|c| c.builtin_subclass_flag == flag)
     }
 
     pub fn mro_map_collect<F, R>(&self, f: F) -> Vec<R>
@@ -1646,7 +1701,7 @@ impl Py<PyType> {
         AsNumber,
         Representable
     ),
-    flags(BASETYPE, HAS_DICT, HAS_WEAKREF)
+    flags(BASETYPE, HAS_DICT, HAS_WEAKREF, TYPE_SUBCLASS)
 )]
 impl PyType {
     #[pygetset]
@@ -1803,6 +1858,27 @@ impl PyType {
             if let Some(old_base) = old_base {
                 keep_alive(old_base, &mut retired);
             }
+
+            // `__bases__` reassignment can change which of the eight
+            // canonical builtins (int, list, ...) are ancestors of this
+            // class, so its construction-time `slots.flags` SUBCLASS_FLAGS
+            // bits (and those of every descendant) can no longer be trusted
+            // for the O(1) `has_subclass_flag` path. Mark them stale rather
+            // than trying to recompute: this is a rare, already-expensive
+            // administrative operation, and every subsequent subclass check
+            // for the affected types simply falls back to the always-correct
+            // MRO scan.
+            fn mark_subclass_flags_stale_recursively(cls: &Py<PyType>) {
+                cls.subclass_flags_stale.store(true, Ordering::Relaxed);
+                for subclass in cls.subclasses.read().iter() {
+                    let Some(subclass) = subclass.upgrade() else {
+                        continue;
+                    };
+                    let subclass: &Py<PyType> = subclass.downcast_ref().unwrap();
+                    mark_subclass_flags_stale_recursively(subclass);
+                }
+            }
+            mark_subclass_flags_stale_recursively(zelf);
 
             // Invalidate inline caches and rebuild every slot for this type and
             // all descendants so slots whose methods left the MRO are reset.

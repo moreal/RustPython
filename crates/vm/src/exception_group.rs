@@ -285,7 +285,10 @@ pub(super) mod types {
             // Validate all items are BaseException instances
             let mut has_non_exception = false;
             for (i, exc) in exceptions.iter().enumerate() {
-                if !exc.fast_isinstance(vm.ctx.exceptions.base_exception_type) {
+                if !exc
+                    .class()
+                    .has_subclass_flag(PyTypeFlags::BASE_EXC_SUBCLASS)
+                {
                     return Err(vm.new_value_error(format!(
                         "Item {i} of second argument (exceptions) is not an exception"
                     )));
