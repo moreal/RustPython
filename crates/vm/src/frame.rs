@@ -6782,36 +6782,21 @@ impl ExecutingFrame<'_> {
                     let class = class_obj.downcast_ref::<PyType>().unwrap();
                     let start_type = self_obj.class();
                     // MRO lookup: skip classes up to and including `class`, then search
-                    let mro: Vec<PyRef<PyType>> = start_type.mro_map_collect(|x| x.to_owned());
-                    let mut found = None;
-                    let mut past_class = false;
-                    for cls in &mro {
-                        if !past_class {
-                            if cls.is(class) {
-                                past_class = true;
-                            }
-                            continue;
-                        }
-                        if let Some(descr) = cls.get_direct_attr(attr_name) {
-                            // Call descriptor __get__ if available
-                            // Pass None for obj when self IS its own type (classmethod)
-                            let obj_arg = if self_obj.is(start_type.as_object()) {
-                                None
-                            } else {
-                                Some(self_obj.to_owned())
-                            };
-                            let result = vm
-                                .call_get_descriptor_specific(
-                                    &descr,
-                                    obj_arg,
-                                    Some(start_type.as_object().to_owned()),
-                                )
-                                .unwrap_or(Ok(descr))?;
-                            found = Some(result);
-                            break;
-                        }
-                    }
-                    if let Some(attr) = found {
+                    if let Some(descr) = start_type.get_super_attr_after(class, attr_name) {
+                        // Call descriptor __get__ if available
+                        // Pass None for obj when self IS its own type (classmethod)
+                        let obj_arg = if self_obj.is(start_type.as_object()) {
+                            None
+                        } else {
+                            Some(self_obj.to_owned())
+                        };
+                        let attr = vm
+                            .call_get_descriptor_specific(
+                                &descr,
+                                obj_arg,
+                                Some(start_type.as_object().to_owned()),
+                            )
+                            .unwrap_or(Ok(descr))?;
                         self.pop_value(); // self
                         self.pop_value(); // class
                         self.pop_value(); // super
@@ -6837,43 +6822,29 @@ impl ExecutingFrame<'_> {
                     let self_val = self_obj.to_owned();
                     let start_type = self_obj.class();
                     // MRO lookup
-                    let mro: Vec<PyRef<PyType>> = start_type.mro_map_collect(|x| x.to_owned());
-                    let mut found = None;
-                    let mut past_class = false;
-                    for cls in &mro {
-                        if !past_class {
-                            if cls.is(class) {
-                                past_class = true;
-                            }
-                            continue;
-                        }
-                        if let Some(descr) = cls.get_direct_attr(attr_name) {
-                            let descr_cls = descr.class();
-                            if descr_cls
-                                .slots
-                                .flags
-                                .has_feature(PyTypeFlags::METHOD_DESCRIPTOR)
-                            {
-                                // Method descriptor: push unbound func + self
-                                // CALL will prepend self as first positional arg
-                                found = Some((descr, true));
-                            } else if let Some(descr_get) = descr_cls.slots.descr_get.load() {
-                                // Has __get__ but not METHOD_DESCRIPTOR: bind it
-                                let bound = descr_get(
-                                    descr,
-                                    Some(self_val.clone()),
-                                    Some(start_type.as_object().to_owned()),
-                                    vm,
-                                )?;
-                                found = Some((bound, false));
-                            } else {
-                                // Plain attribute
-                                found = Some((descr, false));
-                            }
-                            break;
-                        }
-                    }
-                    if let Some((attr, is_method)) = found {
+                    if let Some(descr) = start_type.get_super_attr_after(class, attr_name) {
+                        let descr_cls = descr.class();
+                        let (attr, is_method) = if descr_cls
+                            .slots
+                            .flags
+                            .has_feature(PyTypeFlags::METHOD_DESCRIPTOR)
+                        {
+                            // Method descriptor: push unbound func + self
+                            // CALL will prepend self as first positional arg
+                            (descr, true)
+                        } else if let Some(descr_get) = descr_cls.slots.descr_get.load() {
+                            // Has __get__ but not METHOD_DESCRIPTOR: bind it
+                            let bound = descr_get(
+                                descr,
+                                Some(self_val.clone()),
+                                Some(start_type.as_object().to_owned()),
+                                vm,
+                            )?;
+                            (bound, false)
+                        } else {
+                            // Plain attribute
+                            (descr, false)
+                        };
                         self.pop_value(); // self
                         self.pop_value(); // class
                         self.pop_value(); // super
