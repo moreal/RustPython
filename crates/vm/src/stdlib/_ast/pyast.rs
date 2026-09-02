@@ -1770,7 +1770,7 @@ fn populate_field_types(vm: &VirtualMachine, module: &Py<PyModule>) {
         let Some(type_obj) = value.downcast_ref::<PyType>() else {
             continue;
         };
-        if let Some(field_types) = type_obj.get_attr(field_types_attr) {
+        if let Some(field_types) = type_obj.get_attr_with_vm(field_types_attr, vm) {
             type_obj.set_attr(annotations_attr, field_types);
         }
     }

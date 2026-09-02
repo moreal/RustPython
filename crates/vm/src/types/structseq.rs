@@ -77,11 +77,11 @@ pub fn struct_sequence_new(
     }
 
     let min_len: usize = cls
-        .get_attr(identifier!(vm.ctx, n_sequence_fields))
+        .get_attr_with_vm(identifier!(vm.ctx, n_sequence_fields), vm)
         .ok_or_else(|| vm.new_type_error("missing n_sequence_fields attribute"))?
         .try_into_value(vm)?;
     let max_len: usize = cls
-        .get_attr(identifier!(vm.ctx, n_fields))
+        .get_attr_with_vm(identifier!(vm.ctx, n_fields), vm)
         .ok_or_else(|| vm.new_type_error("missing n_fields attribute"))?
         .try_into_value(vm)?;
 
@@ -133,7 +133,7 @@ pub fn struct_sequence_new(
 
 fn get_visible_len(obj: &PyObject, vm: &VirtualMachine) -> PyResult<usize> {
     obj.class()
-        .get_attr(identifier!(vm.ctx, n_sequence_fields))
+        .get_attr_with_vm(identifier!(vm.ctx, n_sequence_fields), vm)
         .ok_or_else(|| vm.new_type_error("missing n_sequence_fields"))?
         .try_into_value(vm)
 }
@@ -297,7 +297,7 @@ pub trait PyStructSequence: StaticType + PyClassImpl + Sized + 'static {
             alloc::borrow::Cow::Borrowed(Self::TP_NAME)
         } else {
             let typ = zelf.class();
-            match typ.get_attr(identifier!(vm.ctx, __module__)) {
+            match typ.get_attr_with_vm(identifier!(vm.ctx, __module__), vm) {
                 Some(module) if module.downcastable::<PyStr>() => {
                     let module_str = module.downcast_ref::<PyStr>().unwrap();
                     alloc::borrow::Cow::Owned(format!("{}.{}", module_str.as_wtf8(), Self::NAME))

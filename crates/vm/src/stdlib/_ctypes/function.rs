@@ -810,10 +810,10 @@ impl Constructor for PyCFuncPtr {
         // Check if first argument is a Python callable (callback creation)
         if first_arg.is_callable() {
             // Get argument types and result type from the class
-            let class_argtypes = cls.get_attr(vm.ctx.intern_str("_argtypes_"));
-            let class_restype = cls.get_attr(vm.ctx.intern_str("_restype_"));
+            let class_argtypes = cls.get_attr_with_vm(vm.ctx.intern_str("_argtypes_"), vm);
+            let class_restype = cls.get_attr_with_vm(vm.ctx.intern_str("_restype_"), vm);
             let class_flags = cls
-                .get_attr(vm.ctx.intern_str("_flags_"))
+                .get_attr_with_vm(vm.ctx.intern_str("_flags_"), vm)
                 .and_then(|f| f.try_to_value::<u32>(vm).ok())
                 .unwrap_or(0);
 
@@ -1026,7 +1026,7 @@ fn extract_call_info(zelf: &Py<PyCFuncPtr>, vm: &VirtualMachine) -> PyResult<Cal
         } else if let Some(class_argtypes) = zelf
             .as_object()
             .class()
-            .get_attr(vm.ctx.intern_str("_argtypes_"))
+            .get_attr_with_vm(vm.ctx.intern_str("_argtypes_"), vm)
             && !vm.is_none(&class_argtypes)
         {
             Some(extract_arg_types(&class_argtypes, vm)?)
@@ -1038,7 +1038,7 @@ fn extract_call_info(zelf: &Py<PyCFuncPtr>, vm: &VirtualMachine) -> PyResult<Cal
     let restype_obj = zelf.restype.read().clone().or_else(|| {
         zelf.as_object()
             .class()
-            .get_attr(vm.ctx.intern_str("_restype_"))
+            .get_attr_with_vm(vm.ctx.intern_str("_restype_"), vm)
     });
 
     // Check if restype is explicitly None (return void)

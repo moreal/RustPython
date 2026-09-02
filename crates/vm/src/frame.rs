@@ -9229,10 +9229,12 @@ impl ExecutingFrame<'_> {
                 == crate::types::fn_addr(PyBaseObject::getattro as crate::types::GetattroFunc)
         });
         if !is_default_getattro {
-            let getattribute = cls.get_attr(identifier!(_vm, __getattribute__));
+            let getattribute = cls.get_attr_with_vm(identifier!(_vm, __getattribute__), _vm);
             if !oparg.is_method()
                 && !self.specialization_eval_frame_active(_vm)
-                && cls.get_attr(identifier!(_vm, __getattr__)).is_none()
+                && cls
+                    .get_attr_with_vm(identifier!(_vm, __getattr__), _vm)
+                    .is_none()
                 && let Some(getattribute) = getattribute
                 && let Some(func) = getattribute.downcast_ref_if_exact::<PyFunction>(_vm)
                 && func.can_specialize_call(2)
@@ -9297,7 +9299,7 @@ impl ExecutingFrame<'_> {
             return;
         }
 
-        let cls_attr = cls.get_attr(attr_name);
+        let cls_attr = cls.get_attr_with_vm(attr_name, _vm);
         let class_has_dict = cls.slots.flags.has_feature(PyTypeFlags::HAS_DICT);
 
         if oparg.is_method() {
@@ -10263,7 +10265,7 @@ impl ExecutingFrame<'_> {
                         }
                         return;
                     }
-                    let init = cls.get_attr(identifier!(vm, __init__));
+                    let init = cls.get_attr_with_vm(identifier!(vm, __init__), vm);
                     if let Some(init) = init
                         && let Some(init_func) = init.downcast_ref_if_exact::<PyFunction>(vm)
                         && init_func.can_specialize_call(nargs + 1)
@@ -11080,7 +11082,7 @@ impl ExecutingFrame<'_> {
         }
 
         let attr_name = self.code.names[attr_idx as usize];
-        let cls_attr = cls.get_attr(attr_name);
+        let cls_attr = cls.get_attr_with_vm(attr_name, vm);
         let has_data_descr = cls_attr.as_ref().is_some_and(|descr| {
             let descr_cls = descr.class();
             descr_cls.slots.descr_get.load().is_some() && descr_cls.slots.descr_set.load().is_some()

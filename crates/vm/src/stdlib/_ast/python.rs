@@ -111,7 +111,7 @@ pub(crate) mod _ast {
             return Ok(vm.ctx.new_tuple(vec![type_obj]));
         };
 
-        let fields = cls.get_attr(vm.ctx.intern_str("_fields"));
+        let fields = cls.get_attr_with_vm(vm.ctx.intern_str("_fields"), vm);
         if let Some(fields) = fields {
             let fields = fields.sequence_unchecked();
             let numfields = fields.length(vm)?;
@@ -219,8 +219,8 @@ pub(crate) mod _ast {
         }
 
         let cls = zelf.class();
-        let fields = cls.get_attr(vm.ctx.intern_str("_fields"));
-        let attributes = cls.get_attr(vm.ctx.intern_str("_attributes"));
+        let fields = cls.get_attr_with_vm(vm.ctx.intern_str("_fields"), vm);
+        let attributes = cls.get_attr_with_vm(vm.ctx.intern_str("_attributes"), vm);
         let dict = zelf.as_object().dict();
 
         let expecting = PySet::default().into_ref(&vm.ctx);
@@ -246,7 +246,7 @@ pub(crate) mod _ast {
         }
 
         // Discard optional fields (T | None).
-        if let Some(field_types) = cls.get_attr(vm.ctx.intern_str("_field_types"))
+        if let Some(field_types) = cls.get_attr_with_vm(vm.ctx.intern_str("_field_types"), vm)
             && let Ok(field_types) = field_types.downcast::<crate::builtins::PyDict>()
         {
             for (key, value) in field_types.items_vec() {
@@ -382,11 +382,11 @@ pub(crate) mod _ast {
         fn slot_init(zelf: PyObjectRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult<()> {
             let fields = zelf
                 .class()
-                .get_attr(vm.ctx.intern_str("_fields"))
+                .get_attr_with_vm(vm.ctx.intern_str("_fields"), vm)
                 .ok_or_else(|| {
                     let module = zelf
                         .class()
-                        .get_attr(vm.ctx.intern_str("__module__"))
+                        .get_attr_with_vm(vm.ctx.intern_str("__module__"), vm)
                         .and_then(|obj| obj.try_to_value::<String>(vm).ok())
                         .unwrap_or_else(|| "ast".to_owned());
                     vm.new_attribute_error(format!(
@@ -433,7 +433,7 @@ pub(crate) mod _ast {
                     } else {
                         let attrs = zelf
                             .class()
-                            .get_attr(vm.ctx.intern_str("_attributes"))
+                            .get_attr_with_vm(vm.ctx.intern_str("_attributes"), vm)
                             .ok_or_else(|| {
                                 vm.new_attribute_error(format!(
                                     "type object '{}' has no attribute '_attributes'",
@@ -465,7 +465,9 @@ Support for arbitrary keyword arguments is deprecated and will be removed in Pyt
 
             // Use _field_types to determine defaults for unset fields.
             // Only built-in AST node classes have _field_types populated.
-            let field_types = zelf.class().get_attr(vm.ctx.intern_str("_field_types"));
+            let field_types = zelf
+                .class()
+                .get_attr_with_vm(vm.ctx.intern_str("_field_types"), vm);
             if let Some(Ok(ft_dict)) =
                 field_types.map(|ft| ft.downcast::<crate::builtins::PyDict>())
             {
@@ -485,7 +487,7 @@ Support for arbitrary keyword arguments is deprecated and will be removed in Pyt
                             let load_type =
                                 super::super::pyast::NodeExprContextLoad::make_static_type();
                             let load_instance = load_type
-                                .get_attr(vm.ctx.intern_str("_instance"))
+                                .get_attr_with_vm(vm.ctx.intern_str("_instance"), vm)
                                 .unwrap_or_else(|| {
                                     vm.ctx.new_base_object(load_type, Some(vm.ctx.new_dict()))
                                 });

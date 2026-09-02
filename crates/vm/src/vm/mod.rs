@@ -952,7 +952,7 @@ impl VirtualMachine {
             .ctx
             .types
             .list_type
-            .get_attr(self.ctx.intern_str("append"))
+            .get_attr_with_vm(self.ctx.intern_str("append"), self)
             .ok_or_else(|| self.new_runtime_error("failed to cache list.append"))?;
         self.callable_cache.list_append = Some(list_append);
         self.callable_cache.builtin_all = Some(self.builtins.get_attr("all", self)?);
@@ -2961,7 +2961,7 @@ impl VirtualMachine {
     {
         let method = obj
             .class()
-            .get_attr(method_name)
+            .get_attr_with_vm(method_name, self)
             .ok_or_else(|| self.new_type_error(err_msg()))?;
         self.call_if_get_descriptor(&method, obj)
     }

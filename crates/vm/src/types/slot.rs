@@ -580,7 +580,7 @@ pub(crate) fn richcompare_wrapper(
 fn iter_wrapper(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult {
     // slot_tp_iter: if __iter__ is None, the type is explicitly not iterable
     let cls = zelf.class();
-    let iter_attr = cls.get_attr(identifier!(vm, __iter__));
+    let iter_attr = cls.get_attr_with_vm(identifier!(vm, __iter__), vm);
     match iter_attr {
         Some(attr) if vm.is_none(&attr) => {
             Err(vm.new_type_error(format!("'{}' object is not iterable", cls.slot_name())))
@@ -654,7 +654,7 @@ fn init_wrapper(obj: PyObjectRef, args: FuncArgs, vm: &VirtualMachine) -> PyResu
 }
 
 pub(crate) fn new_wrapper(cls: PyTypeRef, mut args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-    let new = cls.get_attr(identifier!(vm, __new__)).unwrap();
+    let new = cls.get_attr_with_vm(identifier!(vm, __new__), vm).unwrap();
     args.prepend_arg(cls.into());
     new.call(args, vm)
 }

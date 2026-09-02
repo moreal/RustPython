@@ -89,7 +89,9 @@ impl PyObject {
         use crate::builtins::PyCoroutine;
 
         // Check if object has __aiter__ method
-        let aiter_method = self.class().get_attr(identifier!(vm, __aiter__));
+        let aiter_method = self
+            .class()
+            .get_attr_with_vm(identifier!(vm, __aiter__), vm);
         let Some(_aiter_method) = aiter_method else {
             return Err(vm.new_type_error(format!(
                 "'{}' object is not an async iterable",
@@ -255,7 +257,7 @@ impl PyObject {
     ) -> PyResult<Option<PyObjectRef>> {
         let obj_cls = self.class();
         let cls_attr_name = vm.ctx.interned_str(name_str);
-        let cls_attr = match cls_attr_name.and_then(|name| obj_cls.get_attr(name)) {
+        let cls_attr = match cls_attr_name.and_then(|name| obj_cls.get_attr_with_vm(name, vm)) {
             Some(descr) => {
                 let descr_cls = descr.class();
                 let descr_get = descr_cls.slots.descr_get.load();

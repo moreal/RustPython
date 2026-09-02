@@ -79,7 +79,7 @@ mod _functools {
                 return Err(vm.new_type_error("_PlaceholderType takes no arguments"));
             }
             // Return the singleton stored on the type class
-            if let Some(instance) = cls.get_attr(vm.ctx.intern_str("_instance")) {
+            if let Some(instance) = cls.get_attr_with_vm(vm.ctx.intern_str("_instance"), vm) {
                 return Ok(instance);
             }
             // Fallback: create a new instance (shouldn't happen for base type after module init)

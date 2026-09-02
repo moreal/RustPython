@@ -104,7 +104,7 @@ pub(crate) fn repr_ast_node(
         return Ok(s);
     };
 
-    let fields = match cls.get_attr(vm.ctx.intern_str("_fields")) {
+    let fields = match cls.get_attr_with_vm(vm.ctx.intern_str("_fields"), vm) {
         Some(fields) => fields,
         None => {
             let mut s = Wtf8Buf::from(&*cls.name());
