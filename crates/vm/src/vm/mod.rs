@@ -91,6 +91,12 @@ pub struct VirtualMachine {
     pub wasm_id: Option<String>,
     exceptions: RefCell<ExceptionStack>,
     pub import_func: PyObjectRef,
+    /// `builtins.__import__` as captured right after interpreter
+    /// initialization. Used to detect whether `__import__` has since been
+    /// replaced, so `import_inner` can skip work (like materializing the
+    /// current frame) that only the default implementation is known to
+    /// never need.
+    pub(crate) default_import_func: PyObjectRef,
     pub(crate) importlib: PyObjectRef,
     pub profile_func: RefCell<PyObjectRef>,
     pub trace_func: RefCell<PyObjectRef>,
@@ -1050,6 +1056,7 @@ impl VirtualMachine {
         let sys_module = new_module(stdlib::sys::module_def(&ctx));
 
         let import_func = ctx.none();
+        let default_import_func = ctx.none();
         let importlib = ctx.none();
         let profile_func = RefCell::new(ctx.none());
         let trace_func = RefCell::new(ctx.none());
@@ -1063,6 +1070,7 @@ impl VirtualMachine {
             wasm_id: None,
             exceptions: RefCell::default(),
             import_func,
+            default_import_func,
             importlib,
             profile_func,
             trace_func,
@@ -1221,6 +1229,10 @@ impl VirtualMachine {
         }
 
         stdlib::builtins::init_module(self, &self.builtins);
+        self.default_import_func = self
+            .builtins
+            .get_attr(identifier!(self, __import__), self)
+            .unwrap_or_else(|_| self.ctx.none());
         let callable_cache_init = self.init_callable_cache();
         self.expect_pyresult(callable_cache_init, "failed to initialize callable cache");
         stdlib::sys::init_module(self, &self.sys_module, &self.builtins);
@@ -2684,16 +2696,22 @@ impl VirtualMachine {
             .get_attr(identifier!(self, __import__), self)
             .map_err(|_| self.new_import_error("__import__ not found", module.to_owned()))?;
 
-        let (locals, globals) = if let Some(globals) = crate::frame::current_globals() {
+        let globals = crate::frame::current_globals();
+        // Neither the native `__import__` (`import::import_module_level`) nor
+        // the frozen `_frozen_importlib.__import__` fallback ever reads the
+        // `locals` argument, so only pay for materializing the data-stack
+        // frame into a heap `FrameObject` and allocating its locals mapping
+        // when `__import__` has actually been replaced with something that
+        // might read it.
+        let locals = if globals.is_some() && !import_func.is(&self.default_import_func) {
             // Locals fallback: use the heavy frame if available, otherwise
             // use globals as locals (light frame locals are on the data stack).
-            let locals_mapping = self.current_frame().map_or_else(
-                || ArgMapping::from_dict_exact(globals.clone()),
+            Some(self.current_frame().map_or_else(
+                || ArgMapping::from_dict_exact(globals.clone().unwrap()),
                 |f| f.iframe().locals.clone_mapping(self),
-            );
-            (Some(locals_mapping), Some(globals))
+            ))
         } else {
-            (None, None)
+            None
         };
         let from_list: PyObjectRef = from_list.to_owned().into();
         import_func
