@@ -30,6 +30,58 @@ mod _collections {
     use core::{cmp::max, mem::size_of};
     use crossbeam_utils::atomic::AtomicCell;
 
+    #[pyfunction]
+    fn _count_elements(
+        mapping: PyObjectRef,
+        iterable: PyObjectRef,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let iter = iterable.get_iter(vm)?;
+
+        // Mirrors CPython's `_collections._count_elements` fast path: only
+        // take the shortcut of updating the underlying dict entries directly
+        // (skipping attribute lookup and a bound-method call per element)
+        // when neither `get` nor `__setitem__` is overridden from `dict`'s
+        // own. This never consults `__missing__`, matching what `dict.get()`
+        // itself does.
+        let get_name = vm.ctx.intern_str("get");
+        let setitem_name = identifier!(vm, __setitem__);
+        let dict_type = vm.ctx.types.dict_type;
+        let mapping_class = mapping.class();
+        let same_attr = |name| match (mapping_class.get_attr(name), dict_type.get_attr(name)) {
+            (Some(a), Some(b)) => a.is(&b),
+            _ => false,
+        };
+        let use_dict_fast_path = mapping.downcast_ref::<PyDict>().is_some()
+            && same_attr(get_name)
+            && same_attr(setitem_name);
+
+        let one: PyObjectRef = vm.ctx.new_int(1).into();
+
+        if use_dict_fast_path {
+            let dict = mapping.downcast_ref::<PyDict>().unwrap();
+            for key in iter.iter::<PyObjectRef>(vm)? {
+                let key = key?;
+                let newval = match dict.inner_getitem_opt(&*key, vm)? {
+                    Some(oldval) => vm._add(&oldval, &one)?,
+                    None => one.clone(),
+                };
+                dict.inner_setitem(&*key, newval, vm)?;
+            }
+        } else {
+            let bound_get = mapping.get_attr(get_name, vm)?;
+            let zero: PyObjectRef = vm.ctx.new_int(0).into();
+            for key in iter.iter::<PyObjectRef>(vm)? {
+                let key = key?;
+                let oldval = bound_get.call((key.clone(), zero.clone()), vm)?;
+                let newval = vm._add(&oldval, &one)?;
+                mapping.set_item(&*key, newval, vm)?;
+            }
+        }
+
+        Ok(())
+    }
+
     #[pyattr]
     #[pyclass(
         module = "collections",

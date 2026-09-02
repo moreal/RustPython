@@ -1763,7 +1763,6 @@ class TestLRU:
         f(0, **{})
         self.assertEqual(f.cache_info().hits, 1)
 
-    @unittest.expectedFailure  # TODO: RUSTPYTHON; Python lru_cache impl doesn't cache hash like C impl
     def test_lru_hash_only_once(self):
         # To protect against weird reentrancy bugs and to improve
         # efficiency when faced with slow __hash__ methods, the
@@ -2265,6 +2264,13 @@ class TestLRUPy(TestLRU, unittest.TestCase):
     @module.lru_cache()
     def cached_staticmeth(x, y):
         return 3 * x + y
+
+    # TODO: RUSTPYTHON; RustPython's pure-Python lru_cache fallback doesn't
+    # cache the key hash like the C implementation does, unlike upstream
+    # CPython's, so it calls __hash__ more than once per call here.
+    @unittest.expectedFailure
+    def test_lru_hash_only_once(self):
+        super().test_lru_hash_only_once()
 
 
 @unittest.skipUnless(c_functools, 'requires the C _functools module')
