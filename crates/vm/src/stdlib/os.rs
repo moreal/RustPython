@@ -7,6 +7,7 @@ use crate::{
     convert::{IntoPyException, ToPyException, ToPyObject},
     function::{ArgumentError, FromArgs, FuncArgs},
     host_env::{crt_fd, posix::RawMode},
+    ospath::OsPath,
 };
 use core::marker::PhantomData;
 use std::{io, path::Path};
@@ -124,6 +125,18 @@ impl<const AVAILABLE: usize, KW: DirFdKeyword> FromArgs for DirFd<'_, AVAILABLE,
 }
 
 #[derive(FromArgs)]
+pub(crate) struct SymlinkArgs<'fd> {
+    pub src: OsPath,
+    pub dst: OsPath,
+    #[cfg_attr(any(unix, target_os = "wasi"), expect(unused))]
+    #[pyarg(flatten)]
+    pub target_is_directory: TargetIsDirectory,
+    #[cfg_attr(not(unix), expect(unused))]
+    #[pyarg(flatten)]
+    pub dir_fd: DirFd<'fd, { _os::SYMLINK_DIR_FD as usize }>,
+}
+
+#[derive(FromArgs)]
 pub(super) struct FollowSymlinks(
     #[pyarg(named, name = "follow_symlinks", default = true)] pub bool,
 );
@@ -198,6 +211,7 @@ pub(super) mod _os {
         builtins::{
             PyBytesRef, PyGenericAlias, PyIntRef, PyStrRef, PyTuple, PyTupleRef, PyTypeRef,
         },
+        class::PyClassDef,
         common::lock::{OnceCell, PyRwLock},
         convert::{IntoPyException, ToPyObject},
         exceptions::{OSErrorBuilder, ToOSErrorBuilder},
@@ -1345,7 +1359,7 @@ pub(super) mod _os {
         fn slot_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             let result = crate::types::struct_sequence_new(
                 cls.clone(),
-                args.bind(vm)?,
+                args.bind_for(vm, Self::NAME)?,
                 StatResultData::OPTIONAL_FIELD_NAMES,
                 vm,
             )?;
@@ -2002,7 +2016,7 @@ pub(super) mod _os {
         fn slot_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
             crate::types::struct_sequence_new(
                 cls,
-                args.bind(vm)?,
+                args.bind_for(vm, Self::NAME)?,
                 StatvfsResultData::OPTIONAL_FIELD_NAMES,
                 vm,
             )

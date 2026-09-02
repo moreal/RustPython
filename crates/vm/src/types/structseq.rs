@@ -250,7 +250,12 @@ pub trait PyStructSequence: StaticType + PyClassImpl + Sized + 'static {
 
     #[pyslot]
     fn slot_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-        struct_sequence_new(cls, args.bind(vm)?, Self::Data::OPTIONAL_FIELD_NAMES, vm)
+        struct_sequence_new(
+            cls,
+            args.bind_for(vm, Self::NAME)?,
+            Self::Data::OPTIONAL_FIELD_NAMES,
+            vm,
+        )
     }
 
     /// Convert a Data struct into a PyStructSequence instance.

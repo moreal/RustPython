@@ -14,7 +14,7 @@ use crate::{
         ByteInnerSplitOptions, ByteInnerSub, ByteInnerTranslateOptions, DecodeArgs, PyBytesInner,
         bytes_decode,
     },
-    class::PyClassImpl,
+    class::{PyClassDef, PyClassImpl},
     common::{hash::PyHash, lock::PyMutex},
     convert::{ToPyObject, ToPyResult},
     function::{ArgBytesLike, ArgIndex, FuncArgs, OptionalArg, OptionalOption, PyComparisonValue},
@@ -95,7 +95,7 @@ impl Constructor for PyBytes {
     type Args = Vec<u8>;
 
     fn slot_new(cls: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-        let options: ByteInnerNewOptions = args.bind(vm)?;
+        let options: ByteInnerNewOptions = args.bind_for(vm, Self::NAME)?;
 
         // Optimizations for exact bytes type
         if cls.is(vm.ctx.types.bytes_type) {

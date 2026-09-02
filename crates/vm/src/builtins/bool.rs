@@ -2,7 +2,7 @@ use super::{PyInt, PyStrRef, PyType, PyTypeRef, PyUtf8StrRef};
 use crate::common::format::FormatSpec;
 use crate::{
     AsObject, Context, Py, PyObject, PyObjectRef, PyResult, TryFromBorrowedObject, VirtualMachine,
-    class::PyClassImpl,
+    class::{PyClassDef, PyClassImpl},
     convert::{IntoPyException, ToPyObject, ToPyResult},
     function::{FuncArgs, OptionalArg},
     protocol::PyNumberMethods,
@@ -87,7 +87,7 @@ impl Constructor for PyBool {
     type Args = OptionalArg<PyObjectRef>;
 
     fn slot_new(zelf: PyTypeRef, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-        let x: Self::Args = args.bind(vm)?;
+        let x: Self::Args = args.bind_for(vm, Self::NAME)?;
         if !zelf.fast_isinstance(vm.ctx.types.type_type) {
             return Err(vm.new_type_error(format!(
                 "requires a 'type' object but received a '{}'",

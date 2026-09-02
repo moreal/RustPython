@@ -4,7 +4,7 @@ use crate::{
     TryFromBorrowedObject, VirtualMachine,
     builtins::PyUtf8StrRef,
     byte::bytes_from_object,
-    class::PyClassImpl,
+    class::{PyClassDef, PyClassImpl},
     common::{
         format::FormatSpec,
         hash,
@@ -259,7 +259,7 @@ impl Constructor for PyInt {
             return Ok(args.args[0].clone());
         }
 
-        let options: IntOptions = args.bind(vm)?;
+        let options: IntOptions = args.bind_for(vm, Self::NAME)?;
         let value = if let OptionalArg::Present(val) = options.val_options {
             if let OptionalArg::Present(base) = options.base {
                 let base = base

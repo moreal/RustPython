@@ -8,7 +8,7 @@ use super::{
 use crate::{
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject,
     atomic_func,
-    class::PyClassImpl,
+    class::{PyClassDef, PyClassImpl},
     common::{
         ascii,
         hash::PyHash,
@@ -1077,7 +1077,7 @@ impl Constructor for PyFrozenSet {
 
         // Optimizations for exact frozenset type
         let iterable_opt = if is_exact_frozenset || is_frozenset_init {
-            let iterable: OptionalArg<PyObjectRef> = args.bind(vm)?;
+            let iterable: OptionalArg<PyObjectRef> = args.bind_for(vm, Self::NAME)?;
 
             // Return exact frozenset as-is
             if is_exact_frozenset
@@ -1093,10 +1093,7 @@ impl Constructor for PyFrozenSet {
                 [] => OptionalArg::Missing,
                 [iterable] => OptionalArg::Present(iterable.clone()),
                 slice => {
-                    return Err(vm.new_type_error(format!(
-                        "frozenset expected at most 1 argument, got {}",
-                        slice.len()
-                    )));
+                    return Err(vm.new_arity_type_error(Self::NAME, 0..=1, slice.len()));
                 }
             }
         };
