@@ -1428,6 +1428,31 @@ impl PyType {
             .find_map(|class| class.attributes.get(attr_name))
     }
 
+    /// Look up `attr_name` in the MRO starting just after `boundary`, without collecting
+    /// the MRO into an owned `Vec` first. Used by the `super()` bytecode fast path
+    /// (`LOAD_SUPER_ATTR`), where `boundary` is the explicit or implicit `__class__`
+    /// argument to `super()`.
+    pub fn get_super_attr_after(
+        &self,
+        boundary: &Py<Self>,
+        attr_name: &'static PyStrInterned,
+    ) -> Option<PyObjectRef> {
+        let mro = self.mro.read();
+        let mut past_boundary = false;
+        for cls in mro.iter() {
+            if !past_boundary {
+                if cls.is(boundary) {
+                    past_boundary = true;
+                }
+                continue;
+            }
+            if let Some(descr) = cls.attributes.get(attr_name) {
+                return Some(descr);
+            }
+        }
+        None
+    }
+
     /// Fast lookup for attribute existence on a class.
     pub fn has_attr(&self, attr_name: &'static PyStrInterned) -> bool {
         self.has_name_in_mro(attr_name)
