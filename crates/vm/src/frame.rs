@@ -45,7 +45,7 @@ use num_traits::Zero;
 use rustpython_common::atomic::{PyAtomic, Radium};
 use rustpython_common::{
     lock::{OnceCell, PyMutex},
-    wtf8::{Wtf8, Wtf8Buf, wtf8_concat},
+    wtf8::{Wtf8Buf, wtf8_concat},
 };
 use rustpython_compiler_core::{OneIndexed, SourceLocation};
 
@@ -8040,18 +8040,21 @@ impl ExecutingFrame<'_> {
         if let Some(kw_obj) = kwargs_or_null {
             // Stack: [callable, self_or_null, args_tuple]
             let callable = self.nth_value(2);
-            let func_str = Self::object_function_str(callable, vm);
 
-            Self::iterate_mapping_keys(vm, &kw_obj, &func_str, |key| {
-                // `PyStr`, not `PyUtf8Str`: CPython only checks that the key is a
-                // `str`, not that it is valid UTF-8, so surrogate keys are accepted.
-                let key_str = key
-                    .downcast_ref::<PyStr>()
-                    .ok_or_else(|| vm.new_type_error("keywords must be strings"))?;
-                let value = kw_obj.get_item(&*key, vm)?;
-                kwargs.insert(key_str.as_wtf8().to_owned(), value);
-                Ok(())
-            })?
+            Self::iterate_mapping_keys(
+                vm,
+                &kw_obj,
+                || Self::object_function_str(callable, vm),
+                |key, value| {
+                    // `PyStr`, not `PyUtf8Str`: CPython only checks that the key is a
+                    // `str`, not that it is valid UTF-8, so surrogate keys are accepted.
+                    let key_str = key
+                        .downcast_ref::<PyStr>()
+                        .ok_or_else(|| vm.new_type_error("keywords must be strings"))?;
+                    kwargs.insert(key_str.as_wtf8().to_owned(), value);
+                    Ok(())
+                },
+            )?
         };
 
         let args_obj = self.pop_value();
@@ -8108,26 +8111,41 @@ impl ExecutingFrame<'_> {
 
     /// Helper function to iterate over mapping keys using the keys() method.
     /// This ensures proper order preservation for OrderedDict and other custom mappings.
-    fn iterate_mapping_keys<F>(
+    /// For an exact `dict`, iterates entries directly instead of going through the
+    /// `keys()` protocol, avoiding the bound-method call, the `dict_keys` view, and a
+    /// re-hashing `__getitem__` lookup per key. Dict subclasses (which may override
+    /// `keys`/`__getitem__`) fall back to the general protocol path.
+    /// `func_str` is only invoked when the mapping check fails, so the caller can pass
+    /// an expensive-to-compute closure without paying for it on the success path.
+    fn iterate_mapping_keys<F, G>(
         vm: &VirtualMachine,
         mapping: &PyObject,
-        func_str: &Wtf8,
+        func_str: G,
         mut key_handler: F,
     ) -> PyResult<()>
     where
-        F: FnMut(PyObjectRef) -> PyResult<()>,
+        F: FnMut(PyObjectRef, PyObjectRef) -> PyResult<()>,
+        G: FnOnce() -> Wtf8Buf,
     {
+        if let Some(dict) = mapping.downcast_ref_if_exact::<PyDict>(vm) {
+            for (key, value) in dict {
+                key_handler(key, value)?;
+            }
+            return Ok(());
+        }
+
         let Some(keys_method) = vm.get_method(mapping.to_owned(), vm.ctx.intern_str("keys")) else {
             return Err(vm.new_type_error(format!(
                 "{} argument after ** must be a mapping, not {}",
-                func_str,
+                func_str(),
                 mapping.class().name()
             )));
         };
 
         let keys = keys_method?.call((), vm)?.get_iter(vm)?;
         while let PyIterReturn::Return(key) = keys.next(vm)? {
-            key_handler(key)?;
+            let value = mapping.get_item(&*key, vm)?;
+            key_handler(key, value)?;
         }
         Ok(())
     }
