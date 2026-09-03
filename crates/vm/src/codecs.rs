@@ -6,7 +6,7 @@ use rustpython_common::{
     ascii,
     borrow::BorrowedValue,
     encodings::{
-        CodecContext, DecodeContext, DecodeErrorHandler, EncodeContext, EncodeErrorHandler,
+        self, CodecContext, DecodeContext, DecodeErrorHandler, EncodeContext, EncodeErrorHandler,
         EncodeReplace, StrBuffer, StrSize, errors,
     },
     lock::{OnceCell, PyRwLock},
@@ -32,6 +32,12 @@ pub struct CodecsRegistry {
 struct RegistryInner {
     search_path: Vec<PyObjectRef>,
     search_cache: HashMap<String, PyCodec>,
+    /// Caches `PyCodec::is_text_codec` per normalized encoding name, so
+    /// repeated `codecs.encode()`/`codecs.decode()`/`str.encode()`/
+    /// `bytes.decode()` calls for an encoding without a `FastTextCodec`
+    /// shortcut don't re-run the `_is_text_encoding` attribute lookup
+    /// every time.
+    is_text_cache: HashMap<String, bool>,
     errors: HashMap<String, PyObjectRef>,
 }
 
@@ -144,6 +150,112 @@ impl TryFromObject for PyCodec {
     }
 }
 
+/// The handful of encoding names that CPython's `PyUnicode_AsEncodedString`
+/// and `PyUnicode_Decode` (see `unicode_encode_ucs1`/`unicode_check_encoding_errors`
+/// in `unicodeobject.c`) resolve without ever consulting the codec registry.
+/// `str.encode()`/`bytes.decode()` mirror that here: for these names we skip
+/// `CodecsRegistry::lookup`, `PyCodec::is_text_codec`, and the throwaway
+/// `(bytes, consumed)` tuple entirely and call the native codec directly.
+///
+/// This is safe even in the presence of `codecs.register()`: CPython itself
+/// never gives a custom search function a chance to override these names, so
+/// matching that here cannot introduce a new incompatibility. It also mirrors
+/// this registry's own pre-existing behavior, since `utf-8`/`utf8`/`ascii`
+/// (and, when `freeze-stdlib` is enabled, the `latin-1` aliases) are already
+/// pinned into `search_cache` at interpreter startup and are therefore never
+/// re-resolved through `search_path` in practice.
+#[derive(Clone, Copy)]
+pub(crate) enum FastTextCodec {
+    Utf8,
+    Ascii,
+    Latin1,
+}
+
+impl FastTextCodec {
+    pub(crate) fn from_name(encoding: &str) -> Option<Self> {
+        if encoding.eq_ignore_ascii_case("utf-8")
+            || encoding.eq_ignore_ascii_case("utf_8")
+            || encoding.eq_ignore_ascii_case("utf8")
+        {
+            Some(Self::Utf8)
+        } else if encoding.eq_ignore_ascii_case("ascii")
+            || encoding.eq_ignore_ascii_case("us-ascii")
+            || encoding.eq_ignore_ascii_case("us_ascii")
+        {
+            Some(Self::Ascii)
+        } else if encoding.eq_ignore_ascii_case("latin-1")
+            || encoding.eq_ignore_ascii_case("latin_1")
+            || encoding.eq_ignore_ascii_case("latin1")
+            || encoding.eq_ignore_ascii_case("iso-8859-1")
+            || encoding.eq_ignore_ascii_case("iso_8859_1")
+            || encoding.eq_ignore_ascii_case("iso8859-1")
+            || encoding.eq_ignore_ascii_case("iso8859_1")
+        {
+            Some(Self::Latin1)
+        } else {
+            None
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Utf8 => encodings::utf8::ENCODING_NAME,
+            Self::Ascii => encodings::ascii::ENCODING_NAME,
+            Self::Latin1 => encodings::latin_1::ENCODING_NAME,
+        }
+    }
+
+    pub(crate) fn encode(
+        self,
+        s: &Py<PyStr>,
+        errors: Option<&Py<PyUtf8Str>>,
+        vm: &VirtualMachine,
+    ) -> PyResult<Vec<u8>> {
+        match self {
+            Self::Utf8 => {
+                if s.is_utf8() || errors.is_some_and(|e| e.is(identifier!(vm, surrogatepass))) {
+                    return Ok(s.as_bytes().to_vec());
+                }
+                let ctx = PyEncodeContext::new(self.name(), s, vm);
+                let errors = ErrorsHandler::new(errors, vm);
+                encodings::utf8::encode(ctx, &errors)
+            }
+            Self::Ascii => {
+                if s.isascii() {
+                    return Ok(s.as_bytes().to_vec());
+                }
+                let ctx = PyEncodeContext::new(self.name(), s, vm);
+                let errors = ErrorsHandler::new(errors, vm);
+                encodings::ascii::encode(ctx, &errors)
+            }
+            Self::Latin1 => {
+                if s.isascii() {
+                    return Ok(s.as_bytes().to_vec());
+                }
+                let ctx = PyEncodeContext::new(self.name(), s, vm);
+                let errors = ErrorsHandler::new(errors, vm);
+                encodings::latin_1::encode(ctx, &errors)
+            }
+        }
+    }
+
+    pub(crate) fn decode(
+        self,
+        data: &ArgBytesLike,
+        errors: Option<&Py<PyUtf8Str>>,
+        vm: &VirtualMachine,
+    ) -> PyResult<Wtf8Buf> {
+        let ctx = PyDecodeContext::new(self.name(), data, vm);
+        let errors = ErrorsHandler::new(errors, vm);
+        let (decoded, _consumed) = match self {
+            Self::Utf8 => encodings::utf8::decode(ctx, &errors, true)?,
+            Self::Ascii => encodings::ascii::decode(ctx, &errors)?,
+            Self::Latin1 => encodings::latin_1::decode(ctx, &errors)?,
+        };
+        Ok(decoded)
+    }
+}
+
 impl ToPyObject for PyCodec {
     #[inline]
     fn to_pyobject(self, _vm: &VirtualMachine) -> PyObjectRef {
@@ -198,6 +310,7 @@ impl CodecsRegistry {
         let inner = RegistryInner {
             search_path: Vec::new(),
             search_cache: HashMap::new(),
+            is_text_cache: HashMap::new(),
             errors,
         };
 
@@ -226,6 +339,7 @@ impl CodecsRegistry {
             if item.get_id() == search_function.get_id() {
                 if !inner.search_cache.is_empty() {
                     inner.search_cache.clear();
+                    inner.is_text_cache.clear();
                 }
                 inner.search_path.remove(i);
                 return;
@@ -278,7 +392,26 @@ impl CodecsRegistry {
     ) -> PyResult<PyCodec> {
         let codec = self.lookup(encoding, vm)?;
 
-        if codec.is_text_codec(vm)? {
+        let normalized = normalize_encoding_name(encoding);
+        let cached = self
+            .inner
+            .read()
+            .is_text_cache
+            .get(normalized.as_ref())
+            .copied();
+        let is_text = match cached {
+            Some(is_text) => is_text,
+            None => {
+                let is_text = codec.is_text_codec(vm)?;
+                self.inner
+                    .write()
+                    .is_text_cache
+                    .insert(normalized.into_owned(), is_text);
+                is_text
+            }
+        };
+
+        if is_text {
             Ok(codec)
         } else {
             Err(vm.new_lookup_error(format!(
@@ -289,7 +422,9 @@ impl CodecsRegistry {
 
     pub fn forget(&self, encoding: &str) -> Option<PyCodec> {
         let encoding = normalize_encoding_name(encoding);
-        self.inner.write().search_cache.remove(encoding.as_ref())
+        let mut inner = self.inner.write();
+        inner.is_text_cache.remove(encoding.as_ref());
+        inner.search_cache.remove(encoding.as_ref())
     }
 
     pub fn encode(

@@ -10,7 +10,7 @@ use crate::{
     cformat::cformat_bytes,
     common::hash,
     common::wtf8::is_py_ascii_whitespace,
-    function::{ArgIterable, Either, OptionalArg, OptionalOption, PyComparisonValue},
+    function::{ArgBytesLike, ArgIterable, Either, OptionalArg, OptionalOption, PyComparisonValue},
     literal::escape::Escape,
     protocol::{BufferFlags, PyBuffer},
     sequence::{SequenceExt, SequenceMutExt},
@@ -1222,6 +1222,12 @@ pub(crate) fn bytes_decode(
         None => crate::codecs::DEFAULT_ENCODING,
         Some(e) => e.as_str(),
     };
+    if let Some(fast) = crate::codecs::FastTextCodec::from_name(encoding)
+        && let Ok(buf) = ArgBytesLike::try_from_object(vm, zelf.clone())
+    {
+        let decoded = fast.decode(&buf, errors.as_deref(), vm)?;
+        return Ok(vm.ctx.new_str(decoded));
+    }
     vm.state
         .codec_registry
         .decode_text(zelf, encoding, errors, vm)
