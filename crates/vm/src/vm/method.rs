@@ -30,7 +30,7 @@ impl PyMethod {
         let interned_name = vm.ctx.interned_str(name);
         let mut is_method = false;
 
-        let cls_attr = match interned_name.and_then(|name| cls.get_attr(name)) {
+        let cls_attr = match interned_name.and_then(|name| cls.get_attr_with_vm(name, vm)) {
             Some(descr) => {
                 let descr_cls = descr.class();
                 let descr_get = if descr_cls
@@ -80,7 +80,7 @@ impl PyMethod {
                 }
                 None => Ok(Self::Attribute(attr)),
             }
-        } else if let Some(getter) = cls.get_attr(identifier!(vm, __getattr__)) {
+        } else if let Some(getter) = cls.get_attr_with_vm(identifier!(vm, __getattr__), vm) {
             getter.call((obj, name.to_owned()), vm).map(Self::Attribute)
         } else {
             Err(vm.new_no_attribute_error(obj.clone(), name.to_owned()))
@@ -96,7 +96,7 @@ impl PyMethod {
         let attr = if DIRECT {
             obj_cls.get_direct_attr(name)
         } else {
-            obj_cls.get_attr(name)
+            obj_cls.get_attr_with_vm(name, vm)
         };
         let func = match attr {
             Some(f) => f,

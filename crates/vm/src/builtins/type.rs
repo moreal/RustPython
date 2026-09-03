@@ -1206,6 +1206,17 @@ impl PyType {
         self.find_name_in_mro(attr_name)
     }
 
+    /// Like `get_attr`, but for callers that already hold a `vm` reference.
+    /// Goes straight to the cached MRO lookup instead of re-deriving the
+    /// current VM from thread-local storage.
+    pub fn get_attr_with_vm(
+        &self,
+        attr_name: &'static PyStrInterned,
+        vm: &VirtualMachine,
+    ) -> Option<PyObjectRef> {
+        self.lookup_ref_and_version_interned(attr_name, vm).0
+    }
+
     /// `_PyType_LookupRefAndVersion` equivalent for interned names.
     /// Returns the observed lookup result and the type version used for the lookup.
     ///
@@ -2819,7 +2830,7 @@ impl GetAttr for PyType {
         };
         vm_trace!("type.__getattribute__({:?}, {:?})", zelf, name);
         let mcl = zelf.class();
-        let mcl_attr = mcl.get_attr(name);
+        let mcl_attr = mcl.get_attr_with_vm(name, vm);
 
         if let Some(ref attr) = mcl_attr {
             let attr_class = attr.class();
@@ -2833,7 +2844,7 @@ impl GetAttr for PyType {
             }
         }
 
-        let zelf_attr = zelf.get_attr(name);
+        let zelf_attr = zelf.get_attr_with_vm(name, vm);
 
         if let Some(attr) = zelf_attr {
             let descr_get = attr.class().slots.descr_get.load();

@@ -58,7 +58,7 @@ mod type_parameters;
 /// Return the cached singleton instance for an operator/context node type,
 /// or create a new instance if none exists.
 fn singleton_node_to_object(vm: &VirtualMachine, node_type: &'static Py<PyType>) -> PyObjectRef {
-    if let Some(instance) = node_type.get_attr(vm.ctx.intern_str("_instance")) {
+    if let Some(instance) = node_type.get_attr_with_vm(vm.ctx.intern_str("_instance"), vm) {
         return instance;
     }
     NodeAst
@@ -463,7 +463,10 @@ fn scan_ast_source_extent(
 ) -> PyResult<()> {
     if is_ast_instance(vm, object)? {
         extent.update_location(vm, object)?;
-        if let Some(fields) = object.class().get_attr(vm.ctx.intern_str("_fields")) {
+        if let Some(fields) = object
+            .class()
+            .get_attr_with_vm(vm.ctx.intern_str("_fields"), vm)
+        {
             let fields = fields.sequence_unchecked();
             let len = fields.length(vm)?;
             for i in 0..len {
@@ -531,10 +534,16 @@ fn copy_ast_passthrough_fields(
         }
     }
 
-    let Some(source_fields) = source.class().get_attr(vm.ctx.intern_str("_fields")) else {
+    let Some(source_fields) = source
+        .class()
+        .get_attr_with_vm(vm.ctx.intern_str("_fields"), vm)
+    else {
         return Ok(());
     };
-    let Some(target_fields) = target.class().get_attr(vm.ctx.intern_str("_fields")) else {
+    let Some(target_fields) = target
+        .class()
+        .get_attr_with_vm(vm.ctx.intern_str("_fields"), vm)
+    else {
         return Ok(());
     };
     let source_fields = source_fields.sequence_unchecked();

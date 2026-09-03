@@ -19,12 +19,14 @@ fn method_is_overloaded(
     let Some(rop_name) = rop_name else {
         return Ok(false);
     };
-    let Some(method_b) = class_b.get_attr(rop_name) else {
+    let Some(method_b) = class_b.get_attr_with_vm(rop_name, vm) else {
         return Ok(false);
     };
-    class_a.get_attr(rop_name).map_or(Ok(true), |method_a| {
-        vm.identical_or_equal(&method_a, &method_b).map(|eq| !eq)
-    })
+    class_a
+        .get_attr_with_vm(rop_name, vm)
+        .map_or(Ok(true), |method_a| {
+            vm.identical_or_equal(&method_a, &method_b).map(|eq| !eq)
+        })
 }
 
 macro_rules! binary_func {

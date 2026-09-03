@@ -35,8 +35,12 @@ impl Constructor for PyBaseObject {
     fn slot_new(cls: PyTypeRef, args: Self::Args, vm: &VirtualMachine) -> PyResult {
         if !args.args.is_empty() || !args.kwargs.is_empty() {
             // Check if type's __new__ != object.__new__
-            let tp_new = cls.get_attr(identifier!(vm, __new__));
-            let object_new = vm.ctx.types.object_type.get_attr(identifier!(vm, __new__));
+            let tp_new = cls.get_attr_with_vm(identifier!(vm, __new__), vm);
+            let object_new = vm
+                .ctx
+                .types
+                .object_type
+                .get_attr_with_vm(identifier!(vm, __new__), vm);
 
             if let (Some(tp_new), Some(object_new)) = (tp_new, object_new) {
                 if !tp_new.is(&object_new) {
@@ -49,8 +53,12 @@ impl Constructor for PyBaseObject {
 
                 // If we reach here, tp_new == object_new
                 // Now check if type's __init__ == object.__init__
-                let tp_init = cls.get_attr(identifier!(vm, __init__));
-                let object_init = vm.ctx.types.object_type.get_attr(identifier!(vm, __init__));
+                let tp_init = cls.get_attr_with_vm(identifier!(vm, __init__), vm);
+                let object_init = vm
+                    .ctx
+                    .types
+                    .object_type
+                    .get_attr_with_vm(identifier!(vm, __init__), vm);
 
                 if let (Some(tp_init), Some(object_init)) = (tp_init, object_init)
                     && tp_init.is(&object_init)
@@ -65,7 +73,7 @@ impl Constructor for PyBaseObject {
         }
 
         // Ensure that all abstract methods are implemented before instantiating instance.
-        if let Some(abs_methods) = cls.get_attr(identifier!(vm, __abstractmethods__)) {
+        if let Some(abs_methods) = cls.get_attr_with_vm(identifier!(vm, __abstractmethods__), vm) {
             let methods: Vec<PyUtf8StrRef> = abs_methods.try_to_value(vm)?;
             let unimplemented_abstract_method_count = methods.len();
             if unimplemented_abstract_method_count > 0 {
@@ -138,8 +146,8 @@ impl Initializer for PyBaseObject {
 
         // if (type->tp_new == object_new) → second error
         if let (Some(typ_new), Some(object_new)) = (
-            typ.get_attr(identifier!(vm, __new__)),
-            object_type.get_attr(identifier!(vm, __new__)),
+            typ.get_attr_with_vm(identifier!(vm, __new__), vm),
+            object_type.get_attr_with_vm(identifier!(vm, __new__), vm),
         ) && typ_new.is(&object_new)
         {
             return Err(vm.new_type_error(format!(
@@ -476,7 +484,12 @@ impl PyBaseObject {
     fn __reduce_ex__(zelf: PyObjectRef, proto: usize, vm: &VirtualMachine) -> PyResult {
         let __reduce__ = identifier!(vm, __reduce__);
         if let Some(reduce) = vm.get_attribute_opt(zelf.clone(), __reduce__)? {
-            let object_reduce = vm.ctx.types.object_type.get_attr(__reduce__).unwrap();
+            let object_reduce = vm
+                .ctx
+                .types
+                .object_type
+                .get_attr_with_vm(__reduce__, vm)
+                .unwrap();
             let typ_obj: PyObjectRef = zelf.class().to_owned().into();
             let class_reduce = typ_obj.get_attr(__reduce__, vm)?;
             if !class_reduce.is(&object_reduce) {
@@ -627,8 +640,8 @@ fn is_getstate_overridden(obj: &PyObject, vm: &VirtualMachine) -> bool {
 
     // Check if __getstate__ in the MRO comes from object or elsewhere
     // If the type has its own __getstate__, it's overridden
-    if let Some(getstate) = obj_cls.get_attr(identifier!(vm, __getstate__))
-        && let Some(obj_getstate) = object_type.get_attr(identifier!(vm, __getstate__))
+    if let Some(getstate) = obj_cls.get_attr_with_vm(identifier!(vm, __getstate__), vm)
+        && let Some(obj_getstate) = object_type.get_attr_with_vm(identifier!(vm, __getstate__), vm)
     {
         return !getstate.is(&obj_getstate);
     }
