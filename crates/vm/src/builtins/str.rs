@@ -8,7 +8,7 @@ use crate::{
     TryFromBorrowedObject, TryFromObject, VirtualMachine,
     anystr::{self, AnyStr, AnyStrContainer, AnyStrWrapper, StringRange, adjust_indices},
     atomic_func,
-    bytes_inner::{swapcase_ascii, title_ascii},
+    bytes_inner::{repeat_bytes, swapcase_ascii, title_ascii},
     cformat::cformat_string,
     class::{PyClassDef, PyClassImpl},
     common::{
@@ -23,7 +23,6 @@ use crate::{
     protocol::{
         BufferFlags, PyBuffer, PyIterReturn, PyMappingMethods, PyNumberMethods, PySequenceMethods,
     },
-    sequence::SequenceExt,
     sliceable::{SequenceIndex, SliceableSequenceOp},
     types::{
         AsMapping, AsNumber, AsSequence, Comparable, Constructor, Hashable, IterNext, Iterable,
@@ -607,9 +606,7 @@ impl PyStr {
             // This only works for `str` itself, not its subclasses.
             return Ok(zelf);
         }
-        zelf.as_wtf8()
-            .as_bytes()
-            .mul(vm, value)
+        repeat_bytes(zelf.as_wtf8().as_bytes(), value, vm)
             .map(|x| Self::from(unsafe { Wtf8Buf::from_bytes_unchecked(x) }).into_ref(&vm.ctx))
     }
 
