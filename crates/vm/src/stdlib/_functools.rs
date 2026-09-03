@@ -3,12 +3,16 @@ pub(crate) use _functools::module_def;
 #[pymodule]
 mod _functools {
     use crate::{
-        Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
+        Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
         builtins::{
             PyBoundMethod, PyDict, PyDictRef, PyGenericAlias, PyTuple, PyType, PyTypeRef, object,
         },
-        common::lock::PyRwLock,
-        function::{FuncArgs, KwArgs, OptionalOption, PySetterValue},
+        common::{
+            hash::PyHash,
+            lock::{PyMutex, PyRwLock},
+        },
+        dict_inner::DictKey,
+        function::{FuncArgs, KwArgs, OptionalArg, OptionalOption, PySetterValue},
         object::AsObject,
         protocol::PyIter,
         pyclass,
@@ -16,6 +20,7 @@ mod _functools {
         types::{Callable, Constructor, GetDescriptor, Representable},
     };
     use rustpython_common::wtf8::Wtf8Buf;
+    use std::collections::HashMap;
 
     #[derive(FromArgs)]
     struct ReduceArgs {
@@ -525,6 +530,504 @@ mod _functools {
             } else {
                 Ok(Wtf8Buf::from("..."))
             }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum LruMaxSize {
+        NoCache,
+        Unbounded,
+        Bounded(usize),
+    }
+
+    #[derive(Debug)]
+    struct LruNode {
+        key: PyObjectRef,
+        hash: PyHash,
+        value: PyObjectRef,
+        prev: Option<usize>,
+        next: Option<usize>,
+    }
+
+    /// Cache storage backing the bounded/unbounded `maxsize` variants: a slab
+    /// of nodes threaded into a doubly-linked recency list (`front` is least
+    /// recently used, `back` is most recently used), indexed by a plain
+    /// hash-bucket map so a lookup calls the key's `__hash__` exactly once.
+    /// A node's slot is only ever reused in place by eviction (mirroring
+    /// CPython's `lru_cache`), so `nodes` never grows a hole to track.
+    #[derive(Debug, Default)]
+    struct LruCacheState {
+        buckets: HashMap<PyHash, Vec<usize>>,
+        nodes: Vec<LruNode>,
+        front: Option<usize>,
+        back: Option<usize>,
+        hits: usize,
+        misses: usize,
+    }
+
+    impl LruCacheState {
+        fn len(&self) -> usize {
+            self.nodes.len()
+        }
+
+        /// Identity-only match within a hash bucket. Safe to call under the
+        /// cache's lock: unlike `key_eq`, `is` never runs Python code.
+        fn find_by_identity(&self, hash: PyHash, key: &PyObject) -> Option<usize> {
+            let bucket = self.buckets.get(&hash)?;
+            bucket
+                .iter()
+                .find(|&&idx| self.nodes[idx].key.is(key))
+                .copied()
+        }
+
+        /// Every `(index, key)` sharing `hash`'s bucket, for a caller that
+        /// needs to fall back to `key_eq` outside the lock.
+        fn bucket_candidates(&self, hash: PyHash) -> Vec<(usize, PyObjectRef)> {
+            self.buckets
+                .get(&hash)
+                .map(|bucket| {
+                    bucket
+                        .iter()
+                        .map(|&idx| (idx, self.nodes[idx].key.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        fn bucket_add(&mut self, hash: PyHash, idx: usize) {
+            self.buckets.entry(hash).or_default().push(idx);
+        }
+
+        fn bucket_remove(&mut self, hash: PyHash, idx: usize) {
+            if let Some(bucket) = self.buckets.get_mut(&hash) {
+                if let Some(pos) = bucket.iter().position(|&i| i == idx) {
+                    bucket.swap_remove(pos);
+                }
+                if bucket.is_empty() {
+                    self.buckets.remove(&hash);
+                }
+            }
+        }
+
+        /// Splice node `idx` out of the recency list. Its own `prev`/`next`
+        /// are left stale; every caller immediately either relinks it (`touch`,
+        /// `insert`) or overwrites it (`insert` on eviction).
+        fn unlink(&mut self, idx: usize) {
+            let (prev, next) = (self.nodes[idx].prev, self.nodes[idx].next);
+            match prev {
+                Some(p) => self.nodes[p].next = next,
+                None => self.front = next,
+            }
+            match next {
+                Some(n) => self.nodes[n].prev = prev,
+                None => self.back = prev,
+            }
+        }
+
+        /// Link node `idx` in as the most-recently-used (back) entry.
+        fn link_back(&mut self, idx: usize) {
+            let old_back = self.back;
+            self.nodes[idx].prev = old_back;
+            self.nodes[idx].next = None;
+            match old_back {
+                Some(b) => self.nodes[b].next = Some(idx),
+                None => self.front = Some(idx),
+            }
+            self.back = Some(idx);
+        }
+
+        /// Mark node `idx` most-recently-used, for a cache hit.
+        fn touch(&mut self, idx: usize) {
+            self.unlink(idx);
+            self.link_back(idx);
+        }
+
+        /// Insert a freshly computed `(key, value)`, evicting the
+        /// least-recently-used entry first if the bounded cache is full.
+        /// Caller has already checked that `key` is not present.
+        fn insert(
+            &mut self,
+            hash: PyHash,
+            key: PyObjectRef,
+            value: PyObjectRef,
+            maxsize: LruMaxSize,
+        ) {
+            if let LruMaxSize::Bounded(n) = maxsize
+                && self.nodes.len() >= n
+            {
+                let old_idx = self
+                    .front
+                    .expect("a full bounded lru cache always has a least-recently-used node");
+                let old_hash = self.nodes[old_idx].hash;
+                self.bucket_remove(old_hash, old_idx);
+                self.unlink(old_idx);
+                self.nodes[old_idx] = LruNode {
+                    key,
+                    hash,
+                    value,
+                    prev: None,
+                    next: None,
+                };
+                self.bucket_add(hash, old_idx);
+                self.link_back(old_idx);
+                return;
+            }
+            let idx = self.nodes.len();
+            self.nodes.push(LruNode {
+                key,
+                hash,
+                value,
+                prev: None,
+                next: None,
+            });
+            self.bucket_add(hash, idx);
+            self.link_back(idx);
+        }
+
+        fn clear(&mut self) {
+            self.buckets.clear();
+            self.nodes.clear();
+            self.front = None;
+            self.back = None;
+            self.hits = 0;
+            self.misses = 0;
+        }
+    }
+
+    /// Builds the same cache key CPython's C `lru_cache` builds: a lone
+    /// exact `str`/`int` positional argument is used bare (matching
+    /// `_functoolsmodule.c`'s `lru_cache_make_key` fast path); otherwise the
+    /// key is a tuple of the positional arguments, followed by
+    /// `kwd_mark, name, value, ...` when there are keyword arguments, followed
+    /// by each argument's `type()` when `typed` is set.
+    fn make_key(
+        kwd_mark: &PyObjectRef,
+        args: &[PyObjectRef],
+        kwargs: &KwArgs,
+        typed: bool,
+        vm: &VirtualMachine,
+    ) -> PyObjectRef {
+        let has_kwargs = !kwargs.is_empty();
+        if !typed && !has_kwargs {
+            if let [only] = args {
+                let cls = only.class();
+                if cls.is(vm.ctx.types.str_type) || cls.is(vm.ctx.types.int_type) {
+                    return only.clone();
+                }
+            }
+            return vm.ctx.new_tuple(args.to_vec()).into();
+        }
+
+        let mut key: Vec<PyObjectRef> = Vec::with_capacity(
+            args.len()
+                + if has_kwargs { 1 + kwargs.len() * 2 } else { 0 }
+                + if typed { args.len() + kwargs.len() } else { 0 },
+        );
+        key.extend(args.iter().cloned());
+        if has_kwargs {
+            key.push(kwd_mark.clone());
+            for (name, value) in kwargs {
+                key.push(vm.ctx.new_str(name.clone()).into());
+                key.push(value.clone());
+            }
+        }
+        if typed {
+            key.extend(args.iter().map(|a| a.class().to_owned().into()));
+            if has_kwargs {
+                key.extend(kwargs.values().map(|v| v.class().to_owned().into()));
+            }
+        }
+        vm.ctx.new_tuple(key).into()
+    }
+
+    #[pyattr]
+    #[pyclass(name = "_lru_cache_wrapper", module = "functools", traverse = "manual")]
+    #[derive(Debug, PyPayload)]
+    pub(super) struct PyLruCache {
+        func: PyObjectRef,
+        typed: bool,
+        maxsize: LruMaxSize,
+        cache_info_type: PyObjectRef,
+        // Unique per-instance sentinel delimiting positional from keyword
+        // arguments in a cache key, the way `_functoolsmodule.c` uses one
+        // `kwd_mark` object per module (a fresh, private one per instance here
+        // is just as good: it is never compared across instances).
+        kwd_mark: PyObjectRef,
+        state: PyMutex<LruCacheState>,
+    }
+
+    // SAFETY: every owned PyObjectRef reachable from a `PyLruCache` (the
+    // wrapped function, the cache_info namedtuple type, the kwd_mark
+    // sentinel, and every cached key/value) is traversed at most once.
+    // (Not brought in via `use`: `object::Traverse` is implemented directly
+    // for `PyRef<T>`/`PyDictRef`, and importing it makes `some_dict.clear()`
+    // calls elsewhere in this module ambiguously resolve to
+    // `Traverse::clear` instead of `PyDict::clear`.)
+    unsafe impl crate::object::Traverse for PyLruCache {
+        fn traverse(&self, tracer_fn: &mut crate::object::TraverseFn<'_>) {
+            self.func.traverse(tracer_fn);
+            self.cache_info_type.traverse(tracer_fn);
+            self.kwd_mark.traverse(tracer_fn);
+            // Best-effort: a GC traversal must never block, so a held lock
+            // (e.g. from a thread paused mid-call) just skips the cached
+            // entries this pass, same trade-off `PyDeque::traverse` makes.
+            if let Some(state) = self.state.try_lock() {
+                for node in &state.nodes {
+                    node.key.traverse(tracer_fn);
+                    node.value.traverse(tracer_fn);
+                }
+            }
+        }
+    }
+
+    #[derive(FromArgs)]
+    pub(super) struct LruCacheNewArgs {
+        #[pyarg(any)]
+        user_function: PyObjectRef,
+        #[pyarg(any)]
+        maxsize: PyObjectRef,
+        #[pyarg(any)]
+        typed: bool,
+        #[pyarg(any)]
+        cache_info_type: PyObjectRef,
+    }
+
+    impl Constructor for PyLruCache {
+        type Args = LruCacheNewArgs;
+
+        fn py_new(_cls: &Py<PyType>, args: Self::Args, vm: &VirtualMachine) -> PyResult<Self> {
+            if !args.user_function.is_callable() {
+                return Err(vm.new_type_error("the first argument must be callable"));
+            }
+
+            let maxsize = if vm.is_none(&args.maxsize) {
+                LruMaxSize::Unbounded
+            } else {
+                let index = match args.maxsize.try_index_opt(vm) {
+                    Some(result) => result?,
+                    None => return Err(vm.new_type_error("maxsize should be integer or None")),
+                };
+                let n: isize = index.try_to_primitive(vm)?;
+                match n.max(0) {
+                    0 => LruMaxSize::NoCache,
+                    n => LruMaxSize::Bounded(n as usize),
+                }
+            };
+
+            Ok(Self {
+                func: args.user_function,
+                typed: args.typed,
+                maxsize,
+                cache_info_type: args.cache_info_type,
+                kwd_mark: vm
+                    .ctx
+                    .new_base_object(vm.ctx.types.object_type.to_owned(), None),
+                state: PyMutex::new(LruCacheState::default()),
+            })
+        }
+    }
+
+    #[pyclass(
+        with(Constructor, Callable, GetDescriptor),
+        flags(HAS_DICT, HAS_WEAKREF)
+    )]
+    impl PyLruCache {
+        #[pygetset]
+        fn __dict__(zelf: &Py<Self>, vm: &VirtualMachine) -> PyDictRef {
+            zelf.as_object()
+                .instance_dict()
+                .map_or_else(|| vm.ctx.new_dict(), |d| d.get_or_insert(vm))
+        }
+
+        #[pygetset(setter)]
+        fn set___dict__(
+            zelf: &Py<Self>,
+            value: PySetterValue,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            object::object_generic_set_dict(zelf.as_object().to_owned(), value, vm)
+        }
+
+        #[pymethod]
+        fn cache_info(&self, vm: &VirtualMachine) -> PyResult {
+            let (hits, misses, currsize) = {
+                let state = self.state.lock();
+                (state.hits, state.misses, state.len())
+            };
+            let maxsize: PyObjectRef = match self.maxsize {
+                LruMaxSize::Unbounded => vm.ctx.none(),
+                LruMaxSize::NoCache => vm.ctx.new_int(0).into(),
+                LruMaxSize::Bounded(n) => vm.ctx.new_int(n).into(),
+            };
+            self.cache_info_type
+                .call((hits, misses, maxsize, currsize), vm)
+        }
+
+        #[pymethod]
+        fn cache_clear(&self) {
+            self.state.lock().clear();
+        }
+
+        #[pymethod(name = "__reduce__")]
+        fn __reduce__(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult {
+            zelf.as_object().get_attr("__qualname__", vm)
+        }
+
+        #[pymethod(name = "__copy__")]
+        fn __copy__(zelf: PyRef<Self>) -> PyRef<Self> {
+            zelf
+        }
+
+        #[pymethod(name = "__deepcopy__")]
+        fn __deepcopy__(zelf: PyRef<Self>, _memo: OptionalArg<PyObjectRef>) -> PyRef<Self> {
+            zelf
+        }
+    }
+
+    impl GetDescriptor for PyLruCache {
+        fn descr_get(
+            zelf: PyObjectRef,
+            obj: Option<PyObjectRef>,
+            _cls: Option<PyObjectRef>,
+            vm: &VirtualMachine,
+        ) -> PyResult {
+            let obj = match obj {
+                Some(obj) if !vm.is_none(&obj) => obj,
+                _ => return Ok(zelf),
+            };
+            Ok(PyBoundMethod::new(obj, zelf).into_ref(&vm.ctx).into())
+        }
+    }
+
+    impl Callable for PyLruCache {
+        type Args = FuncArgs;
+
+        fn call(zelf: &Py<Self>, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+            if zelf.maxsize == LruMaxSize::NoCache {
+                zelf.state.lock().misses += 1;
+                return zelf.func.call(args, vm);
+            }
+
+            let key = make_key(&zelf.kwd_mark, &args.args, &args.kwargs, zelf.typed, vm);
+            // Computed once and reused for every subsequent lookup this call,
+            // matching CPython's guarantee that `__hash__` runs at most once
+            // per `lru_cache`-wrapped call.
+            let hash = key.key_hash(vm)?;
+
+            if let Some(value) = zelf.lookup_and_touch(hash, &key, vm)? {
+                return Ok(value);
+            }
+
+            // Released the lock before running arbitrary Python code: the
+            // wrapped function may legitimately recurse back into this same
+            // cache (see CPython's lru_cache bpo-35780 regression test).
+            let result = zelf.func.call(args, vm)?;
+
+            zelf.insert_if_absent(hash, key, result.clone(), vm)?;
+
+            Ok(result)
+        }
+    }
+
+    impl PyLruCache {
+        /// Look up `key` (with precomputed `hash`). On a hit, marks the entry
+        /// most-recently-used, counts it, and returns its value; on a miss,
+        /// counts it and returns `None`.
+        ///
+        /// `key_eq` can run arbitrary Python code -- including a call that
+        /// legitimately reenters this very cache on the same thread, the
+        /// scenario CPython's lru_cache `test_need_for_rlock` exists to guard
+        /// against -- so it only ever runs with `self.state` unlocked. The
+        /// cheap identity check (`is`) that never runs Python code is the
+        /// only comparison made while locked.
+        fn lookup_and_touch(
+            &self,
+            hash: PyHash,
+            key: &PyObject,
+            vm: &VirtualMachine,
+        ) -> PyResult<Option<PyObjectRef>> {
+            let candidates = {
+                let mut state = self.state.lock();
+                if let Some(idx) = state.find_by_identity(hash, key) {
+                    let value = state.nodes[idx].value.clone();
+                    state.touch(idx);
+                    state.hits += 1;
+                    return Ok(Some(value));
+                }
+                let candidates = state.bucket_candidates(hash);
+                if candidates.is_empty() {
+                    state.misses += 1;
+                    return Ok(None);
+                }
+                candidates
+            };
+
+            let mut matched = None;
+            for (idx, candidate_key) in candidates {
+                if key.key_eq(vm, &candidate_key)? {
+                    matched = Some((idx, candidate_key));
+                    break;
+                }
+            }
+
+            let mut state = self.state.lock();
+            // Re-validate under the lock: eviction (from a concurrent or
+            // reentrant call) may have reused this exact slot for a
+            // different key while `key_eq` ran unlocked above.
+            if let Some((idx, candidate_key)) = matched
+                && state
+                    .nodes
+                    .get(idx)
+                    .is_some_and(|node| node.key.is(&candidate_key))
+            {
+                let value = state.nodes[idx].value.clone();
+                state.touch(idx);
+                state.hits += 1;
+                return Ok(Some(value));
+            }
+            state.misses += 1;
+            Ok(None)
+        }
+
+        /// Cache a freshly computed `(key, value)`, unless `key` is already
+        /// present -- meaning a concurrent or reentrant call cached it while
+        /// the wrapped function ran -- in which case the cache is left
+        /// untouched, matching CPython's `bounded_lru_cache_update_lock_held`
+        /// (bpo-35780). Same locked-identity/unlocked-`key_eq` split as
+        /// `lookup_and_touch`, for the same reentrancy reason.
+        fn insert_if_absent(
+            &self,
+            hash: PyHash,
+            key: PyObjectRef,
+            value: PyObjectRef,
+            vm: &VirtualMachine,
+        ) -> PyResult<()> {
+            let candidates = {
+                let mut state = self.state.lock();
+                if state.find_by_identity(hash, &key).is_some() {
+                    return Ok(());
+                }
+                let candidates = state.bucket_candidates(hash);
+                if candidates.is_empty() {
+                    state.insert(hash, key, value, self.maxsize);
+                    return Ok(());
+                }
+                candidates
+            };
+
+            let mut already_present = false;
+            for (_, candidate_key) in candidates {
+                if key.key_eq(vm, &candidate_key)? {
+                    already_present = true;
+                    break;
+                }
+            }
+
+            let mut state = self.state.lock();
+            if !already_present && state.find_by_identity(hash, &key).is_none() {
+                state.insert(hash, key, value, self.maxsize);
+            }
+            Ok(())
         }
     }
 }
