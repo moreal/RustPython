@@ -180,10 +180,12 @@ impl PyFunction {
     ) -> PyResult<Self> {
         let name = PyMutex::new(code.obj_name.to_owned());
         let module = vm.unwrap_or_none(globals.get_item_opt(identifier!(vm, __name__), vm)?);
-        let builtins = globals.get_item("__builtins__", vm).unwrap_or_else(|_| {
-            // If not in globals, inherit from current execution context
-            crate::frame::current_builtins().unwrap_or_else(|| vm.builtins.dict().into())
-        });
+        let builtins = globals
+            .get_item_opt(identifier!(vm, __builtins__), vm)?
+            .unwrap_or_else(|| {
+                // If not in globals, inherit from current execution context
+                crate::frame::current_builtins().unwrap_or_else(|| vm.builtins.dict().into())
+            });
         // If builtins is a module, use its __dict__ instead
         let builtins = if let Some(module) = builtins.downcast_ref::<PyModule>() {
             module.dict().into()
@@ -201,7 +203,7 @@ impl PyFunction {
             vm.ctx.none()
         };
 
-        let qualname = vm.ctx.new_str(code.qualname.as_str());
+        let qualname = code.qualname.to_owned();
         let func = Self {
             code: PyAtomicRef::from(code),
             globals,
@@ -220,6 +222,16 @@ impl PyFunction {
             jitted_code: PyMutex::new(None),
         };
         Ok(func)
+    }
+
+    /// Wrap a newly constructed function object without eagerly allocating
+    /// its `__dict__`. Function objects rarely have instance attributes set,
+    /// so materializing `__dict__` lazily on first access avoids an extra
+    /// dict allocation for every `def`/`lambda`/nested function created.
+    #[inline]
+    pub(crate) fn into_ref_lazy_dict(self, vm: &VirtualMachine) -> PyResult<PyRef<Self>> {
+        let cls = Self::class(&vm.ctx).to_owned();
+        self.into_ref_with_type_lazy_dict(vm, cls)
     }
 
     fn fill_locals_from_args(

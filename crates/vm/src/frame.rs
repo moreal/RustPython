@@ -8565,7 +8565,9 @@ impl ExecutingFrame<'_> {
             .expect("Stack value should be code object");
 
         // Create function with minimal attributes
-        let func_obj = PyFunction::new(code_obj, self.globals.to_owned(), vm)?.into_pyobject(vm);
+        let func_obj = PyFunction::new(code_obj, self.globals.to_owned(), vm)?
+            .into_ref_lazy_dict(vm)?
+            .into();
 
         self.push_value(func_obj);
         Ok(None)

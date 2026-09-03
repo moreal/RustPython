@@ -306,7 +306,9 @@ impl SharedValue {
                 // Stateless functions have no globals, so `__main__` is used,
                 // just like for builtins such as exec().
                 let globals = vm.main_namespace()?;
-                Ok(PyFunction::new(code, globals, vm)?.into_pyobject(vm))
+                Ok(PyFunction::new(code, globals, vm)?
+                    .into_ref_lazy_dict(vm)?
+                    .into())
             }
             Self::Pickled(data) => pickle_loads(&data, vm),
         }

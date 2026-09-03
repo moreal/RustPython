@@ -21,8 +21,10 @@ mod vm_new;
 mod vm_object;
 mod vm_ops;
 
+#[cfg(not(feature = "stdio"))]
+use crate::PyPayload;
 use crate::{
-    AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
+    AsObject, Py, PyObject, PyObjectRef, PyRef, PyResult,
     builtins::{
         self, PyBaseExceptionRef, PyBaseObject, PyDict, PyDictRef, PyInt, PyList, PyModule, PyStr,
         PyStrInterned, PyStrRef, PyTypeRef, PyUtf8Str, PyUtf8StrInterned, PyWeak,
@@ -1443,7 +1445,7 @@ impl VirtualMachine {
         // Create a function object for module code, similar to PyEval_EvalCode
         let mut func = PyFunction::new(code, scope.globals.clone(), self)?;
         func.closure = closure;
-        let func = func.into_ref(&self.ctx);
+        let func = func.into_ref_lazy_dict(self)?;
         func.invoke_with_locals(FuncArgs::default(), scope.locals, self)
     }
 
