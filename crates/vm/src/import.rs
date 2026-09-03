@@ -371,6 +371,38 @@ pub(crate) fn is_stdlib_module_name(name: &PyObjectRef, vm: &VirtualMachine) -> 
     result.try_to_bool(vm)
 }
 
+/// Check whether `module` looks like a package, i.e. has a `__path__`
+/// attribute (mirrors `hasattr(module, '__path__')` in `importlib._bootstrap`).
+///
+/// For a plain (non-subclassed) module, this is checked directly against its
+/// `__dict__` instead of going through the module's `getattro`, which on a
+/// miss builds an expensive diagnostic `AttributeError` message (looking up
+/// `__spec__`, computing shadowing hints, possibly checking cwd, etc.) that
+/// this caller only ever discards.
+fn module_has_path(module: &PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
+    if let Some(module) = module.downcast_ref_if_exact::<crate::builtins::PyModule>(vm) {
+        let dict = module.dict();
+        if dict
+            .get_item_opt(vm.ctx.intern_str("__path__"), vm)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        // No dynamic `__getattr__` hook that could still produce `__path__`
+        // on demand, so a plain module missing it from `__dict__` is
+        // definitely not a package.
+        if dict
+            .get_item_opt(identifier!(vm, __getattr__), vm)?
+            .is_none()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(vm
+        .get_attribute_opt(module.clone(), vm.ctx.intern_str("__path__"))?
+        .is_some())
+}
+
 /// PyImport_ImportModuleLevelObject
 pub(crate) fn import_module_level(
     name: &Py<PyStr>,
@@ -455,9 +487,7 @@ pub(crate) fn import_module_level(
         // (has __path__). Non-module objects without __name__/__path__ would
         // crash inside _handle_fromlist; IMPORT_FROM handles per-attribute
         // errors with proper ImportError conversion.
-        let has_path = vm
-            .get_attribute_opt(module.clone(), vm.ctx.intern_str("__path__"))?
-            .is_some();
+        let has_path = module_has_path(&module, vm)?;
         if has_path {
             let handle_fromlist = vm.importlib.get_attr("_handle_fromlist", vm)?;
             handle_fromlist.call((module, fromlist, vm.import_func.clone()), vm)
