@@ -246,7 +246,10 @@ impl Coro {
         vm: &VirtualMachine,
     ) -> PyResult<PyIterReturn> {
         // Validate throw arguments (_gen_throw)
-        if exc_type.fast_isinstance(vm.ctx.exceptions.base_exception_type) && !vm.is_none(&exc_val)
+        if exc_type
+            .class()
+            .has_subclass_flag(crate::types::PyTypeFlags::BASE_EXC_SUBCLASS)
+            && !vm.is_none(&exc_val)
         {
             return Err(vm.new_type_error("instance exception may not have a separate value"));
         }

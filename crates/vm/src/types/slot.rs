@@ -240,6 +240,17 @@ bitflags! {
         // (bool, int, float, str, bytes, bytearray, list, tuple, dict, set, frozenset)
         // This is not a stable API
         const _MATCH_SELF = 1 << 22;
+        // O(1) subclass-of-builtin markers, set on the builtin type itself and
+        // inherited by every subclass (see `PyType::new_heap_inner`/`new_static`).
+        // Bit positions match CPython's Py_TPFLAGS_*_SUBCLASS for familiarity.
+        const LONG_SUBCLASS = 1 << 24;
+        const LIST_SUBCLASS = 1 << 25;
+        const TUPLE_SUBCLASS = 1 << 26;
+        const BYTES_SUBCLASS = 1 << 27;
+        const UNICODE_SUBCLASS = 1 << 28;
+        const DICT_SUBCLASS = 1 << 29;
+        const BASE_EXC_SUBCLASS = 1 << 30;
+        const TYPE_SUBCLASS = 1 << 31;
         const HAS_DICT = 1 << 40;
         const HAS_WEAKREF = 1 << 41;
 
@@ -252,6 +263,18 @@ impl PyTypeFlags {
     // Default used for both built-in and normal classes: empty, for now.
     // CPython default: Py_TPFLAGS_HAVE_STACKLESS_EXTENSION | Py_TPFLAGS_HAVE_VERSION_TAG
     pub const DEFAULT: Self = Self::empty();
+
+    /// All eight `*_SUBCLASS` markers together, for masking during inheritance.
+    pub const SUBCLASS_FLAGS: Self = Self::from_bits_truncate(
+        Self::LONG_SUBCLASS.bits()
+            | Self::LIST_SUBCLASS.bits()
+            | Self::TUPLE_SUBCLASS.bits()
+            | Self::BYTES_SUBCLASS.bits()
+            | Self::UNICODE_SUBCLASS.bits()
+            | Self::DICT_SUBCLASS.bits()
+            | Self::BASE_EXC_SUBCLASS.bits()
+            | Self::TYPE_SUBCLASS.bits(),
+    );
 
     // CPython: See initialization of flags in type_new.
     /// Used for types created in Python. Subclassable and are a
