@@ -652,3 +652,477 @@ pub mod ascii {
         )
     }
 }
+
+/// Byte-order resolution shared by the UTF-16/UTF-32 "ex_decode" and native-order
+/// decode entry points: given a `byteorder` hint (0 = auto-detect via BOM, negative
+/// = force little-endian, positive = force big-endian) and the raw bytes to decode,
+/// determines how many leading BOM bytes (if any) to skip, which byte order to use,
+/// the encoding name to report in error messages, and the byte-order mark value to
+/// hand back to callers (mirrors CPython's `_codecs.*_ex_decode` byteorder result,
+/// including returning the input `byteorder` verbatim when it is non-zero).
+pub struct ByteOrderInfo {
+    pub bom_len: usize,
+    pub little_endian: bool,
+    pub encoding_name: &'static str,
+    pub bo: isize,
+}
+
+pub mod utf16 {
+    use super::*;
+
+    pub const NATIVE_ENCODING_NAME: &str = "utf-16";
+    pub const LE_ENCODING_NAME: &str = "utf-16-le";
+    pub const BE_ENCODING_NAME: &str = "utf-16-be";
+
+    const ENCODE_ERR_REASON: &str = "surrogates not allowed";
+
+    #[inline]
+    fn store_unit(out: &mut Vec<u8>, unit: u16, little_endian: bool) {
+        if little_endian {
+            out.extend_from_slice(&unit.to_le_bytes());
+        } else {
+            out.extend_from_slice(&unit.to_be_bytes());
+        }
+    }
+
+    #[inline]
+    fn store_char(out: &mut Vec<u8>, cp: u32, little_endian: bool) {
+        if cp >= 0x10000 {
+            let cp = cp - 0x10000;
+            store_unit(out, (0xd800 | (cp >> 10)) as u16, little_endian);
+            store_unit(out, (0xdc00 | (cp & 0x3ff)) as u16, little_endian);
+        } else {
+            store_unit(out, cp as u16, little_endian);
+        }
+    }
+
+    /// Encode `ctx`'s remaining data as UTF-16 code units in the given byte order.
+    /// Lone surrogates go through the error handler one code point at a time (not
+    /// batched as runs), matching CPython's UTF-16 encoder exactly.
+    pub fn encode<Ctx, E>(
+        mut ctx: Ctx,
+        errors: &E,
+        little_endian: bool,
+    ) -> Result<Vec<u8>, Ctx::Error>
+    where
+        Ctx: EncodeContext,
+        E: EncodeErrorHandler<Ctx>,
+    {
+        let mut out = Vec::<u8>::with_capacity(ctx.remaining_data().len() * 2);
+        loop {
+            let data = ctx.remaining_data();
+            let mut bad = None;
+            for (i, ch) in iter_code_points(data) {
+                let v = ch.to_u32();
+                if (0xd800..=0xdfff).contains(&v) {
+                    bad = Some((i, ch));
+                    break;
+                }
+                store_char(&mut out, v, little_endian);
+            }
+            // the iterator above borrows `ctx` through `data`; it must be dropped
+            // (by exhausting or breaking out of the for loop) before `ctx` can be
+            // mutably borrowed by `handle_error` below.
+            let Some((i, ch)) = bad else { break };
+            let err_start = ctx.position() + i;
+            let err_end = err_start
+                + StrSize {
+                    bytes: ch.len_wtf8(),
+                    chars: 1,
+                };
+            let range = err_start..err_end;
+            let replace = ctx.handle_error(errors, range.clone(), Some(ENCODE_ERR_REASON))?;
+            match replace {
+                EncodeReplace::Str(s) => {
+                    if s.as_ref()
+                        .code_points()
+                        .any(|c| matches!(c.to_u32(), 0xd800..=0xdfff))
+                    {
+                        return Err(ctx.error_encoding(range, Some(ENCODE_ERR_REASON)));
+                    }
+                    for c in s.as_ref().code_points() {
+                        store_char(&mut out, c.to_u32(), little_endian);
+                    }
+                }
+                EncodeReplace::Bytes(b) => {
+                    // CPython requires a bytes replacement's length to be a
+                    // multiple of the 2-byte code unit; otherwise it fails
+                    // with the original "surrogates not allowed" error. This
+                    // also means `surrogateescape` (which emits exactly one
+                    // byte per surrogate) never succeeds for UTF-16, matching
+                    // CPython.
+                    let b = b.as_ref();
+                    if b.len() % 2 != 0 {
+                        return Err(ctx.error_encoding(range, Some(ENCODE_ERR_REASON)));
+                    }
+                    out.extend_from_slice(b);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Encode with a leading BOM in the host's native byte order (the plain "utf-16" codec).
+    pub fn encode_native<Ctx, E>(ctx: Ctx, errors: &E) -> Result<Vec<u8>, Ctx::Error>
+    where
+        Ctx: EncodeContext,
+        E: EncodeErrorHandler<Ctx>,
+    {
+        let little_endian = cfg!(target_endian = "little");
+        let mut out = Vec::with_capacity(ctx.remaining_data().len() * 2 + 2);
+        store_unit(&mut out, 0xfeff, little_endian);
+        out.extend(encode(ctx, errors, little_endian)?);
+        Ok(out)
+    }
+
+    /// Decode UTF-16 code units in the given byte order, assembling surrogate pairs
+    /// into astral code points. `final_decode` controls whether a trailing odd byte
+    /// or unpaired lead surrogate at the end of `ctx`'s remaining data is reported as
+    /// an error (final call) or left unconsumed for a future incremental call.
+    pub fn decode<Ctx, E>(
+        mut ctx: Ctx,
+        errors: &E,
+        little_endian: bool,
+        final_decode: bool,
+    ) -> Result<(Wtf8Buf, usize), Ctx::Error>
+    where
+        Ctx: DecodeContext,
+        E: DecodeErrorHandler<Ctx>,
+    {
+        #[inline]
+        fn read_u16(b: &[u8], little_endian: bool) -> u32 {
+            let unit = if little_endian {
+                u16::from_le_bytes([b[0], b[1]])
+            } else {
+                u16::from_be_bytes([b[0], b[1]])
+            };
+            unit as u32
+        }
+
+        let mut out = Wtf8Buf::with_capacity(ctx.remaining_data().len() / 2);
+        loop {
+            let data = ctx.remaining_data();
+            if data.is_empty() {
+                break;
+            }
+            if data.len() < 2 {
+                if !final_decode {
+                    break;
+                }
+                let start = ctx.position();
+                let end = ctx.full_data().len();
+                let replace = ctx.handle_error(errors, start..end, Some("truncated data"))?;
+                out.push_wtf8(replace.as_ref());
+                // the error handler may only have partially consumed the
+                // trailing bytes (e.g. `surrogateescape` stopping at an
+                // ASCII byte); loop back around to handle what remains
+                // instead of assuming it's fully drained.
+                continue;
+            }
+            let ch = read_u16(data, little_endian);
+            if !(0xd800..=0xdfff).contains(&ch) {
+                out.push(CodePoint::from_u32(ch).unwrap());
+                ctx.advance(2);
+                continue;
+            }
+            if (0xd800..=0xdbff).contains(&ch) {
+                if data.len() >= 4 {
+                    let ch2 = read_u16(&data[2..4], little_endian);
+                    if (0xdc00..=0xdfff).contains(&ch2) {
+                        let cp = 0x10000 + (((ch & 0x3ff) << 10) | (ch2 & 0x3ff));
+                        out.push(CodePoint::from_u32(cp).unwrap());
+                        ctx.advance(4);
+                        continue;
+                    }
+                    let start = ctx.position();
+                    let end = start + 2;
+                    let replace =
+                        ctx.handle_error(errors, start..end, Some("illegal UTF-16 surrogate"))?;
+                    out.push_wtf8(replace.as_ref());
+                } else {
+                    if !final_decode {
+                        break;
+                    }
+                    let start = ctx.position();
+                    let end = ctx.full_data().len();
+                    let replace =
+                        ctx.handle_error(errors, start..end, Some("unexpected end of data"))?;
+                    out.push_wtf8(replace.as_ref());
+                }
+            } else {
+                let start = ctx.position();
+                let end = start + 2;
+                let replace = ctx.handle_error(errors, start..end, Some("illegal encoding"))?;
+                out.push_wtf8(replace.as_ref());
+            }
+        }
+        Ok((out, ctx.position()))
+    }
+
+    /// Resolve the effective byte order for a UTF-16 decode. `byteorder` follows the
+    /// `_codecs.utf_16_ex_decode` convention: 0 auto-detects (and strips) a leading
+    /// BOM, falling back to the host's native order; non-zero forces little/big-endian
+    /// with no BOM handling and is echoed back verbatim as `bo`, matching CPython.
+    #[must_use]
+    pub fn resolve_byteorder(data: &[u8], byteorder: isize) -> ByteOrderInfo {
+        if byteorder < 0 {
+            return ByteOrderInfo {
+                bom_len: 0,
+                little_endian: true,
+                encoding_name: LE_ENCODING_NAME,
+                bo: byteorder,
+            };
+        }
+        if byteorder > 0 {
+            return ByteOrderInfo {
+                bom_len: 0,
+                little_endian: false,
+                encoding_name: BE_ENCODING_NAME,
+                bo: byteorder,
+            };
+        }
+        if data.len() >= 2 && data[0] == 0xff && data[1] == 0xfe {
+            ByteOrderInfo {
+                bom_len: 2,
+                little_endian: true,
+                encoding_name: LE_ENCODING_NAME,
+                bo: -1,
+            }
+        } else if data.len() >= 2 && data[0] == 0xfe && data[1] == 0xff {
+            ByteOrderInfo {
+                bom_len: 2,
+                little_endian: false,
+                encoding_name: BE_ENCODING_NAME,
+                bo: 1,
+            }
+        } else {
+            let little_endian = cfg!(target_endian = "little");
+            ByteOrderInfo {
+                bom_len: 0,
+                little_endian,
+                encoding_name: if little_endian {
+                    LE_ENCODING_NAME
+                } else {
+                    BE_ENCODING_NAME
+                },
+                bo: 0,
+            }
+        }
+    }
+}
+
+pub mod utf32 {
+    use super::*;
+
+    pub const NATIVE_ENCODING_NAME: &str = "utf-32";
+    pub const LE_ENCODING_NAME: &str = "utf-32-le";
+    pub const BE_ENCODING_NAME: &str = "utf-32-be";
+
+    const ENCODE_ERR_REASON: &str = "surrogates not allowed";
+
+    #[inline]
+    fn store_unit(out: &mut Vec<u8>, unit: u32, little_endian: bool) {
+        if little_endian {
+            out.extend_from_slice(&unit.to_le_bytes());
+        } else {
+            out.extend_from_slice(&unit.to_be_bytes());
+        }
+    }
+
+    /// Encode `ctx`'s remaining data as UTF-32 code units in the given byte order.
+    /// Lone surrogates go through the error handler one code point at a time, matching
+    /// CPython's UTF-32 encoder exactly.
+    pub fn encode<Ctx, E>(
+        mut ctx: Ctx,
+        errors: &E,
+        little_endian: bool,
+    ) -> Result<Vec<u8>, Ctx::Error>
+    where
+        Ctx: EncodeContext,
+        E: EncodeErrorHandler<Ctx>,
+    {
+        let mut out = Vec::<u8>::with_capacity(ctx.remaining_data().len() * 4);
+        loop {
+            let data = ctx.remaining_data();
+            let mut bad = None;
+            for (i, ch) in iter_code_points(data) {
+                let v = ch.to_u32();
+                if (0xd800..=0xdfff).contains(&v) {
+                    bad = Some((i, ch));
+                    break;
+                }
+                store_unit(&mut out, v, little_endian);
+            }
+            // the iterator above borrows `ctx` through `data`; it must be dropped
+            // (by exhausting or breaking out of the for loop) before `ctx` can be
+            // mutably borrowed by `handle_error` below.
+            let Some((i, ch)) = bad else { break };
+            let err_start = ctx.position() + i;
+            let err_end = err_start
+                + StrSize {
+                    bytes: ch.len_wtf8(),
+                    chars: 1,
+                };
+            let range = err_start..err_end;
+            let replace = ctx.handle_error(errors, range.clone(), Some(ENCODE_ERR_REASON))?;
+            match replace {
+                EncodeReplace::Str(s) => {
+                    if s.as_ref()
+                        .code_points()
+                        .any(|c| matches!(c.to_u32(), 0xd800..=0xdfff))
+                    {
+                        return Err(ctx.error_encoding(range, Some(ENCODE_ERR_REASON)));
+                    }
+                    for c in s.as_ref().code_points() {
+                        store_unit(&mut out, c.to_u32(), little_endian);
+                    }
+                }
+                EncodeReplace::Bytes(b) => {
+                    // CPython requires a bytes replacement's length to be a
+                    // multiple of the 4-byte code unit; otherwise it fails
+                    // with the original "surrogates not allowed" error. This
+                    // also means `surrogateescape` (which emits exactly one
+                    // byte per surrogate) never succeeds for UTF-32, matching
+                    // CPython.
+                    let b = b.as_ref();
+                    if b.len() % 4 != 0 {
+                        return Err(ctx.error_encoding(range, Some(ENCODE_ERR_REASON)));
+                    }
+                    out.extend_from_slice(b);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Encode with a leading BOM in the host's native byte order (the plain "utf-32" codec).
+    pub fn encode_native<Ctx, E>(ctx: Ctx, errors: &E) -> Result<Vec<u8>, Ctx::Error>
+    where
+        Ctx: EncodeContext,
+        E: EncodeErrorHandler<Ctx>,
+    {
+        let little_endian = cfg!(target_endian = "little");
+        let mut out = Vec::with_capacity(ctx.remaining_data().len() * 4 + 4);
+        store_unit(&mut out, 0xfeff, little_endian);
+        out.extend(encode(ctx, errors, little_endian)?);
+        Ok(out)
+    }
+
+    /// Decode UTF-32 code units in the given byte order. `final_decode` controls
+    /// whether trailing bytes that don't form a full 4-byte unit at the end of
+    /// `ctx`'s remaining data are reported as an error (final call) or left
+    /// unconsumed for a future incremental call.
+    pub fn decode<Ctx, E>(
+        mut ctx: Ctx,
+        errors: &E,
+        little_endian: bool,
+        final_decode: bool,
+    ) -> Result<(Wtf8Buf, usize), Ctx::Error>
+    where
+        Ctx: DecodeContext,
+        E: DecodeErrorHandler<Ctx>,
+    {
+        #[inline]
+        fn read_u32(b: &[u8], little_endian: bool) -> u32 {
+            if little_endian {
+                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            } else {
+                u32::from_be_bytes([b[0], b[1], b[2], b[3]])
+            }
+        }
+
+        let mut out = Wtf8Buf::with_capacity(ctx.remaining_data().len() / 4);
+        loop {
+            let data = ctx.remaining_data();
+            if data.is_empty() {
+                break;
+            }
+            if data.len() < 4 {
+                if !final_decode {
+                    break;
+                }
+                let start = ctx.position();
+                let end = ctx.full_data().len();
+                let replace = ctx.handle_error(errors, start..end, Some("truncated data"))?;
+                out.push_wtf8(replace.as_ref());
+                // the error handler may only have partially consumed the
+                // trailing bytes (e.g. `surrogateescape` stopping at an
+                // ASCII byte); loop back around to handle what remains
+                // instead of assuming it's fully drained.
+                continue;
+            }
+            let ch = read_u32(data, little_endian);
+            if ch > 0x10ffff {
+                let start = ctx.position();
+                let end = start + 4;
+                let replace = ctx.handle_error(
+                    errors,
+                    start..end,
+                    Some("code point not in range(0x110000)"),
+                )?;
+                out.push_wtf8(replace.as_ref());
+            } else if (0xd800..=0xdfff).contains(&ch) {
+                let start = ctx.position();
+                let end = start + 4;
+                let replace = ctx.handle_error(
+                    errors,
+                    start..end,
+                    Some("code point in surrogate code point range(0xd800, 0xe000)"),
+                )?;
+                out.push_wtf8(replace.as_ref());
+            } else {
+                out.push(CodePoint::from_u32(ch).unwrap());
+                ctx.advance(4);
+            }
+        }
+        Ok((out, ctx.position()))
+    }
+
+    /// Resolve the effective byte order for a UTF-32 decode; see `utf16::resolve_byteorder`.
+    #[must_use]
+    pub fn resolve_byteorder(data: &[u8], byteorder: isize) -> ByteOrderInfo {
+        if byteorder < 0 {
+            return ByteOrderInfo {
+                bom_len: 0,
+                little_endian: true,
+                encoding_name: LE_ENCODING_NAME,
+                bo: byteorder,
+            };
+        }
+        if byteorder > 0 {
+            return ByteOrderInfo {
+                bom_len: 0,
+                little_endian: false,
+                encoding_name: BE_ENCODING_NAME,
+                bo: byteorder,
+            };
+        }
+        if data.len() >= 4 && data[0..4] == [0xff, 0xfe, 0x00, 0x00] {
+            ByteOrderInfo {
+                bom_len: 4,
+                little_endian: true,
+                encoding_name: LE_ENCODING_NAME,
+                bo: -1,
+            }
+        } else if data.len() >= 4 && data[0..4] == [0x00, 0x00, 0xfe, 0xff] {
+            ByteOrderInfo {
+                bom_len: 4,
+                little_endian: false,
+                encoding_name: BE_ENCODING_NAME,
+                bo: 1,
+            }
+        } else {
+            let little_endian = cfg!(target_endian = "little");
+            ByteOrderInfo {
+                bom_len: 0,
+                little_endian,
+                encoding_name: if little_endian {
+                    LE_ENCODING_NAME
+                } else {
+                    BE_ENCODING_NAME
+                },
+                bo: 0,
+            }
+        }
+    }
+}
