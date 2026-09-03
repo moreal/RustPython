@@ -147,10 +147,12 @@ impl PyDict {
             Err(other) => other,
         };
         let dict = &self.entries;
-        // Use get_attr to properly invoke __getattribute__ for proxy objects
-        let keys_result = other.get_attr(vm.ctx.intern_str("keys"), vm);
+        // Use a non-raising lookup (still invoking __getattribute__ for proxy
+        // objects) with an interned identifier, instead of allocating and
+        // catching an AttributeError exception for every non-mapping argument.
+        let keys_result = vm.get_attribute_opt(other.clone(), identifier!(vm, keys))?;
         let has_keys = match keys_result {
-            Ok(keys_method) => {
+            Some(keys_method) => {
                 let keys = keys_method.call((), vm)?.get_iter(vm)?;
                 while let PyIterReturn::Return(key) = keys.next(vm)? {
                     if !override_existing && dict.contains(vm, &*key)? {
@@ -161,8 +163,7 @@ impl PyDict {
                 }
                 true
             }
-            Err(e) if e.fast_isinstance(vm.ctx.exceptions.attribute_error) => false,
-            Err(e) => return Err(e),
+            None => false,
         };
         if !has_keys {
             return self.merge_from_seq2(other, override_existing, vm);

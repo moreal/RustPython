@@ -360,11 +360,35 @@ mod math {
 
     #[pyfunction]
     fn trunc(x: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        // Fast path: exact float/int implement __trunc__ trivially (truncate the
+        // float, or return self unchanged for int), so skip the dunder lookup and
+        // bound-method call that would otherwise be taken on every call.
+        let x = match x.downcast_exact::<PyFloat>(vm) {
+            Ok(f) => return try_f64_to_bigint(f.to_f64(), vm).map(|v| vm.ctx.new_int(v).into()),
+            Err(x) => x,
+        };
+        let x = match x.downcast_exact::<PyInt>(vm) {
+            Ok(i) => return Ok(i.into_pyref().into()),
+            Err(x) => x,
+        };
         try_magic_method(identifier!(vm, __trunc__), vm, &x)
     }
 
     #[pyfunction]
     fn ceil(x: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        // Fast path: exact float/int both define __ceil__, so the has_attr check
+        // below is always true for them and every call would otherwise allocate a
+        // bound method and make a second call. Handle them directly instead.
+        let x = match x.downcast_exact::<PyFloat>(vm) {
+            Ok(f) => {
+                return try_f64_to_bigint(f.to_f64().ceil(), vm).map(|v| vm.ctx.new_int(v).into());
+            }
+            Err(x) => x,
+        };
+        let x = match x.downcast_exact::<PyInt>(vm) {
+            Ok(i) => return Ok(i.into_pyref().into()),
+            Err(x) => x,
+        };
         // Only call __ceil__ if the class defines it - if it exists but is not callable,
         // the error should be propagated (not fall back to float conversion)
         if x.class().has_attr(identifier!(vm, __ceil__)) {
@@ -383,6 +407,19 @@ mod math {
 
     #[pyfunction]
     fn floor(x: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        // Fast path: exact float/int both define __floor__, so the has_attr check
+        // below is always true for them and every call would otherwise allocate a
+        // bound method and make a second call. Handle them directly instead.
+        let x = match x.downcast_exact::<PyFloat>(vm) {
+            Ok(f) => {
+                return try_f64_to_bigint(f.to_f64().floor(), vm).map(|v| vm.ctx.new_int(v).into());
+            }
+            Err(x) => x,
+        };
+        let x = match x.downcast_exact::<PyInt>(vm) {
+            Ok(i) => return Ok(i.into_pyref().into()),
+            Err(x) => x,
+        };
         // Only call __floor__ if the class defines it - if it exists but is not callable,
         // the error should be propagated (not fall back to float conversion)
         if x.class().has_attr(identifier!(vm, __floor__)) {

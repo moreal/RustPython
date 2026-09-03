@@ -635,6 +635,15 @@ impl PyBytesInner {
             .map_err(|_| vm.new_type_error("can only join an iterable"))?;
         let iter = iterable.iter_sized(vm)?.enumerate().map(|(i, obj)| {
             let obj = obj?;
+            // Fast path: an exact bytes/bytearray element can be copied directly
+            // instead of going through the buffer protocol, which otherwise
+            // allocates a dim_desc plus a to_vec copy per element.
+            if let Some(bytes) = obj.downcast_ref_if_exact::<PyBytes>(vm) {
+                return Ok(Self::from(bytes.as_bytes().to_vec()));
+            }
+            if let Some(bytearray) = obj.downcast_ref_if_exact::<PyByteArray>(vm) {
+                return Ok(Self::from(bytearray.borrow_buf().to_vec()));
+            }
             // Whatever the buffer lookup ran into, the item is only ever
             // reported as the wrong kind of thing.
             Self::try_from_object(vm, obj.clone()).map_err(|_| {
