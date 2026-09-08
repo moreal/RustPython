@@ -1,4 +1,7 @@
 cfgs
+csascii
+csisolatin
+mimalloc
 miri
 py
 pyarg
