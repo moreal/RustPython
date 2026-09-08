@@ -184,10 +184,10 @@ rustpython-wtf8 = { path = "crates/wtf8", version = "0.5.0" }
 rustpython-doc = { path = "crates/doc", version = "0.5.0" }
 
 # Use the RustPython Ruff fork for RustPython public `_ast` metadata.
-ruff_python_parser = { package = "rustpython-ruff_python_parser", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
-ruff_python_ast = { package = "rustpython-ruff_python_ast", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
-ruff_text_size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
-ruff_source_file = { package = "rustpython-ruff_source_file", git = "https://github.com/RustPython/ruff.git", tag = "0.15.19-rustpython" }
+ruff_python_parser = { package = "rustpython-ruff_python_parser", git = "https://github.com/RustPython/ruff.git", tag = "0.16.5-rustpython" }
+ruff_python_ast = { package = "rustpython-ruff_python_ast", git = "https://github.com/RustPython/ruff.git", tag = "0.16.5-rustpython" }
+ruff_text_size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", tag = "0.16.5-rustpython" }
+ruff_source_file = { package = "rustpython-ruff_source_file", git = "https://github.com/RustPython/ruff.git", tag = "0.16.5-rustpython" }
 
 der = { version = "0.8", features = ["alloc", "oid", "pem", "zeroize"] }
 phf = { version = "0.14.0", default-features = false, features = ["macros"]}
@@ -241,7 +241,7 @@ libz-rs-sys = "0.6"
 zlib-rs = { version = "=0.6.7", default-features = false, features = ["rust-allocator", "__internal-api"] }
 lock_api = "0.4"
 log = "0.4.30"
-lz4_flex = "0.13"
+lz4_flex = "0.14"
 nix = { version = "0.31", features = ["fs", "user", "process", "term", "time", "signal", "ioctl", "socket", "sched", "zerocopy", "dir", "hostname", "net", "poll"] }
 mac_address = "1.1.3"
 malachite-bigint = "0.11.0"
@@ -256,7 +256,6 @@ num-integer = "0.1.46"
 num-traits = "0.2"
 num_cpus = "1.17.0"
 num_enum = { version = "0.7", default-features = false }
-oid-registry = "0.8"
 openssl = "0.10.80"
 openssl-sys = "0.9.110"
 openssl-probe = "0.2.1"
@@ -279,7 +278,6 @@ rustls = { version = "0.23.39", default-features = false }
 rustls-graviola = "0.4"
 rustls-native-certs = "0.8"
 rustls-pemfile = "2.2"
-rustls-platform-verifier = "0.7"
 rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
 rustyline = "18"
 serde = { package = "serde_core", version = "1.0.225", default-features = false, features = ["alloc"] }
@@ -318,7 +316,6 @@ wasm-bindgen-futures = "0.4"
 web-sys = "0.3"
 webpki-roots = "1.0"
 which = "8"
-x509-cert = "0.3.0"
 x509-parser = "0.18"
 xml = "1.3"
 writeable = "0.6"
