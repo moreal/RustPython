@@ -13,8 +13,8 @@ use crate::{
     function::{ArgIterable, Either, OptionalArg, OptionalOption, PyComparisonValue},
     literal::escape::Escape,
     protocol::{BufferFlags, PyBuffer},
-    sequence::{SequenceExt, SequenceMutExt},
     types::PyComparisonOp,
+    vm::MAX_MEMORY_SIZE,
 };
 /// How a source object that is neither a size nor a string is turned into
 /// bytes: [`crate::byte::bytes_from_object`] or
@@ -28,6 +28,59 @@ use num_traits::ToPrimitive;
 
 const STRING_WITHOUT_ENCODING: &str = "string argument without an encoding";
 const ENCODING_WITHOUT_STRING: &str = "encoding without a string argument";
+
+/// Repeat a byte buffer `n` times.
+///
+/// The already-copied portion is doubled each round (via `Vec::extend_from_within`,
+/// which reduces to a handful of large `memmove`s for a `Copy` element like `u8`)
+/// instead of appending one source-length slice per repetition. This matters when
+/// the repeated unit is much smaller than the requested total, e.g. repeating a
+/// two-byte string a hundred times.
+pub(crate) fn repeat_bytes(bytes: &[u8], n: isize, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
+    let n = vm.check_repeat_or_overflow_error(bytes.len(), n)?;
+
+    if n > 1 && bytes.len() >= MAX_MEMORY_SIZE / n {
+        return Err(vm.new_memory_error(""));
+    }
+
+    let total = n
+        .checked_mul(bytes.len())
+        .ok_or_else(|| vm.new_memory_error(""))?;
+    let mut v = Vec::new();
+    v.try_reserve_exact(total)
+        .map_err(|_| vm.new_memory_error(""))?;
+    if total > 0 {
+        v.extend_from_slice(bytes);
+        while v.len() < total {
+            let to_copy = core::cmp::min(v.len(), total - v.len());
+            v.extend_from_within(..to_copy);
+        }
+    }
+    Ok(v)
+}
+
+/// In-place counterpart of [`repeat_bytes`]; see its doc comment for the growth strategy.
+pub(crate) fn irepeat_bytes(buf: &mut Vec<u8>, n: isize, vm: &VirtualMachine) -> PyResult<()> {
+    let n = vm.check_repeat_or_overflow_error(buf.len(), n)?;
+
+    if n > 1 && buf.len() >= MAX_MEMORY_SIZE / n {
+        return Err(vm.new_memory_error(""));
+    }
+
+    if n == 0 {
+        buf.clear();
+    } else if n != 1 {
+        let base_len = buf.len();
+        let total = base_len * n;
+        buf.reserve(total - base_len);
+        while buf.len() < total {
+            let cur_len = buf.len();
+            let to_copy = core::cmp::min(cur_len, total - cur_len);
+            buf.extend_from_within(..to_copy);
+        }
+    }
+    Ok(())
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct PyBytesInner {
@@ -1028,11 +1081,11 @@ impl PyBytesInner {
     }
 
     pub fn mul(&self, n: isize, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
-        self.elements.mul(vm, n)
+        repeat_bytes(&self.elements, n, vm)
     }
 
     pub fn imul(&mut self, n: isize, vm: &VirtualMachine) -> PyResult<()> {
-        self.elements.imul(vm, n)
+        irepeat_bytes(&mut self.elements, n, vm)
     }
 
     pub fn concat(&self, other: &PyObject, vm: &VirtualMachine) -> PyResult<Vec<u8>> {
