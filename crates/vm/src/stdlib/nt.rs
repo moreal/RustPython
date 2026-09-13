@@ -6,11 +6,11 @@ pub use module::raw_set_handle_inheritable;
 #[pymodule(name = "nt", with(super::os::_os))]
 pub(crate) mod module {
     use crate::{
-        Py, PyResult, TryFromObject, VirtualMachine,
-        builtins::{PyBytes, PyDictRef, PyListRef, PyStr, PyStrRef, PyTupleRef},
+        AsObject, Py, PyObjectRef, PyResult, TryFromObject, VirtualMachine,
+        builtins::{PyBytes, PyCapsule, PyDictRef, PyListRef, PyStr, PyStrRef, PyTupleRef},
         convert::ToPyException,
         exceptions::{self, OSErrorBuilder, ToOSErrorBuilder},
-        function::{ArgMapping, Either, OptionalArg},
+        function::{ArgMapping, Either, FsPath, OptionalArg},
         host_env::crt_fd,
         ospath::{OsPath, OsPathOrFd},
         stdlib::os::{_os, DirFd, SupportFunc, SymlinkArgs},
@@ -19,6 +19,7 @@ pub(crate) mod module {
     use libc::intptr_t;
     use rustpython_common::wtf8::Wtf8Buf;
     use rustpython_host_env::nt as host_nt;
+    use rustpython_host_env::winapi as host_winapi;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::AsRawHandle;
 
@@ -417,8 +418,6 @@ pub(crate) mod module {
         argv: Either<PyListRef, PyTupleRef>,
         vm: &VirtualMachine,
     ) -> PyResult<intptr_t> {
-        use crate::function::FsPath;
-
         let path = path.to_wide_cstring(vm)?;
 
         let argv = vm.extract_elements_with(argv.as_ref(), |obj| {
@@ -447,8 +446,6 @@ pub(crate) mod module {
         env: PyDictRef,
         vm: &VirtualMachine,
     ) -> PyResult<intptr_t> {
-        use crate::function::FsPath;
-
         let path = path.to_wide_cstring(vm)?;
 
         let argv = vm.extract_elements_with(argv.as_ref(), |obj| {
@@ -465,7 +462,7 @@ pub(crate) mod module {
         }
 
         // Build environment strings as "KEY=VALUE\0" wide strings
-        let mut env_strings: Vec<widestring::WideCString> = Vec::new();
+        let mut env_strings: Vec<widestring::WideCString> = Vec::with_capacity(env.size().used);
         for (key, value) in env {
             let key = FsPath::try_from_path_like(key, true, vm)?;
             let value = FsPath::try_from_path_like(value, true, vm)?;
@@ -481,7 +478,7 @@ pub(crate) mod module {
 
             let env_str = format!("{key_str}={value_str}");
             env_strings.push(
-                widestring::WideCString::from_os_str(&*std::ffi::OsString::from(env_str))
+                widestring::WideCString::from_str(&env_str)
                     .map_err(|err| err.to_pyexception(vm))?,
             );
         }
@@ -504,14 +501,12 @@ pub(crate) mod module {
                 vm.new_runtime_error("exec not supported for isolated subinterpreters".to_owned())
             );
         }
-        let make_widestring =
-            |s: &str| widestring::WideCString::from_os_str(s).map_err(|err| err.to_pyexception(vm));
 
         let path = path.to_wide_cstring(vm)?;
-
         let argv = vm.extract_elements_with(argv.as_ref(), |obj| {
             let arg = PyStrRef::try_from_object(vm, obj)?;
-            make_widestring(arg.expect_str())
+            widestring::WideCString::from_str(arg.expect_str())
+                .map_err(|err| err.to_pyexception(vm))
         })?;
 
         let first = argv
@@ -539,14 +534,12 @@ pub(crate) mod module {
                 vm.new_runtime_error("exec not supported for isolated subinterpreters".to_owned())
             );
         }
-        let make_widestring =
-            |s: &str| widestring::WideCString::from_os_str(s).map_err(|err| err.to_pyexception(vm));
 
         let path = path.to_wide_cstring(vm)?;
-
         let argv = vm.extract_elements_with(argv.as_ref(), |obj| {
             let arg = PyStrRef::try_from_object(vm, obj)?;
-            make_widestring(arg.expect_str())
+            widestring::WideCString::from_str(arg.expect_str())
+                .map_err(|err| err.to_pyexception(vm))
         })?;
 
         let first = argv
@@ -571,6 +564,7 @@ pub(crate) mod module {
                 cold_path();
                 return Err(exceptions::nul_char_error(vm));
             }
+
             // Validate: empty key or '=' in key after position 0
             // (search from index 1 because on Windows starting '=' is allowed
             // for defining hidden environment variables)
@@ -579,7 +573,9 @@ pub(crate) mod module {
             }
 
             let env_str = format!("{key_str}={value_str}");
-            env_strings.push(make_widestring(&env_str)?);
+            // SAFETY: Interior NULs are rejected above. WideCString appends the trailing NUL.
+            let env_str = unsafe { widestring::WideCString::from_str_unchecked(&env_str) };
+            env_strings.push(env_str);
         }
 
         let argv_refs: Vec<&widestring::WideCStr> = argv.iter().map(|s| s.as_ref()).collect();
@@ -1089,5 +1085,82 @@ pub(crate) mod module {
     fn _is_inputhook_installed() -> bool {
         // TODO: Implement the actual logic here
         false
+    }
+
+    const DLL_DIRECTORY_COOKIE: &core::ffi::CStr = c"DLL directory cookie";
+
+    fn pystr_to_wide(s: &PyStrRef, vm: &VirtualMachine) -> PyResult<widestring::WideCString> {
+        widestring::WideCString::from_vec(s.as_wtf8().encode_wide().collect::<Vec<_>>())
+            .map_err(|_| vm.new_value_error("embedded null character"))
+    }
+
+    #[pyfunction]
+    fn _add_dll_directory(path: OsPath, vm: &VirtualMachine) -> PyResult<PyObjectRef> {
+        let wide = path.to_wide_cstring(vm)?;
+        let cookie = host_winapi::add_dll_directory(&wide)
+            .map_err(|err| OSErrorBuilder::with_filename(&err, path, vm))?;
+        Ok(vm
+            .ctx
+            .new_capsule(cookie, Some(DLL_DIRECTORY_COOKIE), None)
+            .into())
+    }
+
+    #[pyfunction]
+    fn _remove_dll_directory(cookie: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
+        let not_a_cookie =
+            || vm.new_type_error("Provided cookie was not returned from os.add_dll_directory");
+        let capsule = cookie
+            .downcast_ref::<PyCapsule>()
+            .ok_or_else(not_a_cookie)?;
+        if capsule.name() != Some(DLL_DIRECTORY_COOKIE) || capsule.pointer().is_null() {
+            return Err(not_a_cookie());
+        }
+        host_winapi::remove_dll_directory(capsule.pointer())
+            .map_err(|err| err.to_pyexception(vm))?;
+        capsule.set_pointer(core::ptr::null_mut());
+        Ok(())
+    }
+
+    #[derive(FromArgs)]
+    struct StartfileArgs {
+        #[pyarg(any)]
+        filepath: OsPath,
+        #[pyarg(any, default)]
+        operation: Option<PyStrRef>,
+        #[pyarg(any, default)]
+        arguments: Option<PyStrRef>,
+        #[pyarg(any, default)]
+        cwd: Option<OsPath>,
+        #[pyarg(any, default)]
+        show_cmd: Option<i32>,
+    }
+
+    #[pyfunction]
+    fn startfile(args: StartfileArgs, vm: &VirtualMachine) -> PyResult<()> {
+        let file = args.filepath.to_wide_cstring(vm)?;
+        let operation = args
+            .operation
+            .as_ref()
+            .map(|s| pystr_to_wide(s, vm))
+            .transpose()?;
+        let arguments = args
+            .arguments
+            .as_ref()
+            .map(|s| pystr_to_wide(s, vm))
+            .transpose()?;
+        let directory = args
+            .cwd
+            .as_ref()
+            .map(|p| p.to_wide_cstring(vm))
+            .transpose()?;
+        let show_cmd = args.show_cmd.unwrap_or(host_winapi::SW_SHOWNORMAL);
+        host_winapi::shell_execute_w(
+            &file,
+            operation.as_deref(),
+            arguments.as_deref(),
+            directory.as_deref(),
+            show_cmd,
+        )
+        .map_err(|err| OSErrorBuilder::with_filename(&err, args.filepath, vm))
     }
 }

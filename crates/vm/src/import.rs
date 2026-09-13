@@ -158,23 +158,31 @@ pub fn import_source(vm: &VirtualMachine, module_name: &str, content: &str) -> P
     import_code_obj(vm, module_name, code, false)
 }
 
+/// Check whether `module.__spec__._initializing` is true, i.e. the module
+/// is currently in the middle of being executed for the first time and is
+/// not yet safe to hand out as a finished result (used both by the slow
+/// import path below and by [`crate::VirtualMachine::import`]'s
+/// `sys.modules`-cache fast path).
+pub(crate) fn is_module_initializing(module: &PyObjectRef, vm: &VirtualMachine) -> PyResult<bool> {
+    match vm.get_attribute_opt(module.clone(), vm.ctx.intern_str("__spec__"))? {
+        Some(spec) => match vm.get_attribute_opt(spec, vm.ctx.intern_str("_initializing"))? {
+            Some(v) => v.try_to_bool(vm),
+            None => Ok(false),
+        },
+        None => Ok(false),
+    }
+}
+
 /// If `__spec__._initializing` is true, wait for the module to finish
 /// initializing by calling `_lock_unlock_module`.
 fn import_ensure_initialized(
     module: &PyObjectRef,
-    name: &str,
+    name: &Py<PyUtf8Str>,
     vm: &VirtualMachine,
 ) -> PyResult<()> {
-    let initializing = match vm.get_attribute_opt(module.clone(), vm.ctx.intern_str("__spec__"))? {
-        Some(spec) => match vm.get_attribute_opt(spec, vm.ctx.intern_str("_initializing"))? {
-            Some(v) => v.try_to_bool(vm)?,
-            None => false,
-        },
-        None => false,
-    };
-    if initializing {
+    if is_module_initializing(module, vm)? {
         let lock_unlock = vm.importlib.get_attr("_lock_unlock_module", vm)?;
-        lock_unlock.call((vm.ctx.new_utf8_str(name),), vm)?;
+        lock_unlock.call((name.to_owned(),), vm)?;
     }
     Ok(())
 }
@@ -383,11 +391,11 @@ pub(crate) fn import_module_level(
         return Err(vm.new_value_error("level must be >= 0"));
     }
 
-    let name_str = match name.to_str() {
-        Some(s) => s,
+    let name = match name.as_utf8() {
+        Some(name) => name,
         None => {
-            // Name contains surrogates. Like CPython, try sys.modules
-            // lookup with the Python string key directly.
+            // Name contains surrogates. Try sys.modules lookup with the
+            // Python string key directly.
             if level == 0 {
                 let sys_modules = vm.sys_module.get_attr("modules", vm)?;
                 return sys_modules.get_item(name, vm).map_err(|_| {
@@ -421,12 +429,12 @@ pub(crate) fn import_module_level(
                 vm.ctx.new_utf8_str(""),
             ));
         }
-        resolve_name(name_str, &package, level as usize, vm)?
+        resolve_name(name, &package, level as usize, vm)?
     } else {
-        if name_str.is_empty() {
+        if name.is_empty() {
             return Err(vm.new_value_error("Empty module name"));
         }
-        name_str.to_owned()
+        name.to_owned()
     };
 
     // import_get_module + import_find_and_load
@@ -438,8 +446,7 @@ pub(crate) fn import_module_level(
         }
         _ => {
             let find_and_load = vm.importlib.get_attr("_find_and_load", vm)?;
-            let abs_name_obj = vm.ctx.new_utf8_str(&*abs_name);
-            find_and_load.call((abs_name_obj, vm.import_func.clone()), vm)?
+            find_and_load.call((abs_name.clone(), vm.import_func.clone()), vm)?
         }
     };
 
@@ -464,15 +471,17 @@ pub(crate) fn import_module_level(
         } else {
             Ok(module)
         }
-    } else if level == 0 || !name_str.is_empty() {
+    } else if level == 0 || !name.is_empty() {
+        let name_str = name.as_str();
         match name_str.find('.') {
             None => Ok(module),
             Some(dot) => {
                 let to_return = if level == 0 {
-                    name_str[..dot].to_owned()
+                    vm.ctx.new_utf8_str(&name_str[..dot])
                 } else {
                     let cut_off = name_str.len() - dot;
-                    abs_name[..abs_name.len() - cut_off].to_owned()
+                    let abs = abs_name.as_str();
+                    vm.ctx.new_utf8_str(&abs[..abs.len() - cut_off])
                 };
                 match sys_modules.get_item(&*to_return, vm) {
                     Ok(m) => Ok(m),
@@ -480,8 +489,7 @@ pub(crate) fn import_module_level(
                         // For absolute imports (level 0), try importing the
                         // parent. Matches _bootstrap.__import__ behavior.
                         let find_and_load = vm.importlib.get_attr("_find_and_load", vm)?;
-                        let to_return_obj = vm.ctx.new_utf8_str(&*to_return);
-                        find_and_load.call((to_return_obj, vm.import_func.clone()), vm)
+                        find_and_load.call((to_return, vm.import_func.clone()), vm)
                     }
                     Err(_) => {
                         // For relative imports (level > 0), raise KeyError
@@ -500,27 +508,38 @@ pub(crate) fn import_module_level(
 }
 
 /// resolve_name in import.c - resolve relative import name
-fn resolve_name(name: &str, package: &str, level: usize, vm: &VirtualMachine) -> PyResult<String> {
+fn resolve_name(
+    name: &Py<PyUtf8Str>,
+    package: &Py<PyUtf8Str>,
+    level: usize,
+    vm: &VirtualMachine,
+) -> PyResult<PyUtf8StrRef> {
     // Python: bits = package.rsplit('.', level - 1)
     // Rust: rsplitn(level, '.') gives maxsplit=level-1
-    let parts: Vec<&str> = package.rsplitn(level, '.').collect();
+    let package_str = package.as_str();
+    let parts: Vec<&str> = package_str.rsplitn(level, '.').collect();
     if parts.len() < level {
         return Err(vm.new_import_error(
             "attempted relative import beyond top-level package",
-            vm.ctx.new_utf8_str(name),
+            name.to_owned(),
         ));
     }
     // rsplitn returns parts right-to-left, so last() is the leftmost (base)
-    let base = parts.last().unwrap();
-    if name.is_empty() {
-        Ok(base.to_string())
+    let base = *parts.last().unwrap();
+    let abs_name = if name.is_empty() {
+        if base.len() == package_str.len() {
+            package.to_owned()
+        } else {
+            vm.ctx.new_utf8_str(base)
+        }
     } else {
-        Ok(format!("{base}.{name}"))
-    }
+        vm.ctx.new_utf8_str(format!("{base}.{}", name.as_str()))
+    };
+    Ok(abs_name)
 }
 
 /// _calc___package__ - calculate package from globals for relative imports
-fn calc_package(globals: Option<&PyObjectRef>, vm: &VirtualMachine) -> PyResult<String> {
+fn calc_package(globals: Option<&PyObjectRef>, vm: &VirtualMachine) -> PyResult<PyUtf8StrRef> {
     let globals = globals.ok_or_else(|| {
         vm.new_import_error(
             "attempted relative import with no known parent package",
@@ -570,7 +589,7 @@ fn calc_package(globals: Option<&PyObjectRef>, vm: &VirtualMachine) -> PyResult<
                 );
             }
         }
-        return Ok(pkg_str.as_str().to_owned());
+        return Ok(pkg_str);
     } else if let Some(ref spec) = spec
         && !vm.is_none(spec)
         && let Ok(parent) = spec.get_attr("parent", vm)
@@ -579,7 +598,7 @@ fn calc_package(globals: Option<&PyObjectRef>, vm: &VirtualMachine) -> PyResult<
         let parent_str: PyUtf8StrRef = parent
             .downcast()
             .map_err(|_| vm.new_type_error("package set to non-string"))?;
-        return Ok(parent_str.as_str().to_owned());
+        return Ok(parent_str);
     }
 
     // Fall back to __name__ and __path__
@@ -605,14 +624,15 @@ fn calc_package(globals: Option<&PyObjectRef>, vm: &VirtualMachine) -> PyResult<
     let mod_name_str: PyUtf8StrRef = mod_name
         .downcast()
         .map_err(|_| vm.new_type_error("__name__ must be a string"))?;
-    let mut package = mod_name_str.as_str().to_owned();
     // If not a package (no __path__), strip last component.
     // Uses rpartition('.')[0] semantics: returns empty string when no dot.
     if globals.get_item("__path__", vm).is_err() {
-        package = match package.rfind('.') {
-            Some(dot) => package[..dot].to_owned(),
-            None => String::new(),
-        };
+        let s = mod_name_str.as_str();
+        Ok(match s.rfind('.') {
+            Some(dot) => vm.ctx.new_utf8_str(&s[..dot]),
+            None => vm.ctx.new_utf8_str(""),
+        })
+    } else {
+        Ok(mod_name_str)
     }
-    Ok(package)
 }
