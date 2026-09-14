@@ -1,4 +1,7 @@
 cfgs
+csascii
+csisolatin
+mimalloc
 miri
 py
 pyarg
@@ -26,6 +29,7 @@ pystone
 pystr
 pystruct
 pystructseq
+pyperformance
 pytype
 qsbr
 rustix
