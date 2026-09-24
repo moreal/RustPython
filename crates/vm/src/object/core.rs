@@ -193,22 +193,26 @@ pub(super) unsafe fn default_dealloc<T: PyPayload>(obj: *mut PyObject) {
     // Untrack from GC BEFORE deallocation.
     // Must happen before memory is freed because intrusive list removal
     // reads the object's gc_pointers (prev/next).
-    if tracked {
+    //
+    // The one exception is an object in another thread's young list, which
+    // only that thread may unlink: it stays linked, and its memory is handed
+    // back to that thread below instead of being freed here.
+    let foreign_young = if tracked {
         let ptr = unsafe { NonNull::new_unchecked(obj) };
-        unsafe {
-            crate::gc_state::gc_state().untrack_object(ptr);
-        }
+        let foreign = unsafe { crate::gc_state::gc_state().untrack_for_dealloc(ptr) };
         // Verify untrack cleared the tracked flag and generation
         debug_assert!(
-            !obj_ref.is_gc_tracked(),
+            foreign.is_some() || !obj_ref.is_gc_tracked(),
             "object still tracked after untrack_object"
         );
-        debug_assert_eq!(
-            obj_ref.gc_generation(),
-            crate::object::GC_UNTRACKED,
+        debug_assert!(
+            foreign.is_some() || obj_ref.gc_generation() == crate::object::GC_UNTRACKED,
             "gc_generation not reset after untrack_object"
         );
-    }
+        foreign
+    } else {
+        None
+    };
 
     // Extract child references to break circular refs (tp_clear), then drop
     // them. Some payloads (e.g. FrameObject) drop children in place inside clear_fn
@@ -233,6 +237,12 @@ pub(super) unsafe fn default_dealloc<T: PyPayload>(obj: *mut PyObject) {
     // word with a non-atomic write, racing a reader's atomic try-incref. Route
     // them through `PyInner::dealloc` instead, whose QSBR hook defers the actual
     // memory free until readers can no longer observe it.
+    if let Some(young) = foreign_young {
+        unsafe { dealloc_foreign_young::<T>(obj, young) };
+        unsafe { trashcan::end() };
+        return;
+    }
+
     let typ = obj_ref.class();
     let pushed = if T::HAS_FREELIST
         && typ.heaptype_ext.is_none()
@@ -264,6 +274,25 @@ pub(super) unsafe fn default_dealloc<T: PyPayload>(obj: *mut PyObject) {
         unsafe { trashcan::end() };
     }
 }
+/// The end of [`default_dealloc`] for an object linked into another thread's
+/// young list: its memory goes back to that thread instead of being freed.
+#[cold]
+#[inline(never)]
+unsafe fn dealloc_foreign_young<T: PyPayload>(
+    obj: *mut PyObject,
+    young: crate::gc_state::ForeignYoung,
+) {
+    let ptr = unsafe { NonNull::new_unchecked(obj) };
+    let mem = unsafe { PyInner::drop_into_raw(obj as *mut PyInner<T>) };
+    if let Err(mem) = unsafe { young.give_back(ptr, mem) } {
+        // The object left that list while this thread was clearing it (a
+        // collection or that thread's exit moved it to the shared lists), so it
+        // is this thread's to unlink and free after all.
+        unsafe { crate::gc_state::gc_state().untrack_object(ptr) };
+        unsafe { mem.free() };
+    }
+}
+
 pub(super) unsafe fn debug_obj<T: PyPayload + core::fmt::Debug>(
     x: &PyObject,
     f: &mut fmt::Formatter<'_>,
@@ -316,6 +345,10 @@ bitflags::bitflags! {
 /// GC generation constants
 pub(crate) const GC_UNTRACKED: u8 = 0xFF;
 pub(crate) const GC_PERMANENT: u8 = 3;
+/// Young (gen0) object sitting in one thread's own list rather than the shared
+/// gen0 list; `gc_refs` names the list. See `gc_state::LocalYoung`.
+#[cfg(feature = "threading")]
+pub(crate) const GC_LOCAL_YOUNG: u8 = 4;
 /// Width of an interpreter's `gc_owner` tag.
 ///
 /// Sized to the padding the header alignment already forces, so the tag costs
@@ -432,6 +465,11 @@ pub(super) struct PyInner<T> {
     /// the references held from inside the candidate set taken off, or
     /// [`GC_REACHABLE`] once the object has been proved reachable. Only
     /// meaningful while `gc_bits` has [`GcBits::COLLECTING`].
+    ///
+    /// Outside a collection, an object whose generation is `GC_LOCAL_YOUNG`
+    /// keeps the id of the thread-local young list it sits in here instead. A
+    /// collection moves every such object to the shared lists before it
+    /// starts counting, so the two uses never overlap.
     pub(super) gc_refs: PyAtomic<u32>,
     /// Intrusive linked list pointers for GC generational tracking
     pub(super) gc_pointers: Pointers<PyObject>,
@@ -1196,6 +1234,21 @@ impl<T: PyPayload> PyInner<T> {
     /// # Safety
     /// `ptr` must be a valid pointer from `PyInner::new` and must not be used after this call.
     unsafe fn dealloc(ptr: *mut Self) {
+        unsafe { Self::drop_into_raw(ptr).free() }
+    }
+
+    /// Everything [`Self::dealloc`] does except freeing the memory: drop the
+    /// fields and the prefix(es), and hand back what `free` needs.
+    ///
+    /// The header's plain fields (`gc_pointers` among them) stay readable
+    /// until the returned [`RawAlloc`] is freed, which is what lets a thread
+    /// that does not own the young list the object is linked into leave the
+    /// unlinking, and the freeing, to the thread that does.
+    ///
+    /// # Safety
+    /// `ptr` must be a valid pointer from `PyInner::new`; nothing but the
+    /// header's GC fields may be used after this call.
+    pub(super) unsafe fn drop_into_raw(ptr: *mut Self) -> RawAlloc {
         unsafe {
             let (flags, member_count) = (*ptr).read_type_flags();
             let has_ext =
@@ -1235,20 +1288,47 @@ impl<T: PyPayload> PyInner<T> {
                 }
                 // WeakRefList has no Drop (just raw pointers), no drop_in_place needed
 
-                if published {
-                    crate::object::qsbr::free_delayed(alloc_ptr, combined);
-                } else {
-                    alloc::alloc::dealloc(alloc_ptr, combined);
+                RawAlloc {
+                    ptr: alloc_ptr,
+                    layout: combined,
+                    published,
                 }
-            } else if published {
-                let layout = core::alloc::Layout::new::<Self>();
-                Self::drop_fields(ptr);
-                crate::object::qsbr::free_delayed(ptr as *mut u8, layout);
             } else {
                 Self::drop_fields(ptr);
-                // The fields are gone; the box is only here to free the memory
-                // the matching `Box::new` in `new` allocated.
-                drop(Box::from_raw(ptr.cast::<core::mem::MaybeUninit<Self>>()));
+                // The fields are gone; what is left is the memory the matching
+                // `Box::new` in `new` allocated.
+                RawAlloc {
+                    ptr: ptr.cast(),
+                    layout: core::alloc::Layout::new::<Self>(),
+                    published,
+                }
+            }
+        }
+    }
+}
+
+/// The memory of an object whose fields are already dropped.
+pub(crate) struct RawAlloc {
+    ptr: *mut u8,
+    layout: core::alloc::Layout,
+    published: bool,
+}
+
+// SAFETY: a `RawAlloc` is the sole owner of memory nothing else refers to any
+// more; freeing it from another thread is what the global allocator allows.
+unsafe impl Send for RawAlloc {}
+
+impl RawAlloc {
+    /// Give the memory back.
+    ///
+    /// # Safety
+    /// Nothing may read the object's header again.
+    pub(crate) unsafe fn free(self) {
+        unsafe {
+            if self.published {
+                crate::object::qsbr::free_delayed(self.ptr, self.layout);
+            } else {
+                alloc::alloc::dealloc(self.ptr, self.layout);
             }
         }
     }
@@ -1900,6 +1980,21 @@ impl PyObject {
         self.0.gc_owner.store(owner, Ordering::Relaxed);
     }
 
+    /// The thread-local young list this object sits in. Only meaningful while
+    /// its generation is [`GC_LOCAL_YOUNG`].
+    #[cfg(feature = "threading")]
+    #[inline]
+    pub(crate) fn gc_young_slot(&self) -> u32 {
+        self.0.gc_refs.load(Ordering::Relaxed)
+    }
+
+    /// Record which thread-local young list this object is going into.
+    #[cfg(feature = "threading")]
+    #[inline]
+    pub(crate) fn set_gc_young_slot(&self, slot: u32) {
+        self.0.gc_refs.store(slot, Ordering::Relaxed);
+    }
+
     /// Enter the running collection's candidate set, with `strong_count` as the
     /// count to subtract internal references from. A count too large to hold is
     /// taken as reachable outright, rather than clipped to a number the
@@ -1994,6 +2089,18 @@ impl PyObject {
         self.0
             .gc_bits
             .fetch_and(!GcBits::TRACKED.bits(), Ordering::Relaxed);
+    }
+
+    /// Like [`Self::clear_gc_tracked`], for an object no other thread can
+    /// reach any more (its dealloc is running), so nothing can race the
+    /// read-modify-write and a plain load and store will do.
+    #[cfg(feature = "threading")]
+    #[inline]
+    pub(crate) fn clear_gc_tracked_unshared(&self) {
+        let bits = self.0.gc_bits.load(Ordering::Relaxed);
+        self.0
+            .gc_bits
+            .store(bits & !GcBits::TRACKED.bits(), Ordering::Relaxed);
     }
 
     #[inline(always)] // the outer function is never inlined
