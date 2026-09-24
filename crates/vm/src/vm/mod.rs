@@ -2640,9 +2640,16 @@ impl VirtualMachine {
         } else {
             None
         };
-        let old_owner = frame.iframe().owner.swap(
+        // Only the thread that holds the frame (the running claim for
+        // generators) writes `owner` here, so a load + store needs no locked
+        // `xchg`.
+        let old_owner = frame
+            .iframe()
+            .owner
+            .load(core::sync::atomic::Ordering::Acquire);
+        frame.iframe().owner.store(
             crate::frame::FrameOwner::Thread as i8,
-            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Release,
         );
 
         let result = self.dispatch_traced_frame(&frame, |frame| f(frame.to_owned()));
@@ -2880,9 +2887,16 @@ impl VirtualMachine {
         }
         // Push generator's exc_info slot onto the chain
         self.push_exception(exc);
-        let old_owner = frame.iframe().owner.swap(
+        // Only the thread that holds the frame (the running claim for
+        // generators) writes `owner` here, so a load + store needs no locked
+        // `xchg`.
+        let old_owner = frame
+            .iframe()
+            .owner
+            .load(core::sync::atomic::Ordering::Acquire);
+        frame.iframe().owner.store(
             crate::frame::FrameOwner::Thread as i8,
-            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Release,
         );
         Ok(GenFrameLink {
             old_chain,

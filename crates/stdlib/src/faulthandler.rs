@@ -152,10 +152,14 @@ mod decl {
             code.first_line_number.map_or(1, |n| n.get()) as u32
         } else {
             let idx = (lasti as usize).saturating_sub(1);
-            if idx < code.locations.len() {
-                code.locations[idx].0.line.get() as u32
-            } else {
-                code.first_line_number.map_or(0, |n| n.get()) as u32
+            let first_line = code.first_line_number.map_or(0, |n| n.get()) as u32;
+            // `locations()` would allocate to decode the table on first use,
+            // which a signal handler must not do; walk the linetable instead.
+            match code.decoded_locations() {
+                Some(locations) => locations
+                    .get(idx)
+                    .map_or(first_line, |(loc, _)| loc.line.get() as u32),
+                None => u32::try_from(code.addr2line(idx as i32 * 2)).unwrap_or(first_line),
             }
         };
 

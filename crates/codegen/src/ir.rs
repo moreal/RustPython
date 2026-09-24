@@ -10,9 +10,9 @@ use rustpython_compiler_core::{
     OneIndexed, SourceLocation,
     bytecode::{
         AnyInstruction, AnyOpcode, CO_FAST_ARG_KW, CO_FAST_ARG_POS, CO_FAST_ARG_VAR, CO_FAST_CELL,
-        CO_FAST_FREE, CO_FAST_HIDDEN, CO_FAST_LOCAL, CodeFlags, CodeObject, CodeUnit, CodeUnits,
-        ConstantData, InstrDisplayContext, Instruction, IntrinsicFunction1, OpArg, OpArgByte,
-        Opcode, PseudoInstruction, PseudoOpcode, PyCodeLocationInfoKind, oparg,
+        CO_FAST_FREE, CO_FAST_HIDDEN, CO_FAST_LOCAL, CodeFlags, CodeLocations, CodeObject,
+        CodeUnit, CodeUnits, ConstantData, InstrDisplayContext, Instruction, IntrinsicFunction1,
+        OpArg, OpArgByte, Opcode, PseudoInstruction, PseudoOpcode, PyCodeLocationInfoKind, oparg,
     },
     varint::{write_signed_varint, write_varint},
 };
@@ -4200,11 +4200,7 @@ pub fn assemble_for_tests(
         first_line_number.get() as i32,
         debug_ranges,
     )?;
-    let locations = rustpython_compiler_core::marshal::linetable_to_locations(
-        &assembled.linetable,
-        first_line_number.get() as i32,
-        assembled.instructions.len(),
-    );
+    let locations = CodeLocations::lazy(first_line_number.get() as i32);
     Ok(CodeObject {
         flags,
         posonlyarg_count,
@@ -4293,11 +4289,7 @@ impl CodeInfo {
             first_line_number.get() as i32,
             opts.debug_ranges,
         )?;
-        let locations = rustpython_compiler_core::marshal::linetable_to_locations(
-            &assembled.linetable,
-            first_line_number.get() as i32,
-            assembled.instructions.len(),
-        );
+        let locations = CodeLocations::lazy(first_line_number.get() as i32);
 
         Ok(CodeObject {
             flags,

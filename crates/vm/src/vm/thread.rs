@@ -127,6 +127,22 @@ struct FrameSlotCache {
     top_iframe: Cell<*const AtomicUsize>,
 }
 
+impl FrameSlotCache {
+    /// Replace `current_frame`, returning the previous pointer.
+    ///
+    /// Only the owning thread ever writes this TLS slot; the only other reader
+    /// is faulthandler's signal handler on the same thread, which can observe
+    /// either the old or the new pointer but never a torn value. A plain
+    /// load + store therefore suffices and avoids the implicitly locked
+    /// `xchg` a `swap` compiles to on x86.
+    #[inline(always)]
+    fn replace_current_frame(&self, frame: *const InterpreterFrame) -> *const InterpreterFrame {
+        let old = self.current_frame.load(Ordering::Relaxed);
+        self.current_frame.store(frame as usize, Ordering::Relaxed);
+        old as *const InterpreterFrame
+    }
+}
+
 thread_local! {
     pub(super) static VM_STACK: RefCell<Vec<NonNull<VirtualMachine>>> = Vec::with_capacity(1).into();
 
@@ -1068,8 +1084,8 @@ pub fn set_current_frame(frame: *const InterpreterFrame) -> *const InterpreterFr
                 }
             }
         }
-        cache.current_frame.swap(frame as usize, Ordering::Relaxed)
-    }) as *const InterpreterFrame
+        cache.replace_current_frame(frame)
+    })
 }
 
 /// Lightweight version that only writes to TLS `current_frame`, returning
@@ -1078,8 +1094,7 @@ pub fn set_current_frame(frame: *const InterpreterFrame) -> *const InterpreterFr
 #[inline(always)]
 #[must_use]
 pub fn set_current_frame_nosave(frame: *const InterpreterFrame) -> *const InterpreterFrame {
-    FRAME_SLOT_CACHE.with(|cache| cache.current_frame.swap(frame as usize, Ordering::Relaxed))
-        as *const InterpreterFrame
+    FRAME_SLOT_CACHE.with(|cache| cache.replace_current_frame(frame))
 }
 
 /// Get the current thread's top InterpreterFrame pointer.

@@ -11584,7 +11584,7 @@ impl<'warnings> Compiler<'warnings> {
                 .iter()
                 .zip(rhs.instructions.iter())
                 .all(|(lhs, rhs)| u8::from(lhs.op) == u8::from(rhs.op) && lhs.arg == rhs.arg)
-            && lhs.locations == rhs.locations
+            && lhs.locations() == rhs.locations()
             && lhs.flags.bits() == rhs.flags.bits()
             && lhs.posonlyarg_count == rhs.posonlyarg_count
             && lhs.arg_count == rhs.arg_count
@@ -13740,7 +13740,7 @@ mod tests {
     };
 
     fn assert_scope_exit_locations(code: &CodeObject) {
-        for (instr, (location, _)) in code.instructions.iter().zip(code.locations.iter()) {
+        for (instr, (location, _)) in code.instructions.iter().zip(code.locations().iter()) {
             if matches!(
                 instr.op,
                 Instruction::ReturnValue
@@ -16558,7 +16558,7 @@ def f(buffer, pos, last_char):
     ) -> Option<(usize, usize, usize, usize)> {
         code.instructions
             .iter()
-            .zip(&code.locations)
+            .zip(code.locations())
             .find_map(|(unit, locations)| matches(&unit.op).then(|| location_range(locations)))
     }
 
@@ -16685,7 +16685,7 @@ class C:
         let (kw_names, (location, end_location)) = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .take(call_kw_index)
             .rev()
             .find(|(unit, _)| matches!(unit.op, Instruction::LoadConst { .. }))
@@ -16723,7 +16723,7 @@ class C:
                 _ => false,
             })
             .expect("missing LOAD_SUPER_METHOD");
-        let (load_location, _) = f.locations[load_super_index];
+        let (load_location, _) = f.locations()[load_super_index];
 
         assert_eq!(
             load_location.line.get(),
@@ -16745,7 +16745,7 @@ def f(obj):
         let load_attr_position = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .find_map(|(unit, (location, end_location))| {
                 matches!(unit.op, Instruction::LoadAttr { .. }).then_some((
                     location.line.get(),
@@ -16814,7 +16814,7 @@ def outer():
         let return_positions: Vec<_> = lambda
             .instructions
             .iter()
-            .zip(&lambda.locations)
+            .zip(lambda.locations())
             .filter_map(|(unit, (location, end_location))| {
                 matches!(unit.op, Instruction::ReturnValue).then_some((
                     location.line.get(),
@@ -16857,7 +16857,7 @@ def bare():
             let return_positions: Vec<_> = function
                 .instructions
                 .iter()
-                .zip(&function.locations)
+                .zip(function.locations())
                 .filter_map(|(unit, (location, end_location))| {
                     matches!(unit.op, Instruction::ReturnValue).then_some((
                         location.line.get(),
@@ -16893,7 +16893,7 @@ def continues(xs):
             let jump_positions: Vec<_> = function
                 .instructions
                 .iter()
-                .zip(&function.locations)
+                .zip(function.locations())
                 .filter_map(|(unit, (location, end_location))| {
                     matches!(
                         unit.op,
@@ -17131,7 +17131,7 @@ def f():
             .iter()
             .filter(|unit| !matches!(unit.op, Instruction::Resume { .. }))
             .take(4)
-            .zip(f.locations.iter().filter(|_| true).skip(1))
+            .zip(f.locations().iter().filter(|_| true).skip(1))
             .map(|(unit, (location, end_location))| {
                 (
                     unit.op,
@@ -17156,7 +17156,7 @@ def f():
         let generic_base_position = type_params
             .instructions
             .iter()
-            .zip(&type_params.locations)
+            .zip(type_params.locations())
             .find_map(|(unit, (location, end_location))| {
                 let Instruction::LoadFastBorrow { var_num } = unit.op else {
                     return None;
@@ -18195,7 +18195,7 @@ def f(x):
         let copy_line = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .find_map(|(unit, (location, _))| {
                 let Instruction::Copy { i } = unit.op else {
                     return None;
@@ -18331,7 +18331,7 @@ def f(x, y):
                 }
                 f.instructions
                     .iter()
-                    .zip(&f.locations)
+                    .zip(f.locations())
                     .skip(idx + 1)
                     .take(8)
                     .find_map(|(unit, (location, _))| {
@@ -18405,7 +18405,7 @@ def f(x):
             let location = f
                 .instructions
                 .iter()
-                .zip(&f.locations)
+                .zip(f.locations())
                 .skip(rest_cleanup_start)
                 .find_map(|(unit, (location, _))| {
                     let found = matches!(
@@ -18471,7 +18471,7 @@ def f(x):
         let wildcard_pop_location = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .skip(unpack_index + 1)
             .find_map(|(unit, (location, _))| {
                 matches!(unit.op, Instruction::PopTop).then_some(*location)
@@ -18963,7 +18963,7 @@ def f(value):
         let jump_position = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .find_map(|(unit, (location, end_location))| {
                 matches!(unit.op, Instruction::JumpForward { .. }).then_some((
                     location.line.get(),
@@ -18998,7 +18998,7 @@ def f(flag):
         let jump_position = f
             .instructions
             .windows(2)
-            .zip(f.locations.windows(2))
+            .zip(f.locations().windows(2))
             .find_map(|(units, locations)| {
                 matches!(units[0].op, Instruction::StoreFastStoreFast { .. })
                     .then(|| {
@@ -19035,7 +19035,7 @@ def f(flag, n, exp):
         let jump_position = f
             .instructions
             .windows(2)
-            .zip(f.locations.windows(2))
+            .zip(f.locations().windows(2))
             .find_map(|(units, locations)| {
                 matches!(units[0].op, Instruction::StoreFastStoreFast { .. })
                     .then(|| {
@@ -19260,7 +19260,7 @@ w = f'' 'a' f''
         let ranges: Vec<_> = code
             .instructions
             .iter()
-            .zip(&code.locations)
+            .zip(code.locations())
             .filter(|(unit, _)| matches!(unit.op, Instruction::LoadConst { .. }))
             .map(|(_, locations)| location_range(locations))
             .take(4)
@@ -19539,7 +19539,7 @@ def spec(x):
         fn string_load_position(code: &CodeObject, expected: &str) -> (usize, usize, usize, usize) {
             code.instructions
                 .iter()
-                .zip(&code.locations)
+                .zip(code.locations())
                 .find_map(|(unit, (location, end_location))| {
                     let Instruction::LoadConst { consti } = unit.op else {
                         return None;
@@ -19607,7 +19607,7 @@ def padded(digits, int_len):
         let build_string_position = |code: &CodeObject| {
             code.instructions
                 .iter()
-                .zip(&code.locations)
+                .zip(code.locations())
                 .find_map(|(unit, (location, end_location))| {
                     matches!(unit.op, Instruction::BuildString { .. }).then_some((
                         location.line.get(),
@@ -21139,7 +21139,7 @@ def f(obj, value):
         let copy_position = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .find_map(|(unit, (location, end_location))| {
                 let Instruction::Copy { i } = unit.op else {
                     return None;
@@ -22067,7 +22067,7 @@ def f(x):
         let mut build_interpolation = None;
         let mut build_tuple = None;
         let mut build_template = None;
-        for (unit, (location, end_location)) in f.instructions.iter().zip(&f.locations) {
+        for (unit, (location, end_location)) in f.instructions.iter().zip(f.locations()) {
             let range = (
                 location.line.get(),
                 location.character_offset.get(),
@@ -22113,7 +22113,7 @@ def f(g, x):
         let push_null = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .find_map(|(unit, (location, end_location))| {
                 matches!(unit.op, Instruction::PushNull).then_some((
                     location.line.get(),
@@ -23425,7 +23425,7 @@ def f(a, b, d):
         let ops_lines: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, _))| {
                 (!matches!(unit.op, Instruction::Cache)).then_some((unit.op, location.line.get()))
             })
@@ -23577,7 +23577,7 @@ def f(cm):
         let ops_lines: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, _))| {
                 (!matches!(unit.op, Instruction::Cache)).then_some((unit.op, location.line.get()))
             })
@@ -23744,7 +23744,7 @@ def f(meta_path, cm):
         let ops_lines: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, _))| {
                 (!matches!(unit.op, Instruction::Cache)).then_some((unit.op, location.line.get()))
             })
@@ -23887,7 +23887,7 @@ def f(cm, ValueError):
         let ops_lines: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, _))| {
                 (!matches!(unit.op, Instruction::Cache)).then_some((unit.op, location.line.get()))
             })
@@ -24572,7 +24572,7 @@ def f(tar1, x):
         let ops_lines: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, _))| {
                 (!matches!(unit.op, Instruction::Cache)).then_some((unit.op, location.line.get()))
             })
@@ -24668,7 +24668,7 @@ def f(self):
         let ops_lines: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, _))| {
                 (!matches!(unit.op, Instruction::Cache)).then_some((unit.op, location.line.get()))
             })
@@ -24709,7 +24709,7 @@ def f(selector, self):
         let ops_lines: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, _))| {
                 (!matches!(unit.op, Instruction::Cache)).then_some((unit.op, location.line.get()))
             })
@@ -29429,7 +29429,7 @@ def f(obj, step):
         let slice_positions: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, end_location))| {
                 let op = match unit.op {
                     Instruction::LoadConst { .. } => "LOAD_CONST",
@@ -30442,7 +30442,7 @@ def f(cm, func, args, kwds):
         let return_positions: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, end_location))| {
                 matches!(unit.op, Instruction::ReturnValue).then_some((
                     location.line.get(),
@@ -30542,7 +30542,7 @@ async def f(cm, func, args, kwds):
         let return_positions: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, end_location))| {
                 matches!(unit.op, Instruction::ReturnValue).then_some((
                     location.line.get(),
@@ -30857,7 +30857,7 @@ def f(x):
             + 1;
         let expected = (2, 12, 2, fstring_end);
 
-        for (unit, (location, end_location)) in f.instructions.iter().zip(&f.locations) {
+        for (unit, (location, end_location)) in f.instructions.iter().zip(f.locations()) {
             if matches!(
                 unit.op,
                 Instruction::BuildList { .. }
@@ -32047,7 +32047,7 @@ class C[T]:
         let return_positions: Vec<_> = listcomp
             .instructions
             .iter()
-            .zip(&listcomp.locations)
+            .zip(listcomp.locations())
             .filter_map(|(unit, (location, end_location))| {
                 matches!(unit.op, Instruction::ReturnValue).then_some((
                     location.line.get(),
@@ -32770,7 +32770,7 @@ def f(self):
         let get_iter_positions: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, end_location))| {
                 matches!(unit.op, Instruction::GetIter).then_some((
                     location.line.get(),
@@ -32823,7 +32823,7 @@ def f(items):
         let backedge_positions: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, end_location))| {
                 matches!(unit.op, Instruction::JumpBackward { .. }).then_some((
                     location.line.get(),
@@ -32856,7 +32856,7 @@ def f(self):
         let filter_jump_position = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .find_map(|(unit, (location, end_location))| {
                 matches!(unit.op, Instruction::PopJumpIfTrue { .. }).then_some((
                     location.line.get(),
@@ -32885,7 +32885,7 @@ def f(fields):
         let jump_forward_position = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .find_map(|(unit, (location, end_location))| {
                 matches!(unit.op, Instruction::JumpForward { .. }).then_some((
                     location.line.get(),
@@ -38842,7 +38842,7 @@ def f(found, value, m, done, name, renamed_variables, keep_unresolved, variables
         let ops_lines: Vec<_> = f
             .instructions
             .iter()
-            .zip(&f.locations)
+            .zip(f.locations())
             .filter_map(|(unit, (location, _))| {
                 (!matches!(unit.op, Instruction::Cache)).then_some((unit.op, location.line.get()))
             })
