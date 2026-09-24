@@ -371,6 +371,22 @@ impl LocalsPlus {
         }
     }
 
+    /// Migrate data-stack-backed storage to the heap, preserving all values.
+    /// Returns the data stack base pointer for `DataStack::pop()`.
+    /// Returns `None` if already heap-backed.
+    fn materialize_to_heap(&mut self) -> Option<*mut u8> {
+        if let LocalsPlusData::DataStack { ptr, capacity } = &self.data {
+            let base = *ptr as *mut u8;
+            let heap_data = unsafe { core::slice::from_raw_parts(*ptr, *capacity) }
+                .to_vec()
+                .into_boxed_slice();
+            self.data = LocalsPlusData::Heap(heap_data);
+            Some(base)
+        } else {
+            None
+        }
+    }
+
     /// Drop all contained values and detach the data stack backing without
     /// copying to the heap, leaving an empty heap-backed husk.
     /// Returns the data stack base pointer for `DataStack::pop()`.
@@ -1870,6 +1886,30 @@ impl FrameObject {
         unsafe { self.iframe_mut().localsplus.fastlocals_mut() }
     }
 
+    /// Migrate data-stack-backed storage to the heap, preserving all values,
+    /// and return the data stack base pointer for `DataStack::pop()`.
+    /// Returns `None` if already heap-backed.
+    ///
+    /// # Safety
+    /// Caller must ensure the frame is not executing and the returned
+    /// pointer is passed to `VirtualMachine::datastack_pop()`.
+    pub(crate) unsafe fn materialize_localsplus(&self) -> Option<*mut u8> {
+        unsafe { self.iframe_mut().localsplus.materialize_to_heap() }
+    }
+
+    /// Drop all localsplus values in place and detach the data stack backing
+    /// without the heap copy. Returns the data stack base pointer for
+    /// `VirtualMachine::datastack_pop()`, or `None` if heap-backed.
+    ///
+    /// # Safety
+    /// Caller must ensure the frame is not executing, that no other reference
+    /// to the frame exists or can be created (localsplus is unobservable
+    /// afterwards), and that the returned pointer is passed to
+    /// `VirtualMachine::datastack_pop()`.
+    pub(crate) unsafe fn release_localsplus(&self) -> Option<*mut u8> {
+        unsafe { self.iframe_mut().localsplus.release_datastack() }
+    }
+
     /// Whether this frame's localsplus is still data-stack-backed. A frame
     /// must have heap-backed localsplus before it is GC-tracked so that a
     /// concurrent collector never reads data-stack-resident, still-mutating
@@ -2956,6 +2996,90 @@ fn specialization_nonnegative_compact_index(i: &Py<PyInt>, vm: &VirtualMachine) 
 /// Get the variable name for a localsplus index of `code`.
 fn localsplus_name(code: &Py<PyCode>, idx: usize) -> &'static PyStrInterned {
     code.localsplus_name(idx)
+}
+
+/// Free a finished call frame's data stack storage.
+///
+/// When the caller holds the only reference to the frame, the locals and
+/// stack values are dropped in place and the storage is released without a
+/// heap copy. Otherwise (the frame escaped through a traceback,
+/// `sys._getframe`, a trace callback, ...) the values are copied to the heap
+/// first so they stay readable through the escaped reference.
+pub(crate) fn release_datastack_frame(frame: &Py<FrameObject>, vm: &VirtualMachine) {
+    let frame_obj = frame.as_object();
+    // Uniqueness argument: at this point the frame is already out of
+    // the thread-frames registry and the current-frame chain
+    // (both unlinked inside `with_frame` before it returned), and the
+    // frame type has no weakref support. A datastack frame is created
+    // untracked and stays untracked while it runs, so it is in no GC
+    // generation list and no collector can observe or incref it. Hence no
+    // thread can mint a new reference without already holding one, and every
+    // escape (traceback, `sys._getframe`, `f_back`, a stored trace-hook arg)
+    // is a heap reference created on this thread while the frame ran.
+    // Therefore `strong_count() == 1` here means nothing escaped, and
+    // `strong_count() > 1` means the frame escaped.
+    debug_assert!(
+        !frame_obj.is_gc_tracked(),
+        "datastack frame is GC-tracked at release"
+    );
+    if frame_obj.strong_count() == 1 {
+        // A reference minted and already released by another thread (through a
+        // heap escape carried across threads) ends in a release-decref; the
+        // fence orders that thread's memory before our drops below.
+        atomic::fence(Acquire);
+        // SAFETY: unique owner and no way to mint a new reference, so
+        // localsplus can never be observed again. The base pointer came
+        // from this thread's data stack.
+        unsafe {
+            if let Some(base) = frame.release_localsplus() {
+                vm.datastack_pop(base);
+            }
+        }
+        return;
+    }
+    // Escaped. Stabilize localsplus on the heap FIRST, then join the GC. This
+    // order guarantees a concurrent (stop-the-world) collector only ever sees a
+    // tracked frame whose localsplus is heap-resident and no longer mutating:
+    // the frame has stopped executing before it becomes a candidate, so its
+    // outgoing edges are stable while a collector traverses them.
+    // SAFETY: the frame finished executing; the base pointer came from this
+    // thread's data stack.
+    unsafe {
+        if let Some(base) = frame.materialize_localsplus() {
+            vm.datastack_pop(base);
+        }
+    }
+    // Retain a strong reference to the caller so `f_back` keeps resolving once
+    // the caller returns and leaves the live frame chain. The caller is still
+    // executing here (this frame is unwinding back into it), so its payload
+    // pointer is live.
+    {
+        let mut guard = frame.iframe().cold().retained_back.lock();
+        if guard.is_none() {
+            let prev = frame.previous_iframe();
+            *guard = unsafe { owned_chain_frame(prev) };
+        }
+    }
+    // Note: previous is NOT cleared here. retained_back captures the
+    // caller reference, and previous may be read again by f_back or
+    // frame chain walkers (the pointer is live as long as the caller
+    // is still executing, which it is at this point).
+    // Invariant: a tracked frame must always have heap-backed localsplus
+    // (proven here for escaped datastack frames and by construction for
+    // generator frames, which are born heap-backed). A stop-the-world
+    // collector reads a frame's localsplus only when the frame is a tracked
+    // candidate, so this keeps it from ever reading data-stack-resident,
+    // still-mutating storage of an executing frame.
+    debug_assert!(
+        !frame.localsplus_is_datastack_backed(),
+        "escaped frame tracked before its localsplus was materialized"
+    );
+    // SAFETY: the frame is alive (held by `frame` and the escaped reference)
+    // and untracked.
+    unsafe {
+        crate::gc_state::gc_state()
+            .track_object(NonNull::from(frame_obj), crate::gc_state::current_owner())
+    };
 }
 
 type BinaryOpExtendGuard = fn(&PyObject, &PyObject, &VirtualMachine) -> bool;

@@ -794,12 +794,59 @@ impl Py<PyFunction> {
         datastack_frame_size_bytes_for_code(&self.code)
     }
 
+    pub(crate) fn prepare_exact_args_frame(
+        &self,
+        args: impl ExactSizeIterator<Item = PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> FrameObjectRef {
+        let code: PyRef<PyCode> = (*self.code).to_owned();
+
+        debug_assert_eq!(args.len(), code.arg_count as usize);
+        debug_assert!(code.flags.contains(bytecode::CodeFlags::OPTIMIZED));
+        debug_assert!(
+            !code
+                .flags
+                .intersects(bytecode::CodeFlags::VARARGS | bytecode::CodeFlags::VARKEYWORDS)
+        );
+        debug_assert_eq!(code.kwonlyarg_count, 0);
+        debug_assert!(!code.flags.intersects(
+            bytecode::CodeFlags::GENERATOR
+                | bytecode::CodeFlags::COROUTINE
+                | bytecode::CodeFlags::ASYNC_GENERATOR,
+        ));
+
+        let locals = if code.flags.contains(bytecode::CodeFlags::NEWLOCALS) {
+            None
+        } else {
+            Some(ArgMapping::from_dict_exact(self.globals.clone()))
+        };
+
+        let frame = FrameObject::new_ref(
+            code,
+            Scope::new(locals, self.globals.clone()),
+            self.builtins.clone(),
+            self.closure.as_ref().map_or(&[], |c| c.as_slice()),
+            Some(self.to_owned().into()),
+            true, // Exact-args fast path is only used for non-gen/coro functions.
+            vm,
+        );
+
+        {
+            let fastlocals = unsafe { frame.fastlocals_mut() };
+            for (slot, arg) in fastlocals.iter_mut().zip(args) {
+                *slot = Some(arg);
+            }
+        }
+
+        frame
+    }
+
     /// Build the generator/coroutine a generator-like function returns, with
     /// the call's positional arguments bound straight into the new frame's
     /// fastlocals.
     ///
-    /// The generator counterpart of `invoke_prepared_exact_args`. Same
-    /// preconditions as `can_specialize_call`: every parameter is
+    /// The counterpart of `prepare_exact_args_frame` for the one call shape it
+    /// refuses. Same preconditions as `can_specialize_call`: every parameter is
     /// positional and this call fills each of them exactly once, so none of
     /// what `fill_locals_from_args_inner` exists for -- varargs packing,
     /// keyword matching, defaults -- can apply, and the `FuncArgs` those need
@@ -1884,6 +1931,17 @@ pub(crate) fn vectorcall_function(
         // of the call-site specialization that would otherwise catch it.
         args.truncate(nargs);
         return Ok(zelf.make_generator_exact_args(args.into_iter(), vm));
+    }
+
+    if !has_kwargs && positional_only && !is_generator_like && nargs == code.arg_count as usize {
+        // FAST PATH: simple positional-only call, exact arg count.
+        // Move owned args directly into fastlocals — no clone needed.
+        args.truncate(nargs);
+        let frame = zelf.prepare_exact_args_frame(args.into_iter(), vm);
+
+        let result = vm.run_frame(frame.clone());
+        crate::frame::release_datastack_frame(&frame, vm);
+        return result;
     }
 
     if !is_generator_like
