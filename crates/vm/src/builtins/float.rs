@@ -42,6 +42,7 @@ thread_local! {
 impl PyPayload for PyFloat {
     const MAX_FREELIST: usize = 100;
     const HAS_FREELIST: bool = true;
+    const TRIVIAL_EXACT_DEALLOC: bool = true;
 
     #[inline]
     fn class(ctx: &Context) -> &'static Py<PyType> {

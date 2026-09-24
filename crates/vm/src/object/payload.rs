@@ -55,6 +55,15 @@ pub trait PyPayload: MaybeTraverse + PyThreadingConstraint + Sized + 'static {
     /// which is created untracked and tracked lazily only on escape.
     const NEW_REF_UNTRACKED: bool = false;
 
+    /// Whether an instance whose class is exactly [`Self::class`] can skip all
+    /// of the generic dealloc: that class is a static (immutable) type with no
+    /// `__del__`, no weakref support and no instance dict or slots, and the
+    /// payload holds no references, so it is never GC-tracked and has nothing
+    /// to clear. Its dealloc then only drops the payload and returns the
+    /// memory to the freelist or the allocator. Instances of subclasses, which
+    /// can add all of those back, still take the generic path.
+    const TRIVIAL_EXACT_DEALLOC: bool = false;
+
     /// Whether this type has a freelist. Types with freelists require
     /// immediate (non-deferred) GC untracking during dealloc to prevent
     /// race conditions when the object is reused.

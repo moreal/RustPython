@@ -274,6 +274,37 @@ pub(super) unsafe fn default_dealloc<T: PyPayload>(obj: *mut PyObject) {
         unsafe { trashcan::end() };
     }
 }
+/// The dealloc of a payload that sets [`PyPayload::TRIVIAL_EXACT_DEALLOC`].
+///
+/// An instance of exactly `T::class()` has no `__del__` to call, no weakref
+/// list to clear, nothing tracked to untrack (so no trashcan either) and
+/// nothing to clear, which leaves the freelist and the memory. Instances of
+/// subclasses go on to [`default_dealloc`]. Kept apart from it, rather than as
+/// an early return inside it, so the common case does not pay for the frame
+/// the generic path needs.
+pub(super) unsafe fn trivial_exact_dealloc<T: PyPayload>(obj: *mut PyObject) {
+    const {
+        assert!(
+            !T::TRIVIAL_EXACT_DEALLOC || (!T::HAS_TRAVERSE && !T::HAS_CLEAR),
+            "TRIVIAL_EXACT_DEALLOC payloads must hold no references"
+        );
+    }
+    let obj_ref = unsafe { &*(obj as *const PyObject) };
+    if !core::ptr::eq(obj_ref.class(), T::class(crate::vm::Context::genesis())) {
+        return unsafe { default_dealloc::<T>(obj) };
+    }
+    debug_assert!(obj_ref.class().slots.del.load().is_none());
+    debug_assert!(obj_ref.weak_ref_list().is_none());
+    debug_assert!(obj_ref.0.ext_ref().is_none());
+    debug_assert!(!obj_ref.is_gc_tracked());
+    // Published objects keep their memory until a QSBR grace period passes,
+    // which `PyInner::dealloc` arranges; see `default_dealloc`.
+    if T::HAS_FREELIST && !obj_ref.0.ref_count.is_published() && unsafe { T::freelist_push(obj) } {
+        return;
+    }
+    unsafe { PyInner::dealloc(obj as *mut PyInner<T>) };
+}
+
 /// The end of [`default_dealloc`] for an object linked into another thread's
 /// young list: its memory goes back to that thread instead of being freed.
 #[cold]
