@@ -670,6 +670,13 @@ pub mod module {
         #[cfg(feature = "threading")]
         crate::stdlib::_thread::after_fork_child(vm);
 
+        // Forget the threads that did not survive the fork, merging the
+        // references other threads had queued back to them.
+        #[cfg(feature = "threading")]
+        unsafe {
+            crate::common::refcount::after_fork_child(|rc| crate::PyObject::dealloc_merged(rc))
+        };
+
         // Reinit import lock ownership metadata in child and release the lock
         // acquired before fork.
         #[cfg(feature = "threading")]
@@ -725,6 +732,9 @@ pub mod module {
 
             // Import lock (RawReentrantMutex<RawMutex, RawThreadId>)
             crate::stdlib::_imp::reinit_imp_lock_after_fork();
+
+            // Biased reference counting's merge registry
+            crate::common::refcount::reinit_after_fork();
         }
     }
 

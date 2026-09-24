@@ -96,6 +96,9 @@ pub struct ThreadSlot {
     pub thread: std::thread::Thread,
     /// QSBR state for deferred memory reclamation.
     pub(crate) qsbr: Arc<crate::object::qsbr::QsbrSlot>,
+    /// This thread's owner id for biased reference counting, so a
+    /// stop-the-world collector can merge what other threads queued for it.
+    pub(crate) refcount_owner: u32,
 }
 
 #[cfg(feature = "threading")]
@@ -468,6 +471,7 @@ fn ensure_thread_slot(vm: &VirtualMachine) -> CurrentFrameSlot {
             stop_requested: core::sync::atomic::AtomicBool::new(false),
             thread: std::thread::current(),
             qsbr: crate::object::qsbr::QSBR.register(),
+            refcount_owner: crate::common::refcount::current_owner_id(),
         });
         registry.insert(thread_id, new_slot.clone());
         drop(registry);
@@ -960,6 +964,25 @@ pub(crate) fn set_stop_requested_for_current_thread(value: bool) -> bool {
     })
 }
 
+/// Merge (and deallocate, when their count reached zero) the objects other
+/// threads queued for this thread under biased reference counting.
+#[cfg(feature = "threading")]
+pub(crate) fn merge_queued_objects() {
+    crate::common::refcount::merge_queued_objects(|rc| unsafe {
+        crate::PyObject::dealloc_merged(rc)
+    });
+}
+
+/// Stop owning objects on this thread (biased reference counting). Called
+/// when a Python thread finishes, while its VM can still run finalizers for
+/// objects whose last reference other threads had queued back to it.
+#[cfg(feature = "threading")]
+pub(crate) fn exit_refcount_owner() {
+    crate::common::refcount::exit_current_thread(|rc| unsafe {
+        crate::PyObject::dealloc_merged(rc)
+    });
+}
+
 /// Whether the QSBR subsystem asked this thread to pass a checkpoint.
 /// A missed or racing read of this flag is harmless: the pending
 /// retirement is still processed at the next checkpoint or by the GC
@@ -1236,6 +1259,7 @@ pub fn reinit_frame_slot_after_fork(vm: &VirtualMachine) {
         stop_requested: core::sync::atomic::AtomicBool::new(false),
         thread: std::thread::current(),
         qsbr: crate::object::qsbr::QSBR.register(),
+        refcount_owner: crate::common::refcount::current_owner_id(),
     });
     FRAME_SLOT_CACHE.with(|cache| {
         #[cfg(unix)]

@@ -447,7 +447,18 @@ pub(crate) const SIZEOF_PYOBJECT_HEAD: usize = core::mem::size_of::<PyInner<()>>
 // those eight as the padding its alignment forces, so they cost it nothing; a
 // 32-bit header spends a word on them. Adding to that group is free only while
 // this holds.
-const _: () = assert!(SIZEOF_PYOBJECT_HEAD == 5 * core::mem::size_of::<usize>() + 8);
+//
+// With `threading` the biased reference count takes two more 32-bit fields,
+// the owning thread's id and its local count, beside the shared word.
+const _: () = assert!(
+    SIZEOF_PYOBJECT_HEAD
+        == 5 * core::mem::size_of::<usize>()
+            + 8
+            + (core::mem::size_of::<RefCount>() - core::mem::size_of::<usize>())
+);
+// The biased count's merge queue stores `&RefCount` and hands it back as the
+// object it heads.
+const _: () = assert!(core::mem::offset_of!(PyInner<()>, ref_count) == 0);
 
 // `PyInner::drop_fields` names `payload` and `typ`; it is only complete while
 // every other field stays trivially destructible.
@@ -702,6 +713,10 @@ impl WeakRefList {
             hash: Radium::new(crate::common::hash::SENTINEL),
         };
         let weak = PyRef::new_ref(weak_payload, cls, dict);
+        // Another thread may upgrade the weakref, or keep the weakref object
+        // alive while clearing the list, with a conditional incref.
+        obj.set_maybe_weakref();
+        weak.as_object().set_maybe_weakref();
 
         // Re-acquire lock for linked list insertion
         let _lock = weakref_lock::lock(obj as *const PyObject as usize);
@@ -1501,6 +1516,26 @@ impl PyObject {
     pub(crate) fn mark_cache_published(&self) {
         self.0.ref_count.mark_published();
     }
+
+    /// Let threads other than the owner take a conditional reference
+    /// ([`Self::try_to_owned`]) to this object. The caller holds a reference.
+    #[inline]
+    pub(crate) fn set_maybe_weakref(&self) {
+        #[cfg(feature = "threading")]
+        self.0.ref_count.set_maybe_weakref();
+    }
+
+    /// [`Self::set_maybe_weakref`] for an object no other thread can reach yet.
+    ///
+    /// # Safety
+    /// The object must not have been shared with another thread.
+    #[inline]
+    pub(crate) unsafe fn set_maybe_weakref_unshared(&self) {
+        #[cfg(feature = "threading")]
+        unsafe {
+            self.0.ref_count.set_maybe_weakref_unshared()
+        };
+    }
 }
 
 impl PyObjectRef {
@@ -2066,6 +2101,17 @@ impl PyObject {
         }
 
         Ok(())
+    }
+
+    /// Deallocate an object whose biased reference count was merged to zero
+    /// by [`rustpython_common::refcount::merge_queued_objects`] or
+    /// [`rustpython_common::refcount::exit_current_thread`].
+    ///
+    /// # Safety
+    /// `rc` must be the `ref_count` of a live object whose count is zero.
+    #[cfg(feature = "threading")]
+    pub(crate) unsafe fn dealloc_merged(rc: *const RefCount) {
+        unsafe { Self::drop_slow(NonNull::new_unchecked(rc as *mut Self)) }
     }
 
     /// _Py_Dealloc: dispatch to type's dealloc

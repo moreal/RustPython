@@ -685,6 +685,7 @@ pub(crate) mod _thread {
         // Clean up thread-local storage while VM context is still active
         // This ensures __del__ methods are called properly
         cleanup_thread_local_data();
+        crate::vm::thread::exit_refcount_owner();
         // Clean up frame tracking
         crate::vm::thread::cleanup_current_thread_frames(vm);
         vm.state.thread_count.fetch_sub(1);
@@ -2017,6 +2018,7 @@ pub(crate) mod _thread {
 
                     // Clean up thread-local data while VM context is still active
                     cleanup_thread_local_data();
+                    crate::vm::thread::exit_refcount_owner();
 
                     // Clean up frame tracking
                     crate::vm::thread::cleanup_current_thread_frames(vm);

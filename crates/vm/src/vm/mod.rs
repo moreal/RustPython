@@ -3517,6 +3517,13 @@ impl VirtualMachine {
         if thread::stop_requested_for_current_thread() {
             return true;
         }
+        // Other threads queued references back to this one to merge. A flag
+        // of this thread's own, so that an owner slow to merge (blocked, say)
+        // leaves every other thread's fast path alone.
+        #[cfg(feature = "threading")]
+        if crate::common::refcount::has_queued_objects() {
+            return true;
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             crate::signal::eval_breaker_pending()
@@ -3543,6 +3550,13 @@ impl VirtualMachine {
         // Suspend this thread if stop-the-world is in progress
         #[cfg(feature = "threading")]
         thread::suspend_if_needed(&self.state);
+
+        // Merge the objects other threads handed back to this one (biased
+        // reference counting); see `eval_breaker_tripped`.
+        #[cfg(feature = "threading")]
+        if crate::common::refcount::has_queued_objects() {
+            thread::merge_queued_objects();
+        }
 
         // Pass a QSBR checkpoint if requested (deferred memory reclamation).
         #[cfg(feature = "threading")]
