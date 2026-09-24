@@ -3826,6 +3826,59 @@ impl ExecutingFrame<'_> {
         }
     }
 
+    /// Whether the general path checks the eval breaker after this instruction.
+    #[inline(always)]
+    fn checks_eval_breaker(op: Instruction) -> bool {
+        const SITES: [bool; 256] = {
+            let sites = [
+                Opcode::Resume,
+                Opcode::ResumeCheck,
+                Opcode::InstrumentedResume,
+                Opcode::JumpBackward,
+                Opcode::JumpBackwardJit,
+                Opcode::JumpBackwardNoJit,
+                Opcode::InstrumentedJumpBackward,
+                Opcode::Call,
+                Opcode::CallKw,
+                Opcode::CallFunctionEx,
+                Opcode::CallAllocAndEnterInit,
+                Opcode::CallBoundMethodExactArgs,
+                Opcode::CallBoundMethodGeneral,
+                Opcode::CallBuiltinClass,
+                Opcode::CallBuiltinFast,
+                Opcode::CallBuiltinFastWithKeywords,
+                Opcode::CallBuiltinO,
+                Opcode::CallIsinstance,
+                Opcode::CallKwBoundMethod,
+                Opcode::CallKwNonPy,
+                Opcode::CallKwPy,
+                Opcode::CallLen,
+                Opcode::CallListAppend,
+                Opcode::CallMethodDescriptorFast,
+                Opcode::CallMethodDescriptorFastWithKeywords,
+                Opcode::CallMethodDescriptorNoargs,
+                Opcode::CallMethodDescriptorO,
+                Opcode::CallNonPyGeneral,
+                Opcode::CallPyExactArgs,
+                Opcode::CallPyGeneral,
+                Opcode::CallStr1,
+                Opcode::CallTuple1,
+                Opcode::CallType1,
+                Opcode::InstrumentedCall,
+                Opcode::InstrumentedCallKw,
+                Opcode::InstrumentedCallFunctionEx,
+            ];
+            let mut table = [false; 256];
+            let mut i = 0;
+            while i < sites.len() {
+                table[sites[i] as usize] = true;
+                i += 1;
+            }
+            table
+        };
+        SITES[u8::from(op) as usize]
+    }
+
     /// The general path of the dispatch loop: one instruction with all the
     /// bookkeeping the fast tier in [`Self::run`] skips (the `lasti` store,
     /// tracing events, the eval breaker, the `FrameResult` of the handler,
@@ -3963,61 +4016,6 @@ impl ExecutingFrame<'_> {
             }
         }
 
-        // The body is out of line so that the signal/QSBR/GC code it
-        // pulls in does not sit inside the dispatch loop, where it
-        // inflates register pressure (and hence per-instruction spills)
-        // for every opcode.
-        #[cold]
-        #[inline(never)]
-        fn eval_breaker_work(vm: &VirtualMachine) -> PyResult<()> {
-            vm.check_signals()?;
-            // Run a scheduled automatic collection here — a safepoint with
-            // no interpreter locks held — instead of synchronously inside
-            // the allocation that tripped the threshold.
-            #[cfg(feature = "threading")]
-            vm.run_scheduled_gc();
-            Ok(())
-        }
-        if vm.eval_breaker_tripped()
-            && let Err(exception) = eval_breaker_work(vm)
-        {
-            #[cold]
-            fn handle_signal_exception(
-                frame: &mut ExecutingFrame<'_>,
-                exception: PyBaseExceptionRef,
-                idx: usize,
-                vm: &VirtualMachine,
-            ) -> FrameResult {
-                if let Some((loc, _end_loc)) = frame.code.locations.get(idx) {
-                    let next = exception.__traceback__();
-                    let new_traceback =
-                        PyTraceback::new(next, frame.frame_object(vm), idx as u32 * 2, loc.line);
-                    exception.set_traceback(Some(new_traceback.into_ref(&vm.ctx)));
-                }
-                vm.contextualize_exception(&exception);
-                frame.unwind_blocks(
-                    vm,
-                    UnwindReason::Raising {
-                        exception,
-                        offset: idx as u32,
-                    },
-                )
-            }
-            match handle_signal_exception(self, exception, idx, vm) {
-                Ok(None) => {}
-                Ok(Some(value)) => {
-                    return ControlFlow::Break(Ok(value));
-                }
-                Err(exception) => {
-                    return ControlFlow::Break(Err(exception));
-                }
-            }
-            // The handler this unwound to starts a fresh instruction,
-            // so drop any EXTENDED_ARG prefix collected for the one
-            // the signal interrupted.
-            arg_state.reset();
-            return ControlFlow::Continue(lasti_cell.load(Relaxed) as usize);
-        }
         // lasti was just stored as `idx + 1` above and nothing between
         // there and here writes it, so the pre-dispatch value is known
         // without an extra atomic load.
@@ -4041,7 +4039,73 @@ impl ExecutingFrame<'_> {
             lasti_cell.store(next_idx, Relaxed);
         }
         match result {
-            Ok(None) => {}
+            Ok(None) => {
+                // Pending signals, a scheduled GC and stop-the-world requests
+                // are serviced once the instruction has completed, at the
+                // same points CPython checks its eval breaker: RESUME,
+                // backward jumps and calls. That bounds the delay to a
+                // stretch of straight-line code, and still runs a handler
+                // for a signal a call raised (`os.kill(os.getpid(), ...)`)
+                // before the next statement.
+                // The body is out of line so that the signal/QSBR/GC code it
+                // pulls in does not sit inside the dispatch loop, where it
+                // inflates register pressure (and hence per-instruction spills)
+                // for every opcode.
+                #[cold]
+                #[inline(never)]
+                fn eval_breaker_work(vm: &VirtualMachine) -> PyResult<()> {
+                    vm.check_signals()?;
+                    // Run a scheduled automatic collection here — a safepoint with
+                    // no interpreter locks held — instead of synchronously inside
+                    // the allocation that tripped the threshold.
+                    #[cfg(feature = "threading")]
+                    vm.run_scheduled_gc();
+                    Ok(())
+                }
+                if Self::checks_eval_breaker(op)
+                    && vm.eval_breaker_tripped()
+                    && let Err(exception) = eval_breaker_work(vm)
+                {
+                    #[cold]
+                    fn handle_signal_exception(
+                        frame: &mut ExecutingFrame<'_>,
+                        exception: PyBaseExceptionRef,
+                        idx: usize,
+                        vm: &VirtualMachine,
+                    ) -> FrameResult {
+                        if let Some((loc, _end_loc)) = frame.code.locations.get(idx) {
+                            let next = exception.__traceback__();
+                            let new_traceback = PyTraceback::new(
+                                next,
+                                frame.frame_object(vm),
+                                idx as u32 * 2,
+                                loc.line,
+                            );
+                            exception.set_traceback(Some(new_traceback.into_ref(&vm.ctx)));
+                        }
+                        vm.contextualize_exception(&exception);
+                        frame.unwind_blocks(
+                            vm,
+                            UnwindReason::Raising {
+                                exception,
+                                offset: idx as u32,
+                            },
+                        )
+                    }
+                    match handle_signal_exception(self, exception, idx, vm) {
+                        Ok(None) => {}
+                        Ok(Some(value)) => {
+                            return ControlFlow::Break(Ok(value));
+                        }
+                        Err(exception) => {
+                            return ControlFlow::Break(Err(exception));
+                        }
+                    }
+                    // The handler this unwound to starts a fresh instruction.
+                    arg_state.reset();
+                    return ControlFlow::Continue(lasti_cell.load(Relaxed) as usize);
+                }
+            }
             Ok(Some(value)) => {
                 return ControlFlow::Break(Ok(value));
             }
