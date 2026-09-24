@@ -76,6 +76,29 @@ impl PyNativeFunction {
     }
 }
 
+impl Py<PyNativeFunction> {
+    /// Call with positional arguments only, as the specialized
+    /// `CALL_BUILTIN_*` instructions have them once they have checked the
+    /// callable: straight into the native function, without going back through
+    /// the vectorcall slot and its keyword handling.
+    #[inline]
+    pub(crate) fn call_positional(
+        &self,
+        mut args: Vec<PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult {
+        let zelf = self
+            .zelf
+            .as_ref()
+            .filter(|_| !self.value.flags.contains(PyMethodFlags::STATIC));
+        if let Some(zelf) = zelf {
+            args.insert(0, zelf.clone());
+        }
+        let callee = Callee::named(self.value.name).with_instance_arg(zelf.is_some());
+        (self.value.func)(vm, FuncArgs::from(args), callee)
+    }
+}
+
 impl Callable for PyNativeFunction {
     type Args = FuncArgs;
     #[inline]

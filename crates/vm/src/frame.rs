@@ -6727,8 +6727,10 @@ impl ExecutingFrame<'_> {
                     if call_conv == PyMethodFlags::O && effective_nargs == 1 {
                         let (callable, args_vec) = self.take_call_args(nargs as usize);
                         debug_assert_eq!(args_vec.len(), effective_nargs as usize);
-                        let result =
-                            callable.vectorcall(args_vec, effective_nargs as usize, None, vm)?;
+                        // SAFETY: checked to be an exact PyNativeFunction above.
+                        let native =
+                            unsafe { callable.downcast_unchecked_ref::<PyNativeFunction>() };
+                        let result = native.call_positional(args_vec, vm)?;
                         self.push_value(result);
                         return Ok(None);
                     }
@@ -6754,8 +6756,10 @@ impl ExecutingFrame<'_> {
                     if call_conv == PyMethodFlags::FASTCALL {
                         let (callable, args_vec) = self.take_call_args(nargs as usize);
                         debug_assert_eq!(args_vec.len(), effective_nargs as usize);
-                        let result =
-                            callable.vectorcall(args_vec, effective_nargs as usize, None, vm)?;
+                        // SAFETY: checked to be an exact PyNativeFunction above.
+                        let native =
+                            unsafe { callable.downcast_unchecked_ref::<PyNativeFunction>() };
+                        let result = native.call_positional(args_vec, vm)?;
                         self.push_value(result);
                         return Ok(None);
                     }
@@ -7165,8 +7169,10 @@ impl ExecutingFrame<'_> {
                     if call_conv == (PyMethodFlags::FASTCALL | PyMethodFlags::KEYWORDS) {
                         let (callable, args_vec) = self.take_call_args(nargs as usize);
                         debug_assert_eq!(args_vec.len(), effective_nargs as usize);
-                        let result =
-                            callable.vectorcall(args_vec, effective_nargs as usize, None, vm)?;
+                        // SAFETY: checked to be an exact PyNativeFunction above.
+                        let native =
+                            unsafe { callable.downcast_unchecked_ref::<PyNativeFunction>() };
+                        let result = native.call_positional(args_vec, vm)?;
                         self.push_value(result);
                         return Ok(None);
                     }

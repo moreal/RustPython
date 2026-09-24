@@ -542,6 +542,13 @@ impl VirtualMachine {
     }
 
     pub fn _abs(&self, a: &PyObject) -> PyResult<PyObjectRef> {
+        // PyNumber_Absolute: call nb_absolute directly. A class that defines
+        // `__abs__` has it wrapped into this slot, so only a type with no slot
+        // at all needs the special-method lookup, which would otherwise bind a
+        // method-wrapper on every call.
+        if let Some(absolute) = a.class().slots.as_number.absolute.load() {
+            return absolute(a.number(), self);
+        }
         self.get_special_method(a, identifier!(self, __abs__))?
             .ok_or_else(|| self.new_unsupported_unary_error(a, "abs()"))?
             .invoke((), self)
