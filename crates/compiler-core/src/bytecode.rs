@@ -12,7 +12,8 @@ use core::{
     cell::UnsafeCell,
     hash, mem,
     ops::{Deref, DerefMut, Index, IndexMut},
-    sync::atomic::{AtomicU8, AtomicU16, AtomicUsize, Ordering},
+    ptr,
+    sync::atomic::{AtomicPtr, AtomicU8, AtomicU16, AtomicUsize, Ordering},
 };
 use itertools::Itertools;
 use malachite_bigint::BigInt;
@@ -460,12 +461,106 @@ pub const CO_FAST_LOCAL: u8 = CoFastFlags::from_element(CoFastFlag::Local).bits(
 pub const CO_FAST_CELL: u8 = CoFastFlags::from_element(CoFastFlag::Cell).bits();
 pub const CO_FAST_FREE: u8 = CoFastFlags::from_element(CoFastFlag::Free).bits();
 
+/// Start and end source location of one instruction.
+pub type LocationPair = (SourceLocation, SourceLocation);
+
+/// Per-instruction source locations of a [`CodeObject`].
+///
+/// The locations are fully determined by `linetable`, so by default they are
+/// decoded from it on first use through [`CodeObject::locations`] rather than
+/// up front: most code objects loaded at startup never have a traceback,
+/// `co_positions()` or line event asked of them. The first reader decodes and
+/// publishes the table; racing readers may each decode, and all but one of the
+/// identical results is dropped.
+pub struct CodeLocations {
+    /// `co_firstlineno` as stored, which seeds the line deltas in `linetable`.
+    first_line: i32,
+    decoded: AtomicPtr<Box<[LocationPair]>>,
+}
+
+impl CodeLocations {
+    /// Locations to be decoded from the owning code object's `linetable`.
+    #[must_use]
+    pub const fn lazy(first_line: i32) -> Self {
+        Self {
+            first_line,
+            decoded: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+
+    /// Locations given up front instead of derived from `linetable`.
+    #[must_use]
+    pub fn decoded(locations: Box<[LocationPair]>) -> Self {
+        Self {
+            first_line: 0,
+            decoded: AtomicPtr::new(Box::into_raw(Box::new(locations))),
+        }
+    }
+
+    fn get(&self) -> Option<&[LocationPair]> {
+        let p = self.decoded.load(Ordering::Acquire);
+        // SAFETY: a non-null pointer came from `Box::into_raw` and stays
+        // valid until `self` is dropped; it is never replaced once set.
+        (!p.is_null()).then(|| unsafe { &**p })
+    }
+
+    #[cold]
+    fn init(&self, linetable: &[u8], num_instructions: usize) -> &[LocationPair] {
+        let locations =
+            crate::marshal::linetable_to_locations(linetable, self.first_line, num_instructions);
+        let new = Box::into_raw(Box::new(locations));
+        match self.decoded.compare_exchange(
+            ptr::null_mut(),
+            new,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            // SAFETY: `new` is now owned by `self`.
+            Ok(_) => unsafe { &*new },
+            Err(winner) => {
+                // SAFETY: `new` was never published, and `winner` is owned by
+                // `self` as in `get`.
+                drop(unsafe { Box::from_raw(new) });
+                unsafe { &*winner }
+            }
+        }
+    }
+}
+
+impl Clone for CodeLocations {
+    fn clone(&self) -> Self {
+        let decoded = self.get().map_or(ptr::null_mut(), |locations| {
+            Box::into_raw(Box::new(Box::<[LocationPair]>::from(locations)))
+        });
+        Self {
+            first_line: self.first_line,
+            decoded: AtomicPtr::new(decoded),
+        }
+    }
+}
+
+impl Drop for CodeLocations {
+    fn drop(&mut self) {
+        let p = *self.decoded.get_mut();
+        if !p.is_null() {
+            // SAFETY: see `get`; nothing can observe the pointer after drop.
+            drop(unsafe { Box::from_raw(p) });
+        }
+    }
+}
+
+// SAFETY: the pointee is only published once and then shared immutably, like
+// `OnceLock<Box<[LocationPair]>>`.
+unsafe impl Send for CodeLocations {}
+unsafe impl Sync for CodeLocations {}
+
 /// Primary container of a single code object. Each python function has
 /// a code object. Also a module has a code object.
 #[derive(Clone)]
 pub struct CodeObject<C: Constant = ConstantData> {
     pub instructions: CodeUnits,
-    pub locations: Box<[(SourceLocation, SourceLocation)]>,
+    /// Read through [`CodeObject::locations`].
+    pub locations: CodeLocations,
     pub flags: CodeFlags,
     /// Number of positional-only arguments
     pub posonlyarg_count: u32,
@@ -1257,6 +1352,25 @@ impl<N: AsRef<str>> fmt::Debug for Arguments<'_, N> {
 }
 
 impl<C: Constant> CodeObject<C> {
+    /// The instruction locations if they are already decoded. Unlike
+    /// [`Self::locations`] this never allocates.
+    #[inline]
+    pub fn decoded_locations(&self) -> Option<&[LocationPair]> {
+        self.locations.get()
+    }
+
+    /// Start and end source location of each instruction, decoded from
+    /// `linetable` on first call unless given up front.
+    #[inline]
+    pub fn locations(&self) -> &[LocationPair] {
+        match self.locations.get() {
+            Some(locations) => locations,
+            None => self
+                .locations
+                .init(&self.linetable, self.instructions.len()),
+        }
+    }
+
     /// Get all arguments of the code object
     /// like inspect.getargs
     pub fn arg_names(&self) -> Arguments<'_, C::Name> {
@@ -1473,6 +1587,30 @@ mod tests {
         // No handler at offset 30 (past all ranges)
         let handler = find_exception_handler(&encoded, 30);
         assert!(handler.is_none());
+    }
+
+    #[test]
+    fn code_locations_decode_lazily() {
+        // Two instructions in a NoColumns entry, two lines below `first_line`.
+        let linetable = [0x80 | (13 << 3) | 1, 4];
+        let expected = crate::marshal::linetable_to_locations(&linetable, 7, 2);
+        assert_eq!(expected[0].0.line.get(), 9);
+
+        let lazy = CodeLocations::lazy(7);
+        assert!(lazy.get().is_none());
+        let unread = lazy.clone();
+        assert_eq!(lazy.init(&linetable, 2), &*expected);
+        assert_eq!(lazy.get(), Some(&*expected));
+        // A clone taken before the first read decodes on its own.
+        assert!(unread.get().is_none());
+        assert_eq!(unread.init(&linetable, 2), &*expected);
+        // A clone of decoded locations carries its own copy.
+        let copy = lazy.clone();
+        drop(lazy);
+        assert_eq!(copy.get(), Some(&*expected));
+
+        let given = CodeLocations::decoded(expected.clone());
+        assert_eq!(given.get(), Some(&*expected));
     }
 
     #[test]

@@ -292,7 +292,7 @@ fn deserialize_code_inner<R: Read, Bag: ConstantBag>(
 
     // Bytecode already uses flat localsplus indices (no translation needed)
     let instructions = CodeUnits::try_from(code_bytes.as_slice())?;
-    let locations = linetable_to_locations(&linetable, first_line_raw, instructions.len());
+    let locations = CodeLocations::lazy(first_line_raw);
 
     // Use original localspluskinds from marshal data (preserves CO_FAST_HIDDEN etc.)
     let localspluskinds = localspluskinds.into_boxed_slice();
@@ -1012,7 +1012,7 @@ fn deserialize_code_value_inner<R: Read, Bag: MarshalBag>(
         flags,
     )?;
     let instructions = bag.code_units_from_bytes(&code_bytes)?;
-    let locations = linetable_to_locations(&linetable, first_line_raw, instructions.len());
+    let locations = CodeLocations::lazy(first_line_raw);
     let constant_bag = bag.constant_bag();
     let code = CodeObject {
         instructions,

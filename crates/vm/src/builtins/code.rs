@@ -22,7 +22,10 @@ use core::{
 };
 use malachite_bigint::BigInt;
 use num_traits::Zero;
-use rustpython_compiler_core::{OneIndexed, bytecode::CodeUnits, bytecode::PyCodeLocationInfoKind};
+use rustpython_compiler_core::{
+    OneIndexed,
+    bytecode::{CodeLocations, CodeUnits, PyCodeLocationInfoKind},
+};
 
 /// State for iterating through code address ranges
 struct PyCodeAddressRange<'a> {
@@ -964,12 +967,8 @@ impl Constructor for PyCode {
             line: row,
             character_offset: OneIndexed::from_zero_indexed(0),
         };
-        let locations: Box<
-            [(
-                rustpython_compiler_core::SourceLocation,
-                rustpython_compiler_core::SourceLocation,
-            )],
-        > = vec![(loc, loc); instructions.len()].into_boxed_slice();
+        let locations =
+            CodeLocations::decoded(vec![(loc, loc); instructions.len()].into_boxed_slice());
 
         let flags = CodeFlags::from_bits_truncate(args.flags);
         let localspluskinds = build_localspluskinds(
@@ -1603,7 +1602,7 @@ impl PyCode {
             instructions,
             // FIXME: invalid locations. Actually locations is a duplication of linetable.
             // It can be removed once we move every other code to use linetable only.
-            locations: self.code.locations.clone(),
+            locations: CodeLocations::decoded(self.code.locations().into()),
             constants: constants.into_iter().map(Literal).collect(),
             names: intern_all(names, "co_names")?,
             varnames,
