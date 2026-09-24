@@ -62,9 +62,7 @@ impl PyMethod {
             None => None,
         };
 
-        if let Some(dict) = obj.dict()
-            && let Some(attr) = dict.get_item_opt(name, vm)?
-        {
+        if let Some(attr) = obj.instance_attr_get(name, interned_name, vm)? {
             return Ok(Self::Attribute(attr));
         }
 

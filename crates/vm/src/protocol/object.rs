@@ -185,10 +185,8 @@ impl PyObject {
         vm: &VirtualMachine,
     ) -> PyResult<()> {
         vm_trace!("object.__setattr__({:?}, {}, {:?})", self, attr_name, value);
-        let descr = vm
-            .ctx
-            .interned_str(attr_name)
-            .and_then(|attr_name| self.get_class_attr(attr_name));
+        let interned_name = vm.ctx.interned_str(attr_name);
+        let descr = interned_name.and_then(|attr_name| self.get_class_attr(attr_name));
         if let Some(attr) = &descr
             && let Some(descriptor) = attr.class().slots.descr_set.load()
         {
@@ -223,12 +221,19 @@ impl PyObject {
             return Err(exc);
         };
 
+        let value = match self.inline_attr_set(attr_name, interned_name, value, vm) {
+            Ok((_old, true)) => return Ok(()),
+            Ok((_, false)) => {
+                return Err(vm.new_no_attribute_error(self.to_owned(), attr_name.to_owned()));
+            }
+            Err(value) => value,
+        };
         if let PySetterValue::Assign(value) = value {
             instance_dict
-                .get_or_insert(vm)
+                .get_or_insert(self.shared_keys())
                 .set_item(attr_name, value, vm)?;
             instance_dict.maybe_materialize_inline_values();
-        } else if let Some(dict) = instance_dict.get() {
+        } else if let Some(dict) = instance_dict.get(self.shared_keys()) {
             dict.del_item(attr_name, vm).map_err(|e| {
                 if e.fast_isinstance(vm.ctx.exceptions.key_error) {
                     vm.new_no_attribute_error(self.to_owned(), attr_name.to_owned())
@@ -271,14 +276,12 @@ impl PyObject {
             None => None,
         };
 
-        let dict = dict.or_else(|| self.dict());
-
         let attr = if let Some(dict) = dict {
             // `Py<PyStr>` rather than its `&Wtf8`: the key type carries the
             // cached hash and compares interned keys by pointer.
             dict.get_item_opt(name_str, vm)?
         } else {
-            None
+            self.instance_attr_get(name_str, cls_attr_name, vm)?
         };
 
         if let Some(obj_attr) = attr {

@@ -255,8 +255,8 @@ mod _functools {
         #[pygetset]
         fn __dict__(zelf: &Py<Self>, vm: &VirtualMachine) -> PyDictRef {
             zelf.as_object()
-                .instance_dict()
-                .map_or_else(|| vm.ctx.new_dict(), |d| d.get_or_insert(vm))
+                .dict_or_insert()
+                .unwrap_or_else(|| vm.ctx.new_dict())
         }
 
         #[pygetset(setter)]
