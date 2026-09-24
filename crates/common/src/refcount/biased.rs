@@ -38,7 +38,6 @@
 
 use crate::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::Cell;
 
@@ -93,8 +92,11 @@ std::thread_local! {
     /// This thread's owner id. Constant-initialized without a destructor, so
     /// reading it is a single thread-pointer-relative load.
     static CURRENT_TID: Cell<u32> = const { Cell::new(TID_UNREGISTERED) };
-    /// This thread's "objects queued" flag while it is registered.
-    static CURRENT_PENDING: Cell<*const AtomicBool> = const { Cell::new(core::ptr::null()) };
+    /// Whether other threads queued objects for this thread to merge. The
+    /// eval breaker polls it on every instruction, so it lives here, one
+    /// thread-pointer-relative load away; queueing threads write it through
+    /// the pointer the registry holds while this thread is registered.
+    static HAS_QUEUED: AtomicBool = const { AtomicBool::new(false) };
     static EXIT_GUARD: ExitGuard = const { ExitGuard(Cell::new(false)) };
     /// Set while [`merge_queued_objects`] runs on this thread.
     static MERGING: Cell<bool> = const { Cell::new(false) };
@@ -123,8 +125,23 @@ fn refcount_overflow() -> ! {
 struct Owner {
     /// Objects handed over by other threads, each carrying one reference.
     objects: Vec<usize>,
-    /// Whether `objects` is nonempty, readable without the registry lock.
-    pending: Arc<AtomicBool>,
+    /// The owner's [`HAS_QUEUED`] flag: set when `objects` becomes nonempty.
+    pending: PendingFlag,
+}
+
+/// Points at a registered thread's [`HAS_QUEUED`] thread-local. The thread
+/// removes its entry before its thread-locals are freed.
+struct PendingFlag(*const AtomicBool);
+
+// SAFETY: only dereferenced under the registry lock while the owner is
+// registered, and the flag itself is atomic.
+unsafe impl Send for PendingFlag {}
+
+impl PendingFlag {
+    fn store(&self, value: bool, order: Ordering) {
+        // SAFETY: see the type.
+        unsafe { &*self.0 }.store(value, order);
+    }
 }
 
 struct Registry {
@@ -177,10 +194,10 @@ fn register_current_thread() -> u32 {
         CURRENT_TID.set(TID_EXITED);
         return UNOWNED;
     }
-    let pending = Arc::new(AtomicBool::new(false));
-    // The registry keeps the flag alive until `exit_current_thread_impl`,
-    // which clears this pointer first.
-    CURRENT_PENDING.set(Arc::as_ptr(&pending));
+    let Ok(pending) = HAS_QUEUED.try_with(|q| PendingFlag(q)) else {
+        CURRENT_TID.set(TID_EXITED);
+        return UNOWNED;
+    };
     REGISTRY.lock().owners.insert(
         tid,
         Owner {
@@ -307,10 +324,9 @@ pub unsafe fn after_fork_child(mut dealloc: impl FnMut(*const RefCount)) {
 
 /// Whether other threads queued objects for the current thread to merge.
 #[inline]
+#[must_use]
 pub fn has_queued_objects() -> bool {
-    let pending = CURRENT_PENDING.with(Cell::get);
-    // SAFETY: non-null only while the registry holds the `Arc`.
-    !pending.is_null() && unsafe { &*pending }.load(Ordering::Relaxed)
+    HAS_QUEUED.with(|q| q.load(Ordering::Relaxed))
 }
 
 /// Merge every object other threads queued for the current thread, calling
@@ -362,7 +378,6 @@ fn exit_current_thread_impl(mut dealloc: Option<&mut dyn FnMut(*const RefCount)>
     if tid > MAX_TID || tid == UNOWNED {
         return;
     }
-    let _ = CURRENT_PENDING.try_with(|p| p.set(core::ptr::null()));
     let objects = {
         let mut registry = REGISTRY.lock();
         // From here on this thread takes the non-owner path for its own
@@ -372,6 +387,7 @@ fn exit_current_thread_impl(mut dealloc: Option<&mut dyn FnMut(*const RefCount)>
     };
     let objects = objects.map(|owner| owner.objects).unwrap_or_default();
     let _ = EXIT_GUARD.try_with(|g| g.0.set(false));
+    let _ = HAS_QUEUED.try_with(|q| q.store(false, Ordering::Relaxed));
     for ptr in objects {
         // SAFETY: the queue's reference kept the object alive.
         let rc = unsafe { &*(ptr as *const RefCount) };
