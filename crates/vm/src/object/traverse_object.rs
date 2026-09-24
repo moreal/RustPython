@@ -4,8 +4,8 @@ use core::any::TypeId;
 use crate::{
     PyObject, PyObjectRef,
     object::{
-        Erased, InstanceDict, MaybeTraverse, PyInner, PyObjectPayload, debug_obj, default_dealloc,
-        try_clear_obj, try_traverse_obj,
+        Erased, MaybeTraverse, PyInner, PyObjectPayload, debug_obj, default_dealloc, try_clear_obj,
+        try_traverse_obj,
     },
 };
 
@@ -43,12 +43,6 @@ impl PyObjVTable {
                 }
             },
         }
-    }
-}
-
-unsafe impl Traverse for InstanceDict {
-    fn traverse(&self, tracer_fn: &mut TraverseFn<'_>) {
-        self.d.traverse(tracer_fn)
     }
 }
 

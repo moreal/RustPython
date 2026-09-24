@@ -975,7 +975,7 @@ impl GcState {
             let instance_dict_count = truly_dead
                 .iter()
                 .filter(|obj| {
-                    if let Some(dict_ref) = obj.dict() {
+                    if let Some(dict_ref) = obj.materialized_dict() {
                         dead_ptrs.contains(&(dict_ref.as_object() as *const PyObject as usize))
                     } else {
                         false

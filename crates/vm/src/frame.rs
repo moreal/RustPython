@@ -25,7 +25,7 @@ use crate::{
     exceptions::ExceptionCtor,
     function::{ArgMapping, Callee, Either, FuncArgs, KwArgs, PyMethodFlags},
     object::PyAtomicBorrow,
-    object::{Traverse, TraverseFn},
+    object::{InlineProbe, InlineShadow, Traverse, TraverseFn},
     protocol::{PyIter, PyIterReturn},
     scope::Scope,
     sliceable::SliceableSequenceOp,
@@ -6066,22 +6066,23 @@ impl ExecutingFrame<'_> {
             Instruction::LoadAttrInstanceValue => {
                 let oparg = LoadAttr::from_u32(u32::from(arg));
                 let cache_base = self.lasti() as usize;
-                let attr_name = self.code.names[oparg.name_idx() as usize];
 
                 let owner = self.top_value();
                 let type_version = self.code.instructions.read_cache_u32(cache_base + 1);
 
-                if type_version != 0 && owner.class().tp_version_tag.load(Acquire) == type_version {
-                    // Type version matches — no data descriptor for this attr.
-                    // Try direct dict lookup, skipping full descriptor protocol.
-                    if let Some(dict) = owner.dict()
-                        && let Some(value) = dict.get_item_opt(attr_name, vm)?
-                    {
+                if type_version != 0
+                    && owner.class().tp_version_tag.load(Acquire) == type_version
+                    && let Some(instance_dict) = owner.instance_dict()
+                {
+                    // Type version matches — no data descriptor for this attr,
+                    // and the cached index is into this type's shared keys.
+                    let index = self.code.instructions.read_cache_u16(cache_base + 3);
+                    if let Ok(Some(value)) = instance_dict.inline_get(usize::from(index)) {
                         self.pop_stackref();
                         self.push_value(value);
                         return Ok(None);
                     }
-                    // Not in instance dict — fall through to class lookup via slow path
+                    // Absent, or the values were materialized into a dict.
                 }
                 self.load_attr_slow(vm, oparg)
             }
@@ -6095,7 +6096,7 @@ impl ExecutingFrame<'_> {
 
                 if type_version != 0
                     && owner.class().tp_version_tag.load(Acquire) == type_version
-                    && let Some(dict) = owner.dict()
+                    && let Some(dict) = owner.materialized_dict()
                 {
                     // Try the cached entry index first; a hit is an identity
                     // check on the entry key instead of a hash probe.
@@ -6337,16 +6338,25 @@ impl ExecutingFrame<'_> {
                 let owner = self.top_value();
                 let type_version = self.code.instructions.read_cache_u32(cache_base + 1);
 
-                if type_version != 0
-                    && owner.class().tp_version_tag.load(Acquire) == type_version
-                    && let Some(dict) = owner.dict()
-                {
-                    self.pop_stackref(); // owner
+                if type_version != 0 && owner.class().tp_version_tag.load(Acquire) == type_version {
+                    let owner = self.pop_stackref();
                     let value = self.pop_value();
-                    // The key was absent at specialization time, but this
-                    // very store inserts it; hint learning makes later
-                    // executions replace by entry index.
-                    self.store_attr_dict_hinted(&dict, attr_name, value, cache_base, vm)?;
+                    // The cached index is into this type's shared keys.
+                    let index = self.code.instructions.read_cache_u16(cache_base + 3);
+                    let value = match owner.instance_dict() {
+                        Some(instance_dict) => {
+                            match instance_dict.inline_set(usize::from(index), value) {
+                                Ok(old) => {
+                                    drop(old);
+                                    return Ok(None);
+                                }
+                                Err(value) => value,
+                            }
+                        }
+                        None => value,
+                    };
+                    // The values were materialized into a dict.
+                    owner.set_attr(attr_name, value, vm)?;
                     return Ok(None);
                 }
                 self.store_attr(vm, attr_idx)
@@ -6361,7 +6371,7 @@ impl ExecutingFrame<'_> {
 
                 if type_version != 0
                     && owner.class().tp_version_tag.load(Acquire) == type_version
-                    && let Some(dict) = owner.dict()
+                    && let Some(dict) = owner.materialized_dict()
                 {
                     self.pop_stackref(); // owner
                     let value = self.pop_value();
@@ -9881,6 +9891,24 @@ impl ExecutingFrame<'_> {
         vm: &VirtualMachine,
     ) -> PyResult<Option<PyObjectRef>> {
         let stamp = self.code.instructions.read_cache_ptr(cache_base + 3);
+        // Inline values: only a name among the type's shared keys can shadow.
+        // Their stamp is disjoint from dict keys versions, so both kinds can
+        // share the cache entry.
+        if let Some(shadow) = self.top_value().inline_shadow(attr_name, stamp) {
+            return Ok(match shadow {
+                InlineShadow::Present(value) => Some(value),
+                InlineShadow::Absent(new_stamp) => {
+                    if let Some(new_stamp) = new_stamp {
+                        unsafe {
+                            self.code
+                                .instructions
+                                .write_cache_ptr(cache_base + 3, new_stamp);
+                        }
+                    }
+                    None
+                }
+            });
+        }
         // Take the stamp check first, on a borrowed dict: a hit is the whole
         // fast path, and cloning the dict for it would cost more than the
         // comparison it exists to make.
@@ -9890,7 +9918,7 @@ impl ExecutingFrame<'_> {
         if stamped {
             return Ok(None);
         }
-        let Some(dict) = self.top_value().dict() else {
+        let Some(dict) = self.top_value().materialized_dict() else {
             return Ok(None);
         };
         // Take the stamp before probing so it attests the probed key set.
@@ -10165,7 +10193,7 @@ impl ExecutingFrame<'_> {
 
                 let new_op = if !class_has_dict {
                     Instruction::LoadAttrMethodNoDict
-                } else if obj.dict().is_none() {
+                } else if !obj.has_instance_dict() {
                     Instruction::LoadAttrMethodLazyDict
                 } else {
                     Instruction::LoadAttrMethodWithValues
@@ -10266,7 +10294,30 @@ impl ExecutingFrame<'_> {
                     // A present attribute always specializes; when no entry
                     // index is representable the hint degrades to 0 and the
                     // handler simply keeps taking its full-probe fallback.
-                    let instance_attr_hint = if let Some(dict) = obj.dict() {
+                    match obj.inline_probe(attr_name) {
+                        InlineProbe::Present(index) => {
+                            unsafe {
+                                self.code
+                                    .instructions
+                                    .write_cache_u32(cache_base + 1, type_version);
+                                self.code
+                                    .instructions
+                                    .write_cache_u16(cache_base + 3, index as u16);
+                            }
+                            self.specialize_at(
+                                instr_idx,
+                                cache_base,
+                                Instruction::LoadAttrInstanceValue,
+                            );
+                            return;
+                        }
+                        InlineProbe::Absent => {
+                            self.cooldown_adaptive_at(cache_base);
+                            return;
+                        }
+                        InlineProbe::NotInline => {}
+                    }
+                    let instance_attr_hint = if let Some(dict) = obj.materialized_dict() {
                         match dict.get_item_opt_refresh_hint(attr_name, 0, _vm) {
                             Ok(present) => present.map(|(_, refreshed)| refreshed.unwrap_or(0)),
                             Err(_) => {
@@ -12028,7 +12079,17 @@ impl ExecutingFrame<'_> {
                     );
                 }
             }
-        } else if let Some(dict) = owner.dict() {
+        } else if let Some(index) = owner.inline_store_index(attr_name) {
+            unsafe {
+                self.code
+                    .instructions
+                    .write_cache_u32(cache_base + 1, type_version);
+                self.code
+                    .instructions
+                    .write_cache_u16(cache_base + 3, index as u16);
+            }
+            self.specialize_at(instr_idx, cache_base, Instruction::StoreAttrInstanceValue);
+        } else if let Some(dict) = owner.materialized_dict() {
             let hint = match dict.hint_for_key(attr_name, vm) {
                 Ok(hint) => hint,
                 Err(_) => {
@@ -12051,15 +12112,8 @@ impl ExecutingFrame<'_> {
                     .instructions
                     .write_cache_u16(cache_base + 3, hint.unwrap_or(0));
             }
-            self.specialize_at(
-                instr_idx,
-                cache_base,
-                if hint.is_some() {
-                    Instruction::StoreAttrWithHint
-                } else {
-                    Instruction::StoreAttrInstanceValue
-                },
-            );
+            // A missing key is learned by the first store's hint refresh.
+            self.specialize_at(instr_idx, cache_base, Instruction::StoreAttrWithHint);
         } else {
             unsafe {
                 self.code.instructions.write_adaptive_counter(

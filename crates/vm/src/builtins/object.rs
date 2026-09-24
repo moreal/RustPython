@@ -97,11 +97,13 @@ impl Constructor for PyBaseObject {
 #[expect(clippy::unnecessary_wraps, reason = "Needs to comply with a signature")]
 pub(crate) fn generic_alloc(cls: PyTypeRef, _nitems: usize, vm: &VirtualMachine) -> PyResult {
     // Only create dict if the class has HAS_DICT flag (i.e., __slots__ was not defined
-    // or __dict__ is in __slots__)
+    // or __dict__ is in __slots__). Heap type instances start out storing their
+    // attributes inline and get a dict only when one is asked for.
     let dict = if cls
         .slots
         .flags
         .has_feature(crate::types::PyTypeFlags::HAS_DICT)
+        && cls.heaptype_ext.is_none()
     {
         Some(vm.ctx.new_dict())
     } else {
@@ -529,14 +531,8 @@ impl PyBaseObject {
 }
 
 pub fn object_get_dict(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<PyDictRef> {
-    if let Some(dict) = obj.dict() {
-        Ok(dict)
-    } else {
-        match obj.instance_dict() {
-            Some(d) => Ok(d.get_or_insert(vm)),
-            None => Err(vm.new_attribute_error("This object has no __dict__")),
-        }
-    }
+    obj.dict_or_insert()
+        .ok_or_else(|| vm.new_attribute_error("This object has no __dict__"))
 }
 pub(crate) fn object_set_dict(
     obj: PyObjectRef,

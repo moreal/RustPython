@@ -21,7 +21,7 @@ use crate::{
         lock::{PyRwLock, PyRwLockReadGuard},
     },
     function::{FuncArgs, KwArgs, OptionalArg, PyMethodDef, PySetterValue},
-    object::{Traverse, TraverseFn},
+    object::{SharedKeys, Traverse, TraverseFn},
     protocol::{PyIterReturn, PyNumberMethods},
     types::{
         AsNumber, Callable, Constructor, GetAttr, Initializer, NewFunc, PyTypeFlags, PyTypeSlots,
@@ -298,6 +298,8 @@ pub struct HeapTypeExt {
     /// The interpreter this type was created in, or `None` for the types the
     /// shared context builds before any interpreter exists.
     pub interpreter_id: Option<i64>,
+    /// Attribute names laid out for the instances' inline values.
+    pub(crate) shared_keys: SharedKeys,
 }
 
 impl HeapTypeExt {
@@ -796,6 +798,7 @@ impl PyType {
             type_data: PyRwLock::new(None),
             specialization_cache: TypeSpecializationCache::new(),
             interpreter_id: HeapTypeExt::creating_interpreter_id(),
+            shared_keys: SharedKeys::default(),
         };
         let bases = PyTuple::new_ref_typed(bases, ctx);
         let base = bases[0].clone();
@@ -2714,6 +2717,7 @@ impl Constructor for PyType {
                 type_data: PyRwLock::new(None),
                 specialization_cache: TypeSpecializationCache::new(),
                 interpreter_id: HeapTypeExt::creating_interpreter_id(),
+                shared_keys: SharedKeys::default(),
             };
             (slots, heaptype_ext)
         };

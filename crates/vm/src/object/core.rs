@@ -17,7 +17,10 @@ use super::{
 };
 use crate::object::traverse_object::PyObjVTable;
 use crate::{
-    builtins::{PyDictRef, PyTuple, PyTupleRef, PyType, PyTypeRef, type_::PyTypeTupleRef},
+    builtins::{
+        PyDictRef, PyStr, PyStrInterned, PyTuple, PyTupleRef, PyType, PyTypeRef,
+        type_::PyTypeTupleRef,
+    },
     common::{
         atomic::{Ordering, PyAtomic, Radium},
         linked_list::{Link, Pointers},
@@ -241,7 +244,7 @@ pub(super) unsafe fn default_dealloc<T: PyPayload>(obj: *mut PyObject) {
     {
         if let Some(ext) = obj_ref.0.ext_ref() {
             if let Some(dict) = &ext.dict {
-                let old = dict.d.write().take();
+                let old = dict.take_all();
                 drop(old);
             }
             for slot in &ext.slots {
@@ -377,10 +380,11 @@ impl ObjExt {
         member_count: usize,
         has_dict: bool,
         inline_values: bool,
+        inline_storage: bool,
     ) -> Self {
         Self {
             dict: if has_dict {
-                Some(InstanceDict::from_opt(dict, inline_values))
+                Some(InstanceDict::from_opt(dict, inline_values, inline_storage))
             } else {
                 None
             },
@@ -1088,9 +1092,177 @@ impl Py<PyWeak> {
 /// converted to a regular heap dict.
 pub(crate) const SHARED_KEYS_MAX_SIZE: usize = 30;
 
+/// The attribute names a heap type's instances store inline, in slot order.
+///
+/// Every instance of the type indexes its inline values with these keys, so
+/// the specialized attribute instructions can cache an index instead of
+/// probing a dict. Keys are only ever appended (up to
+/// [`SHARED_KEYS_MAX_SIZE`]), so an index stays valid for the type's lifetime.
+#[derive(Default)]
+pub(crate) struct SharedKeys {
+    keys: PyRwLock<Vec<&'static PyStrInterned>>,
+    len: PyAtomic<usize>,
+}
+
+impl fmt::Debug for SharedKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedKeys")
+            .field("len", &self.len.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
+impl SharedKeys {
+    pub(crate) fn index_of(&self, name: &PyStrInterned) -> Option<usize> {
+        self.keys.read().iter().position(|key| ptr::eq(*key, name))
+    }
+
+    /// The index of `name`, appending it when absent. `None` once the keys are full.
+    pub(crate) fn index_or_insert(&self, name: &'static PyStrInterned) -> Option<usize> {
+        if let Some(index) = self.index_of(name) {
+            return Some(index);
+        }
+        let mut keys = self.keys.write();
+        if let Some(index) = keys.iter().position(|key| ptr::eq(*key, name)) {
+            return Some(index);
+        }
+        if keys.len() >= SHARED_KEYS_MAX_SIZE {
+            return None;
+        }
+        keys.push(name);
+        self.len.store(keys.len(), Ordering::Release);
+        Some(keys.len() - 1)
+    }
+
+    /// A stamp that changes whenever a key is added. A name found absent
+    /// under a stamp stays absent while the stamp is unchanged.
+    ///
+    /// It is the bitwise complement of the key count so it cannot collide
+    /// with a dict keys version (a `u32`) in a shared inline cache entry.
+    #[inline]
+    pub(crate) fn stamp(&self) -> usize {
+        !self.len.load(Ordering::Acquire)
+    }
+
+    fn is_full(&self) -> bool {
+        self.len.load(Ordering::Acquire) >= SHARED_KEYS_MAX_SIZE
+    }
+}
+
+/// Result of [`PyObject::inline_probe`].
+pub(crate) enum InlineProbe {
+    /// The attribute is stored at this inline index.
+    Present(usize),
+    /// The object stores inline but has no such attribute.
+    Absent,
+    NotInline,
+}
+
+/// Result of [`PyObject::inline_shadow`].
+pub(crate) enum InlineShadow {
+    Present(PyObjectRef),
+    /// Not shadowed; carries a new stamp to cache when the name is not
+    /// among the type's keys at all.
+    Absent(Option<usize>),
+}
+
+/// What an object's instance dict slot holds.
+///
+/// While `inline` is set, the attributes live in `values`, indexed by the
+/// owner type's [`SharedKeys`], and `dict` is `None`. The first time anything
+/// needs a real dict the values are moved into one ("materialized"); from
+/// then on the dict is the only storage and `inline` never comes back.
+#[derive(Debug, Default)]
+struct DictSlot {
+    dict: Option<PyDictRef>,
+    values: Vec<Option<PyObjectRef>>,
+    /// Insertion order of the present values, kept only once it stops being
+    /// ascending index order (the common case needs no bookkeeping).
+    order: Option<Vec<u8>>,
+}
+
+impl DictSlot {
+    fn has_values(&self) -> bool {
+        self.values.iter().any(Option::is_some)
+    }
+
+    /// Store `value` at `index`, returning the value it replaced.
+    fn store(&mut self, index: usize, value: PyObjectRef) -> Option<PyObjectRef> {
+        if index >= self.values.len() {
+            // Every present value sits below `index`, so appending keeps
+            // insertion order ascending.
+            self.values.resize_with(index + 1, || None);
+        } else if self.values[index].is_some() {
+            return self.values[index].replace(value);
+        } else if self.order.is_none() && self.values[index + 1..].iter().any(Option::is_some) {
+            self.order = Some(
+                self.values
+                    .iter()
+                    .positions(Option::is_some)
+                    .map(|i| i as u8)
+                    .collect(),
+            );
+        }
+        if let Some(order) = &mut self.order {
+            order.push(index as u8);
+        }
+        self.values[index] = Some(value);
+        None
+    }
+
+    fn remove(&mut self, index: usize) -> Option<PyObjectRef> {
+        let old = self.values.get_mut(index)?.take()?;
+        if let Some(order) = &mut self.order {
+            order.retain(|&i| usize::from(i) != index);
+        }
+        Some(old)
+    }
+
+    /// Move the inline values into `dict`, a new empty one, in insertion order.
+    ///
+    /// Only the dict's own storage is allocated here, never a Python object,
+    /// so this cannot trigger a collection (and a finalizer) under the lock.
+    fn move_into_dict(&mut self, dict: &PyDictRef, keys: Option<&SharedKeys>, vm: &VirtualMachine) {
+        let mut values = core::mem::take(&mut self.values);
+        let order = self.order.take();
+        let len = values.len();
+        if let Some(keys) = keys {
+            let keys = keys.keys.read();
+            let mut insert = |index: usize| {
+                if let Some(value) = values[index].take() {
+                    // An exact dict keyed by an interned str cannot fail.
+                    dict.set_item(keys[index], value, vm)
+                        .expect("inserting a str key into a new dict");
+                }
+            };
+            match order {
+                Some(order) => order.iter().for_each(|&i| insert(usize::from(i))),
+                None => (0..len).for_each(insert),
+            }
+        }
+        debug_assert!(values.iter().all(Option::is_none));
+    }
+}
+
+unsafe impl Traverse for DictSlot {
+    fn traverse(&self, tracer_fn: &mut TraverseFn<'_>) {
+        self.dict.traverse(tracer_fn);
+        self.values.traverse(tracer_fn);
+    }
+}
+
+unsafe impl Traverse for InstanceDict {
+    fn traverse(&self, tracer_fn: &mut TraverseFn<'_>) {
+        self.d.traverse(tracer_fn)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct InstanceDict {
-    pub(crate) d: PyRwLock<Option<PyDictRef>>,
+    d: PyRwLock<DictSlot>,
+    /// Whether the attributes are stored inline. Only written under the
+    /// write lock, and only ever cleared.
+    inline: PyAtomic<bool>,
     inline_values_valid: PyAtomic<bool>,
 }
 
@@ -1104,17 +1276,30 @@ impl From<PyDictRef> for InstanceDict {
 impl InstanceDict {
     #[inline]
     pub(crate) fn new(d: PyDictRef) -> Self {
-        Self::from_opt(Some(d), false)
+        Self::from_opt(Some(d), false, false)
     }
 
+    /// `inline_values` is what [`Self::inline_values_valid`] starts out as;
+    /// `inline_storage` whether attributes may be stored inline at all.
     #[inline]
-    pub(crate) fn from_opt(d: Option<PyDictRef>, inline_values: bool) -> Self {
+    pub(crate) fn from_opt(
+        d: Option<PyDictRef>,
+        inline_values: bool,
+        inline_storage: bool,
+    ) -> Self {
         Self {
-            d: PyRwLock::new(d),
+            inline: Radium::new(inline_storage && d.is_none()),
+            d: PyRwLock::new(DictSlot {
+                dict: d,
+                ..DictSlot::default()
+            }),
             inline_values_valid: Radium::new(inline_values),
         }
     }
 
+    /// Mirrors CPython's `_PyObject_InlineValues(obj)->valid`, as reported by
+    /// `_testinternalcapi.has_inline_values`. Where the attributes actually
+    /// live is tracked separately by [`Self::is_inline`].
     #[inline]
     pub(crate) fn inline_values_valid(&self) -> bool {
         self.inline_values_valid.load(Ordering::Relaxed)
@@ -1129,25 +1314,95 @@ impl InstanceDict {
         if !self.inline_values_valid() {
             return;
         }
-        let overflow = self.with(|d| d.is_some_and(|d| d.__len__() > SHARED_KEYS_MAX_SIZE));
+        let overflow = self
+            .d
+            .read()
+            .dict
+            .as_ref()
+            .is_some_and(|d| d.__len__() > SHARED_KEYS_MAX_SIZE);
         if overflow {
             self.invalidate_inline_values();
         }
     }
 
-    #[inline]
-    pub(crate) fn get(&self) -> Option<PyDictRef> {
-        self.d.read().clone()
+    /// Whether the attributes are currently stored inline rather than in a
+    /// dict. Without the lock this is only a hint: it can turn false at any
+    /// time, but never back to true.
+    #[inline(always)]
+    pub(crate) fn is_inline(&self) -> bool {
+        self.inline.load(Ordering::Acquire)
     }
 
-    /// Run `f` on the dict without cloning it.
+    /// Materialize the inline values into a dict, and stop storing inline.
+    ///
+    /// `keys` must be the shared keys of the owner's current type. With
+    /// `create`, a dict is made even when there are no attributes.
+    fn materialize(&self, keys: Option<&SharedKeys>, create: bool) -> Option<PyDictRef> {
+        crate::vm::thread::with_current_vm(|vm| {
+            // Allocate before locking: a Python allocation can run a
+            // collection whose finalizers might touch this very object.
+            let new_dict = vm.ctx.new_dict();
+            let mut slot = self.d.write();
+            if self.is_inline() {
+                self.inline.store(false, Ordering::Release);
+                if create || slot.has_values() {
+                    slot.move_into_dict(&new_dict, keys, vm);
+                    slot.dict = Some(new_dict);
+                }
+            } else if create && slot.dict.is_none() {
+                slot.dict = Some(new_dict);
+            }
+            slot.dict.clone()
+        })
+    }
+
+    /// Stop storing attributes inline; see [`Self::materialize`].
+    pub(crate) fn disable_inline(&self, keys: Option<&SharedKeys>) {
+        if self.is_inline() {
+            self.materialize(keys, false);
+        }
+    }
+
+    /// The dict, materializing inline values first. An object storing inline
+    /// always gets one, even with no attributes yet, as it would have had a
+    /// dict from the start; `None` only after the dict was deleted.
+    #[inline]
+    pub(crate) fn get(&self, keys: Option<&SharedKeys>) -> Option<PyDictRef> {
+        if self.is_inline() {
+            return self.materialize(keys, true);
+        }
+        self.d.read().dict.clone()
+    }
+
+    /// The dict only if it already exists; never materializes.
+    #[inline]
+    pub(crate) fn get_materialized(&self) -> Option<PyDictRef> {
+        self.d.read().dict.clone()
+    }
+
+    /// Whether the object has a dict or any inline attribute.
+    #[inline]
+    pub(crate) fn has_attrs(&self) -> bool {
+        let slot = self.d.read();
+        slot.dict.is_some() || (self.is_inline() && slot.has_values())
+    }
+
+    /// Run `f` on the dict without cloning it, materializing inline values
+    /// first.
     ///
     /// For callers that only need to look at the dict — a predicate, a version
     /// stamp — this drops the refcount round-trip [`Self::get`] pays. `f` runs
     /// under the read guard, so it must not run Python or take this lock again.
     #[inline]
-    pub(crate) fn with<R>(&self, f: impl FnOnce(Option<&Py<crate::builtins::PyDict>>) -> R) -> R {
-        f(self.d.read().as_deref())
+    pub(crate) fn with<R>(
+        &self,
+        keys: Option<&SharedKeys>,
+        f: impl FnOnce(Option<&Py<crate::builtins::PyDict>>) -> R,
+    ) -> R {
+        if self.is_inline() {
+            self.materialize(keys, true);
+        }
+        f(self.d.read().dict.as_deref())
     }
 
     #[inline]
@@ -1155,23 +1410,72 @@ impl InstanceDict {
         self.replace(d);
     }
 
-    #[inline]
+    /// Replace the dict, discarding any inline values.
     pub(crate) fn replace(&self, d: Option<PyDictRef>) -> Option<PyDictRef> {
-        core::mem::replace(&mut self.d.write(), d)
+        let (old, _values) = {
+            let mut slot = self.d.write();
+            self.inline.store(false, Ordering::Release);
+            let values = core::mem::take(&mut slot.values);
+            slot.order = None;
+            (core::mem::replace(&mut slot.dict, d), values)
+        };
+        old
     }
 
-    pub(crate) fn get_or_insert(&self, vm: &VirtualMachine) -> PyDictRef {
-        if let Some(existing) = self.d.read().as_ref() {
-            return existing.clone();
+    /// Take everything this slot owns, leaving it empty; for tp_clear.
+    pub(crate) fn take_all(&self) -> (Option<PyDictRef>, Vec<Option<PyObjectRef>>) {
+        let mut slot = self.d.write();
+        slot.order = None;
+        (slot.dict.take(), core::mem::take(&mut slot.values))
+    }
+
+    pub(crate) fn get_or_insert(&self, keys: Option<&SharedKeys>) -> PyDictRef {
+        {
+            let slot = self.d.read();
+            if !self.is_inline()
+                && let Some(existing) = slot.dict.as_ref()
+            {
+                return existing.clone();
+            }
         }
-        let dict = vm.ctx.new_dict();
-        let mut d = self.d.write();
-        if let Some(existing) = d.as_ref() {
-            existing.clone()
-        } else {
-            *d = Some(dict.clone());
-            dict
+        self.materialize(keys, true)
+            .expect("materialize(create) makes a dict")
+    }
+
+    /// Read inline value `index`: `Err` when not storing inline, `Ok(None)`
+    /// when the attribute is absent.
+    #[inline(always)]
+    pub(crate) fn inline_get(&self, index: usize) -> Result<Option<PyObjectRef>, ()> {
+        let slot = self.d.read();
+        if !self.is_inline() {
+            return Err(());
         }
+        Ok(slot.values.get(index).cloned().flatten())
+    }
+
+    /// Store inline value `index`, returning the replaced value so the caller
+    /// drops it outside the lock. Hands `value` back when not storing inline.
+    #[inline(always)]
+    pub(crate) fn inline_set(
+        &self,
+        index: usize,
+        value: PyObjectRef,
+    ) -> Result<Option<PyObjectRef>, PyObjectRef> {
+        let mut slot = self.d.write();
+        if !self.is_inline() {
+            return Err(value);
+        }
+        Ok(slot.store(index, value))
+    }
+
+    /// Remove inline value `index`: `Err` when not storing inline,
+    /// `Ok(None)` when it was absent.
+    pub(crate) fn inline_remove(&self, index: usize) -> Result<Option<PyObjectRef>, ()> {
+        let mut slot = self.d.write();
+        if !self.is_inline() {
+            return Err(());
+        }
+        Ok(slot.remove(index))
     }
 }
 
@@ -1315,7 +1619,16 @@ impl<T: PyPayload + core::fmt::Debug> PyInner<T> {
                     let flags = typ.slots.flags;
                     let has_dict = flags.has_feature(crate::types::PyTypeFlags::HAS_DICT);
                     let inline_values = flags.has_feature(crate::types::PyTypeFlags::INLINE_VALUES);
-                    ext_ptr.write(ObjExt::new(dict, member_count, has_dict, inline_values));
+                    // Any heap type can lay its instances' attributes out by
+                    // its shared keys, subclasses included.
+                    let inline_storage = typ.heaptype_ext.is_some();
+                    ext_ptr.write(ObjExt::new(
+                        dict,
+                        member_count,
+                        has_dict,
+                        inline_values,
+                        inline_storage,
+                    ));
                 }
 
                 if let Some(offset) = weakref_start {
@@ -1709,6 +2022,10 @@ impl PyObject {
     }
 
     pub fn set_class(&self, typ: PyTypeRef, vm: &VirtualMachine) {
+        // Inline values are laid out by the old type's keys.
+        if let Some(dict) = self.instance_dict() {
+            dict.disable_inline(self.shared_keys());
+        }
         self.0.typ.swap_to_temporary_refs(typ, vm);
     }
 
@@ -1740,9 +2057,204 @@ impl PyObject {
                 .is_some_and(InstanceDict::inline_values_valid)
     }
 
+    /// The shared keys the inline values of this object are laid out by.
+    #[inline(always)]
+    pub(crate) fn shared_keys(&self) -> Option<&SharedKeys> {
+        self.class()
+            .heaptype_ext
+            .as_ref()
+            .map(|ext| &ext.shared_keys)
+    }
+
+    /// The instance dict, materializing inline attribute values into it.
     #[inline(always)]
     pub fn dict(&self) -> Option<PyDictRef> {
-        self.instance_dict().and_then(|d| d.get())
+        self.instance_dict().and_then(|d| d.get(self.shared_keys()))
+    }
+
+    /// The instance dict only if it already exists: `None` both for an object
+    /// without one and for one still storing its attributes inline.
+    #[inline(always)]
+    pub(crate) fn materialized_dict(&self) -> Option<PyDictRef> {
+        self.instance_dict()
+            .and_then(InstanceDict::get_materialized)
+    }
+
+    /// The instance dict, created (or materialized) if the object has none.
+    /// `None` only for an object without a dict slot.
+    pub(crate) fn dict_or_insert(&self) -> Option<PyDictRef> {
+        self.instance_dict()
+            .map(|d| d.get_or_insert(self.shared_keys()))
+    }
+
+    /// Resolve `name` to an inline value index of this object.
+    ///
+    /// `None` unless the object stores its attributes inline and `name` is an
+    /// exact str; `Some(None)` when the name is not among the type's keys,
+    /// which then means the attribute is absent. With `insert`, a missing
+    /// name is added to the keys while there is room.
+    fn inline_index(
+        &self,
+        name: &Py<PyStr>,
+        interned: Option<&'static PyStrInterned>,
+        insert: bool,
+        vm: &VirtualMachine,
+    ) -> Option<(&InstanceDict, Option<usize>)> {
+        let dict = self.instance_dict()?;
+        let keys = self.shared_keys()?;
+        if !dict.is_inline() || !name.class().is(vm.ctx.types.str_type) {
+            return None;
+        }
+        let index = match interned {
+            Some(interned) if insert => keys.index_or_insert(interned),
+            Some(interned) => keys.index_of(interned),
+            None if insert && !keys.is_full() => {
+                keys.index_or_insert(vm.ctx.intern_str(name.as_wtf8()))
+            }
+            None => None,
+        };
+        Some((dict, index))
+    }
+
+    /// Look `name` up among the instance attributes, inline or in the dict,
+    /// without materializing a dict.
+    pub(crate) fn instance_attr_get(
+        &self,
+        name: &Py<PyStr>,
+        interned: Option<&'static PyStrInterned>,
+        vm: &VirtualMachine,
+    ) -> PyResult<Option<PyObjectRef>> {
+        if let Some(attr) = self.inline_attr_get(name, interned, vm) {
+            return Ok(attr);
+        }
+        match self.dict() {
+            // `Py<PyStr>` rather than its `&Wtf8`: the key type carries the
+            // cached hash and compares interned keys by pointer.
+            Some(dict) => dict.get_item_opt(name, vm),
+            None => Ok(None),
+        }
+    }
+
+    /// Look `name` up among the inline attribute values.
+    ///
+    /// `None` when the object does not store its attributes inline (the dict
+    /// is authoritative then); `Some(None)` when the attribute is absent.
+    pub(crate) fn inline_attr_get(
+        &self,
+        name: &Py<PyStr>,
+        interned: Option<&'static PyStrInterned>,
+        vm: &VirtualMachine,
+    ) -> Option<Option<PyObjectRef>> {
+        let (dict, index) = self.inline_index(name, interned, false, vm)?;
+        match index {
+            Some(index) => dict.inline_get(index).ok(),
+            None => dict.is_inline().then_some(None),
+        }
+    }
+
+    /// Store or delete `name` among the inline attribute values.
+    ///
+    /// Hands the value back as `Err` when the attribute has to go to the dict
+    /// instead; the inline values are materialized first when the type's keys
+    /// have no room for `name`. On success returns the displaced value, and
+    /// for a delete whether the attribute existed.
+    pub(crate) fn inline_attr_set(
+        &self,
+        name: &Py<PyStr>,
+        interned: Option<&'static PyStrInterned>,
+        value: crate::function::PySetterValue,
+        vm: &VirtualMachine,
+    ) -> Result<(Option<PyObjectRef>, bool), crate::function::PySetterValue> {
+        use crate::function::PySetterValue;
+        let assign = matches!(value, PySetterValue::Assign(_));
+        let Some((dict, index)) = self.inline_index(name, interned, assign, vm) else {
+            return Err(value);
+        };
+        match (value, index) {
+            (PySetterValue::Assign(value), Some(index)) => dict
+                .inline_set(index, value)
+                .map(|old| (old, true))
+                .map_err(PySetterValue::Assign),
+            (value @ PySetterValue::Assign(_), None) => {
+                // No room left in the shared keys.
+                dict.disable_inline(self.shared_keys());
+                Err(value)
+            }
+            (PySetterValue::Delete, Some(index)) => match dict.inline_remove(index) {
+                Ok(old) => {
+                    let existed = old.is_some();
+                    Ok((old, existed))
+                }
+                Err(()) => Err(PySetterValue::Delete),
+            },
+            (PySetterValue::Delete, None) => {
+                if dict.is_inline() {
+                    Ok((None, false))
+                } else {
+                    Err(PySetterValue::Delete)
+                }
+            }
+        }
+    }
+
+    /// The inline value index `name` would be stored at, adding it to the
+    /// type's keys if needed; `None` unless the object stores inline and the
+    /// keys have room.
+    pub(crate) fn inline_store_index(&self, name: &'static PyStrInterned) -> Option<usize> {
+        let dict = self.instance_dict()?;
+        let keys = self.shared_keys()?;
+        if !dict.is_inline() {
+            return None;
+        }
+        keys.index_or_insert(name)
+    }
+
+    /// Probe inline value storage for `name` without materializing anything.
+    pub(crate) fn inline_probe(&self, name: &'static PyStrInterned) -> InlineProbe {
+        let (Some(dict), Some(keys)) = (self.instance_dict(), self.shared_keys()) else {
+            return InlineProbe::NotInline;
+        };
+        if !dict.is_inline() {
+            return InlineProbe::NotInline;
+        }
+        let Some(index) = keys.index_of(name) else {
+            return InlineProbe::Absent;
+        };
+        match dict.inline_get(index) {
+            Ok(Some(_)) => InlineProbe::Present(index),
+            Ok(None) => InlineProbe::Absent,
+            Err(()) => InlineProbe::NotInline,
+        }
+    }
+
+    /// Whether an inline attribute named `name` shadows a class attribute.
+    ///
+    /// `stamp` is a [`SharedKeys::stamp`] under which `name` was found absent
+    /// from the keys before. `None` when the object does not store inline.
+    #[inline]
+    pub(crate) fn inline_shadow(
+        &self,
+        name: &'static PyStrInterned,
+        stamp: usize,
+    ) -> Option<InlineShadow> {
+        let dict = self.instance_dict()?;
+        let keys = self.shared_keys()?;
+        // Take the stamp before probing so it attests the probed key set.
+        let current = keys.stamp();
+        if !dict.is_inline() {
+            return None;
+        }
+        if stamp == current {
+            return Some(InlineShadow::Absent(None));
+        }
+        let Some(index) = keys.index_of(name) else {
+            return Some(InlineShadow::Absent(Some(current)));
+        };
+        match dict.inline_get(index) {
+            Ok(Some(value)) => Some(InlineShadow::Present(value)),
+            Ok(None) => Some(InlineShadow::Absent(None)),
+            Err(()) => None,
+        }
     }
 
     /// Whether this object currently has an instance dict, without cloning it.
@@ -1751,8 +2263,7 @@ impl PyObject {
     /// still empty, which is what `dict().is_none()` reports.
     #[inline(always)]
     pub fn has_instance_dict(&self) -> bool {
-        self.instance_dict()
-            .is_some_and(|d| d.with(|dict| dict.is_some()))
+        self.instance_dict().is_some_and(InstanceDict::has_attrs)
     }
 
     /// Run `f` on the instance dict without cloning it; see [`InstanceDict::with`].
@@ -1762,7 +2273,7 @@ impl PyObject {
         f: impl FnOnce(Option<&Py<crate::builtins::PyDict>>) -> R,
     ) -> R {
         match self.instance_dict() {
-            Some(d) => d.with(f),
+            Some(d) => d.with(self.shared_keys(), f),
             None => f(None),
         }
     }
@@ -2246,8 +2757,10 @@ impl PyObject {
             let ext_ptr =
                 core::ptr::with_exposed_provenance_mut::<ObjExt>(self_addr.wrapping_sub(offset));
             let ext = unsafe { &mut *ext_ptr };
-            if let Some(dict_ref) = ext.dict.as_ref().and_then(|d| d.replace(None)) {
-                result.push(dict_ref.into());
+            if let Some(dict) = ext.dict.as_ref() {
+                let (dict_ref, values) = dict.take_all();
+                result.extend(dict_ref.map(Into::into));
+                result.extend(values.into_iter().flatten());
             }
             for slot in &ext.slots {
                 let value = slot.write().take();
@@ -2930,7 +3443,7 @@ pub(crate) fn init_type_hierarchy() -> BootstrapTypeHierarchy {
         alloc_ptr.expose_provenance();
 
         unsafe {
-            (alloc_ptr as *mut ObjExt).write(ObjExt::new(None, 0, true, false));
+            (alloc_ptr as *mut ObjExt).write(ObjExt::new(None, 0, true, false, false));
             (alloc_ptr.add(weakref_offset) as *mut WeakRefList).write(WeakRefList::new());
             alloc_ptr.add(inner_offset).cast()
         }
