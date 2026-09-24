@@ -124,6 +124,13 @@ impl OpArgState {
     pub const fn reset(&mut self) {
         self.state = 0
     }
+
+    /// Whether no `EXTENDED_ARG` prefix is pending.
+    #[inline(always)]
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.state == 0
+    }
 }
 
 /// Defines an enum whose variants map to fixed `u8` discriminants,
