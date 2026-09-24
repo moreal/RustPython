@@ -20,7 +20,7 @@
 //! # The `shared` word
 //!
 //! ```text
-//! [ signed count (usize::BITS - 4 bits) ][ LEAKED ][ PUBLISHED ][ 2-bit state ]
+//! [ signed count (usize::BITS - 5 bits) ][ IMMORTAL ][ LEAKED ][ PUBLISHED ][ 2-bit state ]
 //! ```
 //!
 //! The state is one of [`INIT`], [`MAYBE_WEAKREF`], [`QUEUED`] or [`MERGED`],
@@ -60,7 +60,11 @@ const MERGED: usize = 3;
 const PUBLISHED: usize = 1 << 2;
 /// The string pool owns this object (it is interned). Implies immortal.
 const LEAKED: usize = 1 << 3;
-const SHARED_SHIFT: u32 = 4;
+/// Set by [`RefCount::make_immortal`] next to `tid = IMMORTAL_TID`, so that
+/// a merge racing `make_immortal` sees it in the word it compares and
+/// swaps, and neither gives the object up nor reports it dead.
+const IMMORTAL: usize = 1 << 4;
+const SHARED_SHIFT: u32 = 5;
 const SHARED_ONE: usize = 1 << SHARED_SHIFT;
 
 /// `tid` of an object no thread owns: its count lives in `shared` alone.
@@ -617,6 +621,11 @@ impl RefCount {
         // then reads `shared`.
         self.tid.store(UNOWNED, Ordering::Relaxed);
         loop {
+            if shared & IMMORTAL != 0 {
+                // Immortalized by another thread while this one released.
+                self.tid.store(IMMORTAL_TID, Ordering::Relaxed);
+                return false;
+            }
             let new = (shared & !STATE_MASK) | MERGED;
             match self.shared.compare_exchange_weak(
                 shared,
@@ -658,7 +667,7 @@ impl RefCount {
                     if queue {
                         return self.queue_for_merge();
                     }
-                    if new & STATE_MASK == MERGED && shared_count(new) == 0 {
+                    if new & STATE_MASK == MERGED && shared_count(new) == 0 && new & IMMORTAL == 0 {
                         core::sync::atomic::fence(Ordering::Acquire);
                         return true;
                     }
@@ -710,7 +719,9 @@ impl RefCount {
         let mut shared = self.shared.load(Ordering::Relaxed);
         let count = loop {
             let count = shared_count(shared) + local + extra;
-            let new = ((count as usize) << SHARED_SHIFT) | (shared & (PUBLISHED | LEAKED)) | MERGED;
+            let new = ((count as usize) << SHARED_SHIFT)
+                | (shared & (PUBLISHED | LEAKED | IMMORTAL))
+                | MERGED;
             match self.shared.compare_exchange_weak(
                 shared,
                 new,
@@ -722,9 +733,12 @@ impl RefCount {
             }
         };
         self.local.store(0, Ordering::Release);
-        if self.tid.load(Ordering::Relaxed) != IMMORTAL_TID {
-            self.tid.store(UNOWNED, Ordering::Release);
+        if shared & IMMORTAL != 0 {
+            self.tid.store(IMMORTAL_TID, Ordering::Release);
+            // Never report an immortal object dead.
+            return count.max(1);
         }
+        self.tid.store(UNOWNED, Ordering::Release);
         debug_assert!(count >= 0);
         count
     }
@@ -775,14 +789,14 @@ impl RefCount {
     /// `strong_count() == 1` fast paths never fire on it and the collector
     /// treats it as a permanent root.
     ///
-    /// Must be called by the thread that owns the object (or on an unowned
-    /// one): an owner's in-flight `dec` could otherwise still deallocate it.
-    /// Idempotent.
+    /// The caller must hold a strong reference. Another thread may own the
+    /// object: the [`IMMORTAL`] flag goes into `shared` first, where the
+    /// owner's merge compare-and-swap sees it. Idempotent.
     pub fn make_immortal(&self) {
-        debug_assert!({
-            let tid = self.tid.load(Ordering::Relaxed);
-            tid == IMMORTAL_TID || tid == UNOWNED || tid == current_tid()
-        });
+        if self.tid.load(Ordering::Relaxed) == IMMORTAL_TID {
+            return;
+        }
+        self.shared.fetch_or(IMMORTAL, Ordering::AcqRel);
         self.tid.store(IMMORTAL_TID, Ordering::Release);
     }
 
@@ -887,6 +901,28 @@ mod tests {
         assert_eq!(raw(&rc), before);
         rc.make_immortal();
         assert_eq!(rc.get(), IMMORTAL_COUNT);
+    }
+
+    /// A static type may be immortalized by a thread that does not own it.
+    /// The owner's own releases must not then give it up or free it.
+    #[test]
+    fn immortalizing_from_another_thread_survives_the_owners_releases() {
+        let rc = RefCount::new();
+        rc.inc(); // the other thread's reference, counted locally
+        std::thread::scope(|s| s.spawn(|| rc.make_immortal()).join().unwrap());
+        assert!(rc.is_immortal());
+        assert!(!rc.dec());
+        assert!(!rc.dec());
+        assert!(!rc.dec());
+        assert!(rc.is_immortal());
+        assert_eq!(rc.get(), IMMORTAL_COUNT);
+
+        // The owner's merge racing the flag: `local` reaches zero with the
+        // flag already in `shared` but `tid` still naming the owner.
+        let rc = RefCount::new();
+        rc.shared.fetch_or(IMMORTAL, Ordering::Relaxed);
+        assert!(!rc.dec());
+        assert!(rc.is_immortal());
     }
 
     #[test]
