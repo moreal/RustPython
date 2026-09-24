@@ -3544,6 +3544,14 @@ impl VirtualMachine {
         #[cfg(feature = "threading")]
         thread::suspend_if_needed(&self.state);
 
+        // Merge the objects other threads handed back to this one (biased
+        // reference counting). They trip this thread's eval breaker through
+        // `stop_requested`, which `suspend_if_needed` just cleared.
+        #[cfg(feature = "threading")]
+        if crate::common::refcount::has_queued_objects() {
+            thread::merge_queued_objects();
+        }
+
         // Pass a QSBR checkpoint if requested (deferred memory reclamation).
         #[cfg(feature = "threading")]
         if crate::signal::qsbr_bit_set() && thread::qsbr_break_requested() {

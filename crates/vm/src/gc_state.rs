@@ -228,6 +228,44 @@ struct CollectStopTheWorld {
     restarted: bool,
 }
 
+/// Merge the biased reference counts other threads queued for their owners:
+/// this thread's own queue, and — with the world stopped, as CPython's
+/// collector does — the queues of threads parked at a safepoint or while
+/// blocked, which may not reach their eval breaker for a long time.
+/// Objects whose count reaches zero are freed once the world restarts.
+#[cfg(feature = "threading")]
+fn merge_queued_objects_for_collection() {
+    use crate::vm::thread::ThreadState;
+
+    crate::vm::thread::merge_queued_objects();
+    if !crate::common::refcount::others_have_queued_objects() {
+        return;
+    }
+    let mut dead = Vec::new();
+    let mut stw = CollectStopTheWorld::new();
+    for state in &stw.stopped {
+        let registry = state.thread_frames.lock();
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "Iteration order doesn't matter here"
+        )]
+        for slot in registry.values() {
+            if slot.state.load(Ordering::Acquire) == ThreadState::Suspended as i32 {
+                // SAFETY: the owner is parked until `restart` below.
+                unsafe {
+                    crate::common::refcount::merge_queued_objects_of(slot.refcount_owner, &mut dead)
+                };
+            }
+        }
+    }
+    stw.restart();
+    drop(stw);
+    for rc in dead {
+        // SAFETY: merged to zero; nothing else holds a reference.
+        unsafe { PyObject::dealloc_merged(rc) };
+    }
+}
+
 #[cfg(feature = "threading")]
 impl CollectStopTheWorld {
     /// Request stop-the-world on every live interpreter when the current thread
@@ -399,6 +437,9 @@ impl GcState {
         obj_ref.set_gc_tracked();
         obj_ref.set_gc_generation(0);
         obj_ref.set_gc_owner(owner);
+        // A collection or `gc.get_objects` on another thread takes a
+        // conditional reference to every tracked object.
+        obj_ref.set_maybe_weakref();
 
         self.generation_lists[0].write().push_front(obj);
         self.counts[0].fetch_add(1, Ordering::Relaxed);
@@ -423,6 +464,8 @@ impl GcState {
         obj_ref.init_gc_tracked_bit();
         obj_ref.set_gc_generation(0);
         obj_ref.set_gc_owner(owner);
+        // See `track_object`; the object is still private to this thread.
+        unsafe { obj_ref.set_maybe_weakref_unshared() };
 
         self.generation_lists[0].write().push_front(obj);
         self.counts[0].fetch_add(1, Ordering::Relaxed);
@@ -443,6 +486,7 @@ impl GcState {
             obj_ref.init_gc_tracked_bit();
             obj_ref.set_gc_generation(0);
             obj_ref.set_gc_owner(owner);
+            unsafe { obj_ref.set_maybe_weakref_unshared() };
         }
 
         {
@@ -581,6 +625,13 @@ impl GcState {
         let Some(_guard) = self.collecting.try_lock() else {
             return CollectResult::default();
         };
+
+        // References other threads handed back to their owners still count
+        // until merged, and would keep dead objects out of this collection.
+        // After the `collecting` lock: it stops the world, and two collectors
+        // stopping it at once would each wait for the other to park.
+        #[cfg(feature = "threading")]
+        merge_queued_objects_for_collection();
 
         let start_time = cfg_select! {
             target_arch = "wasm32" => (),
