@@ -39,6 +39,7 @@ use crate::{
 use alloc::fmt;
 use bstr::ByteSlice;
 use core::cell::UnsafeCell;
+use core::ops::ControlFlow;
 use core::ptr::NonNull;
 use core::sync::atomic;
 use core::sync::atomic::Ordering::{Acquire, Relaxed};
@@ -3549,92 +3550,16 @@ impl ExecutingFrame<'_> {
         // Zero (`CACHE`, never dispatched) marks "no predecessor yet".
         #[cfg(feature = "opcode-histogram")]
         let mut prev_op: u8 = 0;
-        loop {
-            // Advance lasti past the current instruction BEFORE firing the
-            // line event.  This ensures that f_lineno (which reads
-            // locations[lasti - 1]) returns the line of the instruction
-            // being traced, not the previous one. Stored from `idx` rather
-            // than read-modify-written, which would re-load what was just read.
-            lasti_cell.store(idx as u32 + 1, Relaxed);
-
-            // Read once and reuse for both the line-trace check below and
-            // the opcode-trace check after the instruction is decoded,
-            // instead of re-reading the Cell twice per instruction. This is
-            // safe even though the intervening trace_event call could in
-            // principle toggle it, because we refresh `tracing` below right
-            // after that call returns (that cold path is only taken when
-            // tracing was already on, so it costs nothing on the hot path).
-            let mut tracing = vm.use_tracing.get();
-
-            // Fire 'line' trace event when line number changes.
-            // Only fire if this frame has a per-frame trace function set
-            // (frames entered before sys.settrace() have trace=None).
-            // Skip RESUME – it should not generate user-visible line events.
-            // Skip NO_LOCATION units (addr2line == -1); the locations table
-            // fills those with a dummy line, which would emit a 'line'
-            // event whose f_lineno is None.
-            if tracing
-                && self.trace_is_set(vm)
-                && self.trace_lines_is_set()
-                && !matches!(
-                    self.code.instructions.read_op(idx),
-                    Instruction::Resume { .. } | Instruction::InstrumentedResume
-                )
-            {
-                let line = self.code.addr2line(idx as i32 * 2);
-                if line >= 0 && line as u32 != self.prev_line.get() {
-                    self.prev_line.set(line as u32);
-                    match vm.trace_event(crate::protocol::TraceEvent::Line, None) {
-                        Ok(_) => {}
-                        Err(exception) => {
-                            if let Some((loc, _end_loc)) = self.code.locations.get(idx) {
-                                let next = exception.__traceback__();
-                                let new_traceback = PyTraceback::new(
-                                    next,
-                                    self.frame_object(vm),
-                                    idx as u32 * 2,
-                                    loc.line,
-                                );
-                                exception.set_traceback(Some(new_traceback.into_ref(&vm.ctx)));
-                            }
-                            match self.unwind_blocks(
-                                vm,
-                                UnwindReason::Raising {
-                                    exception,
-                                    offset: idx as u32,
-                                },
-                            ) {
-                                Ok(None) => {
-                                    arg_state.reset();
-                                    idx = lasti_cell.load(Relaxed) as usize;
-                                    continue;
-                                }
-                                Ok(Some(value)) => break Ok(value),
-                                Err(e) => break Err(e),
-                            }
-                        }
-                    }
-                    // The trace callback may have toggled tracing (e.g. via
-                    // sys.settrace(None)); refresh before the opcode-trace check
-                    // below reuses this flag.
-                    tracing = vm.use_tracing.get();
-                    // Trace callback may have changed lasti via set_f_lineno.
-                    // Re-read and restart the loop from the new position.
-                    if lasti_cell.load(Relaxed) != (idx as u32 + 1) {
-                        // set_f_lineno defers stack unwinding because we hold
-                        // the state mutex.  Perform it now.
-                        let pops = self.pending_stack_pops();
-                        if pops > 0 {
-                            let from_stack = self.pending_unwind_from_stack();
-                            self.unwind_stack_for_lineno(pops as usize, from_stack, vm);
-                            self.set_pending_stack_pops(0);
-                        }
-                        arg_state.reset();
-                        idx = lasti_cell.load(Relaxed) as usize;
-                        continue;
-                    }
-                }
-            }
+        // Whether the next instruction may take the fast tier: not while
+        // `sys.settrace`/`sys.setprofile` is active on this thread (every
+        // instruction then goes through the general path, which fires the
+        // per-line and per-opcode events), nor after an EXTENDED_ARG prefix
+        // (the fast tier only decodes one-byte args). Only the general path
+        // runs arbitrary code that could turn tracing on, so this is
+        // recomputed after every general-path instruction, and by the fast
+        // tier after any drop that could have run a `__del__`.
+        let mut fast = !vm.use_tracing.get();
+        'dispatch: loop {
             // One aligned acquire load fetches opcode and arg together; two
             // separate atomic reads would force the instruction array pointer
             // to be re-loaded across the acquire barrier.
@@ -3642,178 +3567,523 @@ impl ExecutingFrame<'_> {
             // produced, so it is in bounds of the instruction array, and
             // `units_ptr` stays valid for as long as `self.code` is borrowed.
             let unit = unsafe { bytecode::CodeUnits::read_unit_from(units_ptr, idx) };
-            let op = unit.op;
-            let arg = arg_state.extend(unit.arg);
-            let mut do_extend_arg = false;
 
-            // f_lineno for a live (currently executing) frame is derived
-            // lazily from lasti/locations (see `FrameObject::lineno`) rather
-            // than maintained here on every instruction. lasti already
-            // points past the instruction currently executing (see the
-            // `self.lasti.store` above), so `locations[lasti - 1]` gives
-            // exactly the line of the in-flight instruction — the same
-            // value this unconditional prev_line write used to compute.
-            // prev_line itself is now only touched on the (cold) tracing
-            // path, where it deduplicates consecutive 'line' events.
-
-            if tracing {
-                // Fire 'opcode' trace event for sys.settrace when f_trace_opcodes
-                // is set. Skip RESUME and ExtendedArg
-                // (_Py_call_instrumentation_instruction).
-                if self.trace_is_set(vm)
-                    && self.trace_opcodes_is_set()
-                    && !matches!(
-                        op.into(),
-                        Opcode::Resume | Opcode::InstrumentedResume | Opcode::ExtendedArg
-                    )
-                {
-                    vm.trace_event(crate::protocol::TraceEvent::Opcode, None)?;
+            // Fast tier: a handful of simple, hot opcodes run right here and
+            // go straight to the next instruction. They skip everything the
+            // general path does around a handler: the `lasti` store, the
+            // tracing and eval-breaker checks, the `FrameResult` match and
+            // the inline-cache fixup, since each of them knows its successor
+            // statically. `lasti` is only written where something can observe
+            // it: before a drop that may run `__del__`, and at backward jumps
+            // (for `sys._current_frames()` samplers). Anything unusual (an
+            // unbound local, a non-bool condition, an iterator of another
+            // type, a pending eval breaker) breaks out before any side effect
+            // and the general path re-executes the instruction in full.
+            if fast {
+                'general: {
+                    let arg = bytecode::OpArg::new(u32::from(u8::from(unit.arg)));
+                    let next = idx + 1;
+                    // Release an entry the instruction consumed. The drop can
+                    // run a `__del__`, which may look at this frame's line or
+                    // switch tracing on, so `lasti` is brought up to date
+                    // first and the tracing flag re-read afterwards.
+                    macro_rules! release {
+                        ($value:expr) => {{
+                            let value = $value;
+                            if value.is_some() {
+                                lasti_cell.store(next as u32, Relaxed);
+                                drop(value);
+                                fast = !vm.use_tracing.get();
+                            }
+                        }};
+                    }
+                    let next_idx = match unit.op {
+                        Instruction::Nop | Instruction::NotTaken => next,
+                        Instruction::LoadFast { var_num } => {
+                            let Some(obj) = self.localsplus.fastlocals()[var_num.get(arg)].clone()
+                            else {
+                                break 'general;
+                            };
+                            self.push_value(obj);
+                            next
+                        }
+                        Instruction::LoadFastBorrow { var_num } => {
+                            if !self.try_push_local(var_num.get(arg).as_usize()) {
+                                break 'general;
+                            }
+                            next
+                        }
+                        Instruction::LoadFastBorrowLoadFastBorrow { var_nums } => {
+                            let (idx1, idx2) = var_nums.get(arg).indexes();
+                            let fastlocals = self.localsplus.fastlocals();
+                            if fastlocals[idx1].is_none() || fastlocals[idx2].is_none() {
+                                break 'general;
+                            }
+                            self.try_push_local(idx1.as_usize());
+                            self.try_push_local(idx2.as_usize());
+                            next
+                        }
+                        Instruction::StoreFast { var_num } => {
+                            // A NULL is allowed here: it is what a
+                            // LOAD_FAST_AND_CLEAR restore puts back.
+                            let value = self.pop_value_opt();
+                            let i = var_num.get(arg);
+                            self.localsplus.debug_audit_local_release(i.as_usize());
+                            let old =
+                                core::mem::replace(&mut self.localsplus.fastlocals_mut()[i], value);
+                            release!(old);
+                            next
+                        }
+                        Instruction::StoreFastLoadFast { var_nums } => {
+                            let (store_idx, load_idx) = var_nums.get(arg).indexes();
+                            let value = self.pop_value_opt();
+                            self.localsplus
+                                .debug_audit_local_release(store_idx.as_usize());
+                            let (old, load_value) = {
+                                let locals = self.localsplus.fastlocals_mut();
+                                let old = core::mem::replace(&mut locals[store_idx], value);
+                                (old, locals[load_idx].clone())
+                            };
+                            self.push_value_opt(load_value);
+                            release!(old);
+                            next
+                        }
+                        Instruction::StoreFastStoreFast { var_nums } => {
+                            let (idx1, idx2) = var_nums.get(arg).indexes();
+                            let value1 = self.pop_value_opt();
+                            let value2 = self.pop_value_opt();
+                            self.localsplus.debug_audit_local_release(idx1.as_usize());
+                            self.localsplus.debug_audit_local_release(idx2.as_usize());
+                            let fastlocals = self.localsplus.fastlocals_mut();
+                            let old1 = core::mem::replace(&mut fastlocals[idx1], value1);
+                            let old2 = core::mem::replace(&mut fastlocals[idx2], value2);
+                            release!(old1);
+                            release!(old2);
+                            next
+                        }
+                        Instruction::LoadSmallInt { i } => {
+                            let value = vm.ctx.cached_int(i.get(arg) as i32);
+                            // Cached small integers live as long as the
+                            // Context, so the stack can borrow them.
+                            unsafe { self.push_borrowed(value.as_object()) };
+                            next
+                        }
+                        Instruction::LoadConstMortal | Instruction::LoadConstImmortal => {
+                            let value = self.code.constants[u32::from(arg).into()].clone();
+                            self.push_value(value.into());
+                            next
+                        }
+                        Instruction::PushNull => {
+                            self.push_null();
+                            next
+                        }
+                        Instruction::PopTop | Instruction::EndFor | Instruction::PopIter => {
+                            release!(self.pop_stackref_opt());
+                            next
+                        }
+                        Instruction::Copy { i } => {
+                            let i = i.get(arg) as usize;
+                            let stack_len = self.localsplus.stack_len();
+                            debug_assert!(stack_len >= i, "COPY: stack underflow");
+                            let value = self.localsplus.stack_index(stack_len - i).cloned();
+                            self.push_stackref_opt(value);
+                            next
+                        }
+                        Instruction::Swap { i } => {
+                            let len = self.localsplus.stack_len();
+                            let i = i.get(arg) as usize;
+                            debug_assert!(i <= len && len > 0, "SWAP: stack underflow");
+                            self.localsplus.stack_swap(len - 1, len - i);
+                            next
+                        }
+                        Instruction::JumpForward { .. } => next + u32::from(arg) as usize,
+                        Instruction::JumpBackwardNoJit | Instruction::JumpBackwardJit => {
+                            // Loops are where a pending signal, GC or
+                            // stop-the-world request must be noticed.
+                            if vm.eval_breaker_tripped() {
+                                break 'general;
+                            }
+                            lasti_cell.store(next as u32, Relaxed);
+                            next + Instruction::JumpBackwardNoJit.cache_entries()
+                                - u32::from(arg) as usize
+                        }
+                        Instruction::JumpBackwardNoInterrupt { .. } => {
+                            next - u32::from(arg) as usize
+                        }
+                        Instruction::PopJumpIfFalse { .. } | Instruction::PopJumpIfTrue { .. } => {
+                            let top = self.top_value();
+                            let value = if top.is(&vm.ctx.true_value) {
+                                true
+                            } else if top.is(&vm.ctx.false_value) {
+                                false
+                            } else {
+                                break 'general;
+                            };
+                            // `True`/`False` live as long as the Context, so
+                            // dropping the entry cannot run any code.
+                            drop(self.pop_stackref_opt());
+                            let flag = matches!(unit.op, Instruction::PopJumpIfTrue { .. });
+                            let fallthrough = next + unit.op.cache_entries();
+                            if value == flag {
+                                fallthrough + u32::from(arg) as usize
+                            } else {
+                                self.not_taken_skipped(fallthrough as u32) as usize
+                            }
+                        }
+                        Instruction::PopJumpIfNone { .. }
+                        | Instruction::PopJumpIfNotNone { .. } => {
+                            let value = self.pop_stackref_opt();
+                            let is_none = value.as_ref().is_some_and(|v| vm.is_none(v));
+                            release!(value);
+                            let flag = matches!(unit.op, Instruction::PopJumpIfNone { .. });
+                            let fallthrough = next + unit.op.cache_entries();
+                            if is_none == flag {
+                                fallthrough + u32::from(arg) as usize
+                            } else {
+                                self.not_taken_skipped(fallthrough as u32) as usize
+                            }
+                        }
+                        Instruction::ForIterRange => {
+                            let iter = self.top_value();
+                            let Some(range_iter) =
+                                iter.downcast_ref_if_exact::<PyRangeIterator>(vm)
+                            else {
+                                break 'general;
+                            };
+                            match range_iter.fast_next() {
+                                Some(value) => {
+                                    self.push_value(vm.ctx.new_int(value).into());
+                                    next + unit.op.cache_entries()
+                                }
+                                None => self.for_iter_exhausted_target(
+                                    (next + unit.op.cache_entries()) as u32 + u32::from(arg),
+                                ) as usize,
+                            }
+                        }
+                        Instruction::ForIterList => {
+                            let iter = self.top_value();
+                            let Some(list_iter) = iter.downcast_ref_if_exact::<PyListIterator>(vm)
+                            else {
+                                break 'general;
+                            };
+                            match list_iter.fast_next() {
+                                Some(value) => {
+                                    self.push_value(value);
+                                    next + unit.op.cache_entries()
+                                }
+                                None => self.for_iter_exhausted_target(
+                                    (next + unit.op.cache_entries()) as u32 + u32::from(arg),
+                                ) as usize,
+                            }
+                        }
+                        Instruction::ForIterTuple => {
+                            let iter = self.top_value();
+                            let Some(tuple_iter) =
+                                iter.downcast_ref_if_exact::<PyTupleIterator>(vm)
+                            else {
+                                break 'general;
+                            };
+                            match tuple_iter.fast_next() {
+                                Some(value) => {
+                                    self.push_value(value);
+                                    next + unit.op.cache_entries()
+                                }
+                                None => self.for_iter_exhausted_target(
+                                    (next + unit.op.cache_entries()) as u32 + u32::from(arg),
+                                ) as usize,
+                            }
+                        }
+                        _ => break 'general,
+                    };
+                    #[cfg(feature = "opcode-histogram")]
+                    {
+                        let op_byte = u8::from(unit.op);
+                        crate::opcode_histogram::record(prev_op, op_byte);
+                        prev_op = op_byte;
+                    }
+                    idx = next_idx;
+                    continue 'dispatch;
                 }
             }
 
-            // The body is out of line so that the signal/QSBR/GC code it
-            // pulls in does not sit inside the dispatch loop, where it
-            // inflates register pressure (and hence per-instruction spills)
-            // for every opcode.
-            #[cold]
-            #[inline(never)]
-            fn eval_breaker_work(vm: &VirtualMachine) -> PyResult<()> {
-                vm.check_signals()?;
-                // Run a scheduled automatic collection here — a safepoint with
-                // no interpreter locks held — instead of synchronously inside
-                // the allocation that tripped the threshold.
-                #[cfg(feature = "threading")]
-                vm.run_scheduled_gc();
-                Ok(())
-            }
-            if vm.eval_breaker_tripped()
-                && let Err(exception) = eval_breaker_work(vm)
-            {
-                #[cold]
-                fn handle_signal_exception(
-                    frame: &mut ExecutingFrame<'_>,
-                    exception: PyBaseExceptionRef,
-                    idx: usize,
-                    vm: &VirtualMachine,
-                ) -> FrameResult {
-                    if let Some((loc, _end_loc)) = frame.code.locations.get(idx) {
-                        let next = exception.__traceback__();
-                        let new_traceback = PyTraceback::new(
-                            next,
-                            frame.frame_object(vm),
-                            idx as u32 * 2,
-                            loc.line,
-                        );
-                        exception.set_traceback(Some(new_traceback.into_ref(&vm.ctx)));
-                    }
-                    vm.contextualize_exception(&exception);
-                    frame.unwind_blocks(
-                        vm,
-                        UnwindReason::Raising {
-                            exception,
-                            offset: idx as u32,
-                        },
-                    )
+            match self.run_general(
+                vm,
+                idx,
+                unit,
+                &mut arg_state,
+                #[cfg(feature = "opcode-histogram")]
+                &mut prev_op,
+            ) {
+                ControlFlow::Continue(next_idx) => {
+                    idx = next_idx;
+                    // The instruction may have switched tracing on (a call
+                    // into `sys.settrace`, pdb's `set_trace`, ...), or left
+                    // an EXTENDED_ARG prefix for the next one.
+                    fast = !vm.use_tracing.get() && arg_state.is_empty();
                 }
-                match handle_signal_exception(self, exception, idx, vm) {
-                    Ok(None) => {}
-                    Ok(Some(value)) => {
-                        break Ok(value);
-                    }
+                ControlFlow::Break(result) => return result,
+            }
+        }
+    }
+
+    /// Whether the general path checks the eval breaker after this instruction.
+    #[inline(always)]
+    fn checks_eval_breaker(op: Instruction) -> bool {
+        const SITES: [bool; 256] = {
+            let sites = [
+                Opcode::Resume,
+                Opcode::ResumeCheck,
+                Opcode::InstrumentedResume,
+                Opcode::JumpBackward,
+                Opcode::JumpBackwardJit,
+                Opcode::JumpBackwardNoJit,
+                Opcode::InstrumentedJumpBackward,
+                Opcode::Call,
+                Opcode::CallKw,
+                Opcode::CallFunctionEx,
+                Opcode::CallAllocAndEnterInit,
+                Opcode::CallBoundMethodExactArgs,
+                Opcode::CallBoundMethodGeneral,
+                Opcode::CallBuiltinClass,
+                Opcode::CallBuiltinFast,
+                Opcode::CallBuiltinFastWithKeywords,
+                Opcode::CallBuiltinO,
+                Opcode::CallIsinstance,
+                Opcode::CallKwBoundMethod,
+                Opcode::CallKwNonPy,
+                Opcode::CallKwPy,
+                Opcode::CallLen,
+                Opcode::CallListAppend,
+                Opcode::CallMethodDescriptorFast,
+                Opcode::CallMethodDescriptorFastWithKeywords,
+                Opcode::CallMethodDescriptorNoargs,
+                Opcode::CallMethodDescriptorO,
+                Opcode::CallNonPyGeneral,
+                Opcode::CallPyExactArgs,
+                Opcode::CallPyGeneral,
+                Opcode::CallStr1,
+                Opcode::CallTuple1,
+                Opcode::CallType1,
+                Opcode::InstrumentedCall,
+                Opcode::InstrumentedCallKw,
+                Opcode::InstrumentedCallFunctionEx,
+            ];
+            let mut table = [false; 256];
+            let mut i = 0;
+            while i < sites.len() {
+                table[sites[i] as usize] = true;
+                i += 1;
+            }
+            table
+        };
+        SITES[u8::from(op) as usize]
+    }
+
+    /// The general path of the dispatch loop: one instruction with all the
+    /// bookkeeping the fast tier in [`Self::run`] skips (the `lasti` store,
+    /// tracing events, the eval breaker, the `FrameResult` of the handler,
+    /// exception unwinding).
+    ///
+    /// Returns the index of the next instruction, or the frame's result.
+    #[inline(always)]
+    fn run_general(
+        &mut self,
+        vm: &VirtualMachine,
+        idx: usize,
+        mut unit: bytecode::CodeUnit,
+        arg_state: &mut bytecode::OpArgState,
+        #[cfg(feature = "opcode-histogram")] prev_op: &mut u8,
+    ) -> ControlFlow<PyResult<ExecutionResult>, usize> {
+        let lasti_cell = self.lasti;
+        // Advance lasti past the current instruction BEFORE firing the
+        // line event.  This ensures that f_lineno (which reads
+        // locations[lasti - 1]) returns the line of the instruction
+        // being traced, not the previous one. Stored from `idx` rather
+        // than read-modify-written, which would re-load what was just read.
+        lasti_cell.store(idx as u32 + 1, Relaxed);
+
+        // Read once and reuse for both the line-trace check below and
+        // the opcode-trace check after the instruction is decoded,
+        // instead of re-reading the Cell twice per instruction. This is
+        // safe even though the intervening trace_event call could in
+        // principle toggle it, because we refresh `tracing` below right
+        // after that call returns (that cold path is only taken when
+        // tracing was already on, so it costs nothing on the hot path).
+        let mut tracing = vm.use_tracing.get();
+
+        // Fire 'line' trace event when line number changes.
+        // Only fire if this frame has a per-frame trace function set
+        // (frames entered before sys.settrace() have trace=None).
+        // Skip RESUME – it should not generate user-visible line events.
+        // Skip NO_LOCATION units (addr2line == -1); the locations table
+        // fills those with a dummy line, which would emit a 'line'
+        // event whose f_lineno is None.
+        if tracing
+            && self.trace_is_set(vm)
+            && self.trace_lines_is_set()
+            && !matches!(
+                self.code.instructions.read_op(idx),
+                Instruction::Resume { .. } | Instruction::InstrumentedResume
+            )
+        {
+            let line = self.code.addr2line(idx as i32 * 2);
+            if line >= 0 && line as u32 != self.prev_line.get() {
+                self.prev_line.set(line as u32);
+                match vm.trace_event(crate::protocol::TraceEvent::Line, None) {
+                    Ok(_) => {}
                     Err(exception) => {
-                        break Err(exception);
+                        if let Some((loc, _end_loc)) = self.code.locations.get(idx) {
+                            let next = exception.__traceback__();
+                            let new_traceback = PyTraceback::new(
+                                next,
+                                self.frame_object(vm),
+                                idx as u32 * 2,
+                                loc.line,
+                            );
+                            exception.set_traceback(Some(new_traceback.into_ref(&vm.ctx)));
+                        }
+                        match self.unwind_blocks(
+                            vm,
+                            UnwindReason::Raising {
+                                exception,
+                                offset: idx as u32,
+                            },
+                        ) {
+                            Ok(None) => {
+                                arg_state.reset();
+                                return ControlFlow::Continue(lasti_cell.load(Relaxed) as usize);
+                            }
+                            Ok(Some(value)) => return ControlFlow::Break(Ok(value)),
+                            Err(e) => return ControlFlow::Break(Err(e)),
+                        }
                     }
                 }
-                // The handler this unwound to starts a fresh instruction,
-                // so drop any EXTENDED_ARG prefix collected for the one
-                // the signal interrupted — the loop's own reset at the
-                // bottom is skipped by this `continue`.
-                arg_state.reset();
-                idx = lasti_cell.load(Relaxed) as usize;
-                continue;
-            }
-            // lasti was just stored as `idx + 1` above and nothing between
-            // there and here writes it, so the pre-dispatch value is known
-            // without an extra atomic load.
-            let lasti_before = idx as u32 + 1;
-            #[cfg(feature = "opcode-histogram")]
-            {
-                let op_byte = u8::from(op);
-                crate::opcode_histogram::record(prev_op, op_byte);
-                prev_op = op_byte;
-            }
-            let result = self.execute_instruction(op, arg, &mut do_extend_arg, vm);
-            // Skip inline cache entries if instruction fell through (no jump).
-            // `cache_entries()` is a table lookup, so it is done here rather
-            // than before dispatch: computing it up front kept the count live
-            // across the whole handler and cost a spill and a reload of it on
-            // every instruction.
-            let caches = op.cache_entries();
-            let mut next_idx = lasti_cell.load(Relaxed);
-            if caches > 0 && next_idx == lasti_before {
-                next_idx = lasti_before + caches as u32;
-                lasti_cell.store(next_idx, Relaxed);
-            }
-            match result {
-                Ok(None) => {}
-                Ok(Some(value)) => {
-                    break Ok(value);
+                // The trace callback may have toggled tracing (e.g. via
+                // sys.settrace(None)); refresh before the opcode-trace check
+                // below reuses this flag.
+                tracing = vm.use_tracing.get();
+                // Trace callback may have changed lasti via set_f_lineno.
+                // Re-read and restart the loop from the new position.
+                if lasti_cell.load(Relaxed) != (idx as u32 + 1) {
+                    // set_f_lineno defers stack unwinding because we hold
+                    // the state mutex.  Perform it now.
+                    let pops = self.pending_stack_pops();
+                    if pops > 0 {
+                        let from_stack = self.pending_unwind_from_stack();
+                        self.unwind_stack_for_lineno(pops as usize, from_stack, vm);
+                        self.set_pending_stack_pops(0);
+                    }
+                    arg_state.reset();
+                    return ControlFlow::Continue(lasti_cell.load(Relaxed) as usize);
                 }
-                // Instruction raised an exception
-                Err(exception) => {
+            }
+        }
+        // A trace callback may have re-instrumented this code object, so
+        // the unit fetched at the top is only reused when none ran.
+        if tracing {
+            // SAFETY: as for the fetch at the top of the loop.
+            unit = unsafe {
+                bytecode::CodeUnits::read_unit_from(self.code.instructions.units_ptr(), idx)
+            };
+        }
+        let op = unit.op;
+        let arg = arg_state.extend(unit.arg);
+        let mut do_extend_arg = false;
+
+        // f_lineno for a live (currently executing) frame is derived
+        // lazily from lasti/locations (see `FrameObject::lineno`) rather
+        // than maintained here on every instruction. lasti already
+        // points past the instruction currently executing (see the
+        // `self.lasti.store` above), so `locations[lasti - 1]` gives
+        // exactly the line of the in-flight instruction — the same
+        // value this unconditional prev_line write used to compute.
+        // prev_line itself is now only touched on the (cold) tracing
+        // path, where it deduplicates consecutive 'line' events.
+
+        if tracing {
+            // Fire 'opcode' trace event for sys.settrace when f_trace_opcodes
+            // is set. Skip RESUME and ExtendedArg
+            // (_Py_call_instrumentation_instruction).
+            if self.trace_is_set(vm)
+                && self.trace_opcodes_is_set()
+                && !matches!(
+                    op.into(),
+                    Opcode::Resume | Opcode::InstrumentedResume | Opcode::ExtendedArg
+                )
+                && let Err(e) = vm.trace_event(crate::protocol::TraceEvent::Opcode, None)
+            {
+                return ControlFlow::Break(Err(e));
+            }
+        }
+
+        // lasti was just stored as `idx + 1` above and nothing between
+        // there and here writes it, so the pre-dispatch value is known
+        // without an extra atomic load.
+        let lasti_before = idx as u32 + 1;
+        #[cfg(feature = "opcode-histogram")]
+        {
+            let op_byte = u8::from(op);
+            crate::opcode_histogram::record(*prev_op, op_byte);
+            *prev_op = op_byte;
+        }
+        let result = self.execute_instruction(op, arg, &mut do_extend_arg, vm);
+        // Skip inline cache entries if instruction fell through (no jump).
+        // `cache_entries()` is a table lookup, so it is done here rather
+        // than before dispatch: computing it up front kept the count live
+        // across the whole handler and cost a spill and a reload of it on
+        // every instruction.
+        let caches = op.cache_entries();
+        let mut next_idx = lasti_cell.load(Relaxed);
+        if caches > 0 && next_idx == lasti_before {
+            next_idx = lasti_before + caches as u32;
+            lasti_cell.store(next_idx, Relaxed);
+        }
+        match result {
+            Ok(None) => {
+                // Pending signals, a scheduled GC and stop-the-world requests
+                // are serviced once the instruction has completed, at the
+                // same points CPython checks its eval breaker: RESUME,
+                // backward jumps and calls. That bounds the delay to a
+                // stretch of straight-line code, and still runs a handler
+                // for a signal a call raised (`os.kill(os.getpid(), ...)`)
+                // before the next statement.
+                // The body is out of line so that the signal/QSBR/GC code it
+                // pulls in does not sit inside the dispatch loop, where it
+                // inflates register pressure (and hence per-instruction spills)
+                // for every opcode.
+                #[cold]
+                #[inline(never)]
+                fn eval_breaker_work(vm: &VirtualMachine) -> PyResult<()> {
+                    vm.check_signals()?;
+                    // Run a scheduled automatic collection here — a safepoint with
+                    // no interpreter locks held — instead of synchronously inside
+                    // the allocation that tripped the threshold.
+                    #[cfg(feature = "threading")]
+                    vm.run_scheduled_gc();
+                    Ok(())
+                }
+                if Self::checks_eval_breaker(op)
+                    && vm.eval_breaker_tripped()
+                    && let Err(exception) = eval_breaker_work(vm)
+                {
                     #[cold]
-                    fn handle_exception(
+                    fn handle_signal_exception(
                         frame: &mut ExecutingFrame<'_>,
                         exception: PyBaseExceptionRef,
                         idx: usize,
-                        is_reraise: bool,
-                        is_new_raise: bool,
                         vm: &VirtualMachine,
                     ) -> FrameResult {
-                        // 1. Extract traceback from exception's '__traceback__' attr.
-                        // 2. Add new entry with current execution position (filename, lineno, code_object) to traceback.
-                        // 3. First, try to find handler in exception table
-
-                        // RERAISE instructions should not add traceback entries - they're just
-                        // re-raising an already-processed exception
-                        if !is_reraise {
-                            // Check if the exception already has traceback entries before
-                            // we add ours. If it does, it was propagated from a callee
-                            // function and we should not re-contextualize it.
-                            let had_prior_traceback = exception.__traceback__().is_some();
-
-                            // PyTraceBack_Here always adds a new entry without
-                            // checking for duplicates. Each time an exception passes through
-                            // a frame (e.g., in a loop with repeated raise statements),
-                            // a new traceback entry is added.
-                            if let Some((loc, _end_loc)) = frame.code.locations.get(idx) {
-                                let next = exception.__traceback__();
-
-                                let new_traceback = PyTraceback::new(
-                                    next,
-                                    frame.frame_object(vm),
-                                    idx as u32 * 2,
-                                    loc.line,
-                                );
-                                vm_trace!(
-                                    "Adding to traceback: {:?} {:?}",
-                                    new_traceback,
-                                    loc.line
-                                );
-                                exception.set_traceback(Some(new_traceback.into_ref(&vm.ctx)));
-                            }
-
-                            // _PyErr_SetObject sets __context__ only when the exception
-                            // is first raised. When an exception propagates through frames,
-                            // __context__ must not be overwritten. We contextualize when:
-                            // - It's an explicit raise (raise/raise from)
-                            // - The exception had no prior traceback (originated here)
-                            if is_new_raise || !had_prior_traceback {
-                                vm.contextualize_exception(&exception);
-                            }
+                        if let Some((loc, _end_loc)) = frame.code.locations.get(idx) {
+                            let next = exception.__traceback__();
+                            let new_traceback = PyTraceback::new(
+                                next,
+                                frame.frame_object(vm),
+                                idx as u32 * 2,
+                                loc.line,
+                            );
+                            exception.set_traceback(Some(new_traceback.into_ref(&vm.ctx)));
                         }
-
-                        // Use exception table for zero-cost exception handling
+                        vm.contextualize_exception(&exception);
                         frame.unwind_blocks(
                             vm,
                             UnwindReason::Raising {
@@ -3822,99 +4092,174 @@ impl ExecutingFrame<'_> {
                             },
                         )
                     }
+                    match handle_signal_exception(self, exception, idx, vm) {
+                        Ok(None) => {}
+                        Ok(Some(value)) => {
+                            return ControlFlow::Break(Ok(value));
+                        }
+                        Err(exception) => {
+                            return ControlFlow::Break(Err(exception));
+                        }
+                    }
+                    // The handler this unwound to starts a fresh instruction.
+                    arg_state.reset();
+                    return ControlFlow::Continue(lasti_cell.load(Relaxed) as usize);
+                }
+            }
+            Ok(Some(value)) => {
+                return ControlFlow::Break(Ok(value));
+            }
+            // Instruction raised an exception
+            Err(exception) => {
+                #[cold]
+                fn handle_exception(
+                    frame: &mut ExecutingFrame<'_>,
+                    exception: PyBaseExceptionRef,
+                    idx: usize,
+                    is_reraise: bool,
+                    is_new_raise: bool,
+                    vm: &VirtualMachine,
+                ) -> FrameResult {
+                    // 1. Extract traceback from exception's '__traceback__' attr.
+                    // 2. Add new entry with current execution position (filename, lineno, code_object) to traceback.
+                    // 3. First, try to find handler in exception table
 
-                    // Check if this is a RERAISE instruction
-                    // Both AnyInstruction::Raise { kind: Reraise/ReraiseFromStack } and
-                    // AnyInstruction::Reraise are reraise operations that should not add
-                    // new traceback entries.
-                    // EndAsyncFor and CleanupThrow also re-raise non-matching exceptions.
-                    let is_reraise = match op {
-                        Instruction::RaiseVarargs { argc: kind } => matches!(
+                    // RERAISE instructions should not add traceback entries - they're just
+                    // re-raising an already-processed exception
+                    if !is_reraise {
+                        // Check if the exception already has traceback entries before
+                        // we add ours. If it does, it was propagated from a callee
+                        // function and we should not re-contextualize it.
+                        let had_prior_traceback = exception.__traceback__().is_some();
+
+                        // PyTraceBack_Here always adds a new entry without
+                        // checking for duplicates. Each time an exception passes through
+                        // a frame (e.g., in a loop with repeated raise statements),
+                        // a new traceback entry is added.
+                        if let Some((loc, _end_loc)) = frame.code.locations.get(idx) {
+                            let next = exception.__traceback__();
+
+                            let new_traceback = PyTraceback::new(
+                                next,
+                                frame.frame_object(vm),
+                                idx as u32 * 2,
+                                loc.line,
+                            );
+                            vm_trace!("Adding to traceback: {:?} {:?}", new_traceback, loc.line);
+                            exception.set_traceback(Some(new_traceback.into_ref(&vm.ctx)));
+                        }
+
+                        // _PyErr_SetObject sets __context__ only when the exception
+                        // is first raised. When an exception propagates through frames,
+                        // __context__ must not be overwritten. We contextualize when:
+                        // - It's an explicit raise (raise/raise from)
+                        // - The exception had no prior traceback (originated here)
+                        if is_new_raise || !had_prior_traceback {
+                            vm.contextualize_exception(&exception);
+                        }
+                    }
+
+                    // Use exception table for zero-cost exception handling
+                    frame.unwind_blocks(
+                        vm,
+                        UnwindReason::Raising {
+                            exception,
+                            offset: idx as u32,
+                        },
+                    )
+                }
+
+                // Check if this is a RERAISE instruction
+                // Both AnyInstruction::Raise { kind: Reraise/ReraiseFromStack } and
+                // AnyInstruction::Reraise are reraise operations that should not add
+                // new traceback entries.
+                // EndAsyncFor and CleanupThrow also re-raise non-matching exceptions.
+                let is_reraise = match op {
+                    Instruction::RaiseVarargs { argc: kind } => matches!(
+                        kind.get(arg),
+                        bytecode::RaiseKind::BareRaise | bytecode::RaiseKind::ReraiseFromStack
+                    ),
+                    Instruction::Reraise { .. }
+                    | Instruction::EndAsyncFor
+                    | Instruction::CleanupThrow => true,
+                    _ => false,
+                };
+
+                // Explicit raise instructions (raise/raise from) - these always
+                // need contextualization even if the exception has prior traceback
+                let is_new_raise = matches!(
+                    op,
+                    Instruction::RaiseVarargs { argc: kind }
+                        if matches!(
                             kind.get(arg),
-                            bytecode::RaiseKind::BareRaise | bytecode::RaiseKind::ReraiseFromStack
-                        ),
-                        Instruction::Reraise { .. }
-                        | Instruction::EndAsyncFor
-                        | Instruction::CleanupThrow => true,
-                        _ => false,
-                    };
+                            bytecode::RaiseKind::Raise | bytecode::RaiseKind::RaiseCause
+                        )
+                );
 
-                    // Explicit raise instructions (raise/raise from) - these always
-                    // need contextualization even if the exception has prior traceback
-                    let is_new_raise = matches!(
-                        op,
-                        Instruction::RaiseVarargs { argc: kind }
-                            if matches!(
-                                kind.get(arg),
-                                bytecode::RaiseKind::Raise | bytecode::RaiseKind::RaiseCause
-                            )
-                    );
-
-                    // Fire RAISE or RERAISE monitoring event.
-                    // If the callback raises, replace the original exception.
-                    let exception = {
-                        let mon_events = vm.state.monitoring_events.load();
-                        if is_reraise {
-                            if mon_events & MonitoringEvent::Reraise.mask() != 0 {
-                                let offset = idx as u32 * 2;
-                                let exc_obj: PyObjectRef = exception.clone().into();
-                                match monitoring::fire_reraise(vm, self.code, offset, &exc_obj) {
-                                    Ok(()) => exception,
-                                    Err(monitor_exc) => monitor_exc,
-                                }
-                            } else {
-                                exception
-                            }
-                        } else if mon_events & MonitoringEvent::Raise.mask() != 0 {
+                // Fire RAISE or RERAISE monitoring event.
+                // If the callback raises, replace the original exception.
+                let exception = {
+                    let mon_events = vm.state.monitoring_events.load();
+                    if is_reraise {
+                        if mon_events & MonitoringEvent::Reraise.mask() != 0 {
                             let offset = idx as u32 * 2;
                             let exc_obj: PyObjectRef = exception.clone().into();
-                            match monitoring::fire_raise(vm, self.code, offset, &exc_obj) {
+                            match monitoring::fire_reraise(vm, self.code, offset, &exc_obj) {
                                 Ok(()) => exception,
                                 Err(monitor_exc) => monitor_exc,
                             }
                         } else {
                             exception
                         }
-                    };
-
-                    // Fire 'exception' trace event for sys.settrace.
-                    // Only for new raises, not re-raises (matching the
-                    // `error` label that calls _PyEval_MonitorRaise).
-                    if !is_reraise {
-                        self.fire_exception_trace(&exception, vm)?;
-                    }
-
-                    match handle_exception(self, exception, idx, is_reraise, is_new_raise, vm) {
-                        // The handler unwound to a new position, so the next
-                        // index is whatever it left in the frame.
-                        Ok(None) => next_idx = lasti_cell.load(Relaxed),
-                        Ok(Some(result)) => break Ok(result),
-                        Err(exception) => {
-                            // Fire PY_UNWIND: exception escapes this frame
-                            let exception = if vm.state.monitoring_events.load()
-                                & MonitoringEvent::PyUnwind.mask()
-                                != 0
-                            {
-                                let offset = idx as u32 * 2;
-                                let exc_obj: PyObjectRef = exception.clone().into();
-                                match monitoring::fire_py_unwind(vm, self.code, offset, &exc_obj) {
-                                    Ok(()) => exception,
-                                    Err(monitor_exc) => monitor_exc,
-                                }
-                            } else {
-                                exception
-                            };
-
-                            break Err(exception);
+                    } else if mon_events & MonitoringEvent::Raise.mask() != 0 {
+                        let offset = idx as u32 * 2;
+                        let exc_obj: PyObjectRef = exception.clone().into();
+                        match monitoring::fire_raise(vm, self.code, offset, &exc_obj) {
+                            Ok(()) => exception,
+                            Err(monitor_exc) => monitor_exc,
                         }
+                    } else {
+                        exception
+                    }
+                };
+
+                // Fire 'exception' trace event for sys.settrace.
+                // Only for new raises, not re-raises (matching the
+                // `error` label that calls _PyEval_MonitorRaise).
+                if !is_reraise && let Err(e) = self.fire_exception_trace(&exception, vm) {
+                    return ControlFlow::Break(Err(e));
+                }
+
+                match handle_exception(self, exception, idx, is_reraise, is_new_raise, vm) {
+                    // The handler unwound to a new position, so the next
+                    // index is whatever it left in the frame.
+                    Ok(None) => next_idx = lasti_cell.load(Relaxed),
+                    Ok(Some(result)) => return ControlFlow::Break(Ok(result)),
+                    Err(exception) => {
+                        // Fire PY_UNWIND: exception escapes this frame
+                        let exception = if vm.state.monitoring_events.load()
+                            & MonitoringEvent::PyUnwind.mask()
+                            != 0
+                        {
+                            let offset = idx as u32 * 2;
+                            let exc_obj: PyObjectRef = exception.clone().into();
+                            match monitoring::fire_py_unwind(vm, self.code, offset, &exc_obj) {
+                                Ok(()) => exception,
+                                Err(monitor_exc) => monitor_exc,
+                            }
+                        } else {
+                            exception
+                        };
+
+                        return ControlFlow::Break(Err(exception));
                     }
                 }
             }
-            if !do_extend_arg {
-                arg_state.reset()
-            }
-            idx = next_idx as usize;
         }
+        if !do_extend_arg {
+            arg_state.reset()
+        }
+        ControlFlow::Continue(next_idx as usize)
     }
 
     fn yield_from_target(&self) -> Option<&PyObject> {
@@ -11767,20 +12112,25 @@ impl ExecutingFrame<'_> {
     /// Handle iterator exhaustion in specialized FOR_ITER handlers.
     /// Skips END_FOR if present at target and jumps.
     fn for_iter_jump_on_exhausted(&mut self, target: bytecode::Label) {
-        let target_idx = target.as_usize();
-        let jump_target = if let Some(unit) = self.code.instructions.get(target_idx) {
-            if matches!(
-                unit.op,
-                bytecode::Instruction::EndFor | bytecode::Instruction::InstrumentedEndFor
-            ) {
-                bytecode::Label::from_u32(target.as_u32() + 1)
-            } else {
-                target
+        let jump_target = self.for_iter_exhausted_target(target.as_u32());
+        self.jump(bytecode::Label::from_u32(jump_target));
+    }
+
+    /// Where an exhausted specialized FOR_ITER continues: `target`, or one
+    /// past it when it names the loop's END_FOR.
+    #[inline(always)]
+    fn for_iter_exhausted_target(&self, target: u32) -> u32 {
+        match self.code.instructions.get(target as usize) {
+            Some(unit)
+                if matches!(
+                    unit.op,
+                    bytecode::Instruction::EndFor | bytecode::Instruction::InstrumentedEndFor
+                ) =>
+            {
+                target + 1
             }
-        } else {
-            target
-        };
-        self.jump(jump_target);
+            _ => target,
+        }
     }
 
     fn specialize_load_global(
@@ -12194,6 +12544,25 @@ impl ExecutingFrame<'_> {
             self.push_value(obj);
         }
         Ok(())
+    }
+
+    /// [`Self::push_local`] for the dispatch loop's fast tier: pushes the
+    /// fastlocals slot `idx` and returns `true`, or returns `false` without
+    /// touching the stack if the local is unbound.
+    #[inline(always)]
+    fn try_push_local(&mut self, idx: usize) -> bool {
+        let Some(obj) = self.localsplus.fastlocals()[idx].as_ref() else {
+            return false;
+        };
+        if BORROW_LOCAL_LOADS {
+            let obj: *const PyObject = obj.as_object();
+            // SAFETY: see `push_local`.
+            unsafe { self.push_borrowed(&*obj) };
+        } else {
+            let obj = obj.clone();
+            self.push_value(obj);
+        }
+        true
     }
 
     #[inline(always)]
