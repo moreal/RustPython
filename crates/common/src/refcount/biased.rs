@@ -282,22 +282,20 @@ pub unsafe fn reinit_after_fork() {
 /// [`reinit_after_fork`].
 pub unsafe fn after_fork_child(mut dealloc: impl FnMut(*const RefCount)) {
     let me = current_tid();
-    let objects = {
+    let dead = {
         let mut registry = REGISTRY.lock();
-        let dead: Vec<u32> = registry
+        let mut dead = core::mem::take(&mut registry.owners);
+        if let Some(survivor) = dead.remove(&me) {
+            registry.owners.insert(me, survivor);
+        }
+        registry.pending_owners = registry
             .owners
-            .keys()
-            .copied()
-            .filter(|&tid| tid != me)
-            .collect();
-        dead.into_iter()
-            .filter_map(|tid| remove_owner(&mut registry, tid))
-            .collect::<Vec<_>>()
+            .values()
+            .filter(|owner| !owner.objects.is_empty())
+            .count();
+        dead
     };
-    let objects: Vec<usize> = objects
-        .into_iter()
-        .flat_map(|owner| owner.objects)
-        .collect();
+    let objects: Vec<usize> = dead.into_values().flat_map(|owner| owner.objects).collect();
     for ptr in objects {
         // SAFETY: the queue's reference kept the object alive.
         let rc = unsafe { &*(ptr as *const RefCount) };
