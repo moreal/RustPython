@@ -9235,6 +9235,7 @@ impl ExecutingFrame<'_> {
 
     /// JUMP_BACKWARD plus the settrace LINE event for a backward edge that
     /// stays on the same source line (`sys_trace_jump_func`).
+    #[inline(always)]
     fn jump_relative_backward_and_trace_line(
         &mut self,
         delta: u32,
@@ -9248,8 +9249,26 @@ impl ExecutingFrame<'_> {
 
     /// sys.settrace generates line events for all backward edges, even if on
     /// the same line.
+    ///
+    /// Runs on every backward jump, so only the cheap `use_tracing` test is
+    /// inlined into the dispatch loop; the rest lives in a cold function.
+    #[inline(always)]
     fn trace_backward_same_line(&mut self, from_idx: usize, vm: &VirtualMachine) -> PyResult<()> {
-        if !(vm.use_tracing.get() && self.trace_is_set(vm) && self.trace_lines_is_set()) {
+        if vm.use_tracing.get() {
+            self.trace_backward_same_line_slow(from_idx, vm)
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn trace_backward_same_line_slow(
+        &mut self,
+        from_idx: usize,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        if !(self.trace_is_set(vm) && self.trace_lines_is_set()) {
             return Ok(());
         }
         let to_idx = self.lasti() as usize;
