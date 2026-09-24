@@ -12,7 +12,9 @@ use crate::{
         builtin_func::PyNativeFunction,
         descriptor::{MemberGetter, PyMemberDescriptor, PyMethodDescriptor},
         frame::stack_analysis,
-        function::{PyBoundMethod, PyCell, PyCellRef, PyFunction, vectorcall_function},
+        function::{
+            KwCallLayout, PyBoundMethod, PyCell, PyCellRef, PyFunction, vectorcall_function,
+        },
         list::PyListIterator,
         range::PyRangeIterator,
         tuple::{PyTuple, PyTupleIterator, PyTupleRef},
@@ -366,22 +368,6 @@ impl LocalsPlus {
             data: LocalsPlusData::DataStack { ptr, capacity },
             nlocalsplus: nlocalsplus_u32,
             stack_top: 0,
-        }
-    }
-
-    /// Migrate data-stack-backed storage to the heap, preserving all values.
-    /// Returns the data stack base pointer for `DataStack::pop()`.
-    /// Returns `None` if already heap-backed.
-    fn materialize_to_heap(&mut self) -> Option<*mut u8> {
-        if let LocalsPlusData::DataStack { ptr, capacity } = &self.data {
-            let base = *ptr as *mut u8;
-            let heap_data = unsafe { core::slice::from_raw_parts(*ptr, *capacity) }
-                .to_vec()
-                .into_boxed_slice();
-            self.data = LocalsPlusData::Heap(heap_data);
-            Some(base)
-        } else {
-            None
         }
     }
 
@@ -1884,30 +1870,6 @@ impl FrameObject {
         unsafe { self.iframe_mut().localsplus.fastlocals_mut() }
     }
 
-    /// Migrate data-stack-backed storage to the heap, preserving all values,
-    /// and return the data stack base pointer for `DataStack::pop()`.
-    /// Returns `None` if already heap-backed.
-    ///
-    /// # Safety
-    /// Caller must ensure the frame is not executing and the returned
-    /// pointer is passed to `VirtualMachine::datastack_pop()`.
-    pub(crate) unsafe fn materialize_localsplus(&self) -> Option<*mut u8> {
-        unsafe { self.iframe_mut().localsplus.materialize_to_heap() }
-    }
-
-    /// Drop all localsplus values in place and detach the data stack backing
-    /// without the heap copy. Returns the data stack base pointer for
-    /// `VirtualMachine::datastack_pop()`, or `None` if heap-backed.
-    ///
-    /// # Safety
-    /// Caller must ensure the frame is not executing, that no other reference
-    /// to the frame exists or can be created (localsplus is unobservable
-    /// afterwards), and that the returned pointer is passed to
-    /// `VirtualMachine::datastack_pop()`.
-    pub(crate) unsafe fn release_localsplus(&self) -> Option<*mut u8> {
-        unsafe { self.iframe_mut().localsplus.release_datastack() }
-    }
-
     /// Whether this frame's localsplus is still data-stack-backed. A frame
     /// must have heap-backed localsplus before it is GC-tracked so that a
     /// concurrent collector never reads data-stack-resident, still-mutating
@@ -2994,90 +2956,6 @@ fn specialization_nonnegative_compact_index(i: &Py<PyInt>, vm: &VirtualMachine) 
 /// Get the variable name for a localsplus index of `code`.
 fn localsplus_name(code: &Py<PyCode>, idx: usize) -> &'static PyStrInterned {
     code.localsplus_name(idx)
-}
-
-/// Free a finished call frame's data stack storage.
-///
-/// When the caller holds the only reference to the frame, the locals and
-/// stack values are dropped in place and the storage is released without a
-/// heap copy. Otherwise (the frame escaped through a traceback,
-/// `sys._getframe`, a trace callback, ...) the values are copied to the heap
-/// first so they stay readable through the escaped reference.
-pub(crate) fn release_datastack_frame(frame: &Py<FrameObject>, vm: &VirtualMachine) {
-    let frame_obj = frame.as_object();
-    // Uniqueness argument: at this point the frame is already out of
-    // the thread-frames registry and the current-frame chain
-    // (both unlinked inside `with_frame` before it returned), and the
-    // frame type has no weakref support. A datastack frame is created
-    // untracked and stays untracked while it runs, so it is in no GC
-    // generation list and no collector can observe or incref it. Hence no
-    // thread can mint a new reference without already holding one, and every
-    // escape (traceback, `sys._getframe`, `f_back`, a stored trace-hook arg)
-    // is a heap reference created on this thread while the frame ran.
-    // Therefore `strong_count() == 1` here means nothing escaped, and
-    // `strong_count() > 1` means the frame escaped.
-    debug_assert!(
-        !frame_obj.is_gc_tracked(),
-        "datastack frame is GC-tracked at release"
-    );
-    if frame_obj.strong_count() == 1 {
-        // A reference minted and already released by another thread (through a
-        // heap escape carried across threads) ends in a release-decref; the
-        // fence orders that thread's memory before our drops below.
-        atomic::fence(Acquire);
-        // SAFETY: unique owner and no way to mint a new reference, so
-        // localsplus can never be observed again. The base pointer came
-        // from this thread's data stack.
-        unsafe {
-            if let Some(base) = frame.release_localsplus() {
-                vm.datastack_pop(base);
-            }
-        }
-        return;
-    }
-    // Escaped. Stabilize localsplus on the heap FIRST, then join the GC. This
-    // order guarantees a concurrent (stop-the-world) collector only ever sees a
-    // tracked frame whose localsplus is heap-resident and no longer mutating:
-    // the frame has stopped executing before it becomes a candidate, so its
-    // outgoing edges are stable while a collector traverses them.
-    // SAFETY: the frame finished executing; the base pointer came from this
-    // thread's data stack.
-    unsafe {
-        if let Some(base) = frame.materialize_localsplus() {
-            vm.datastack_pop(base);
-        }
-    }
-    // Retain a strong reference to the caller so `f_back` keeps resolving once
-    // the caller returns and leaves the live frame chain. The caller is still
-    // executing here (this frame is unwinding back into it), so its payload
-    // pointer is live.
-    {
-        let mut guard = frame.iframe().cold().retained_back.lock();
-        if guard.is_none() {
-            let prev = frame.previous_iframe();
-            *guard = unsafe { owned_chain_frame(prev) };
-        }
-    }
-    // Note: previous is NOT cleared here. retained_back captures the
-    // caller reference, and previous may be read again by f_back or
-    // frame chain walkers (the pointer is live as long as the caller
-    // is still executing, which it is at this point).
-    // Invariant: a tracked frame must always have heap-backed localsplus
-    // (proven here for escaped datastack frames and by construction for
-    // generator frames, which are born heap-backed). A stop-the-world
-    // collector reads a frame's localsplus only when the frame is a tracked
-    // candidate, so this keeps it from ever reading data-stack-resident,
-    // still-mutating storage of an executing frame.
-    debug_assert!(
-        !frame.localsplus_is_datastack_backed(),
-        "escaped frame tracked before its localsplus was materialized"
-    );
-    // SAFETY: the frame is alive (held by `frame` and the escaped reference)
-    // and untracked.
-    unsafe {
-        crate::gc_state::gc_state()
-            .track_object(NonNull::from(frame_obj), crate::gc_state::current_owner())
-    };
 }
 
 type BinaryOpExtendGuard = fn(&PyObject, &PyObject, &VirtualMachine) -> bool;
@@ -6903,6 +6781,28 @@ impl ExecutingFrame<'_> {
                     if self.specialization_call_recursion_guard(vm) {
                         return self.execute_call_vectorcall(nargs, vm);
                     }
+                    if self.flatten == Flatten::CallAndGenResume
+                        && !func.is_generator_like()
+                        && self.specialization_has_datastack_space_for_func(vm, func)
+                    {
+                        let stack_len = self.localsplus.stack_len();
+                        let has_self = self
+                            .localsplus
+                            .stack_index(stack_len - nargs as usize - 1)
+                            .is_some();
+                        let npos = nargs as usize + usize::from(has_self);
+                        if let Some(layout) = func.resolve_kw_call(npos, &[]) {
+                            self.tailcall_prepare_kw_frame(
+                                None,
+                                nargs as usize,
+                                npos,
+                                &[],
+                                &layout,
+                                vm,
+                            )?;
+                            return Ok(Some(ExecutionResult::TailCall));
+                        }
+                    }
                     let (callable, args_vec) = self.take_call_args(nargs as usize);
                     let effective_nargs = args_vec.len();
                     let result =
@@ -6943,6 +6843,21 @@ impl ExecutingFrame<'_> {
                             return self.execute_call_vectorcall(nargs, vm);
                         }
                         let nargs_usize = nargs as usize;
+                        if self.flatten == Flatten::CallAndGenResume
+                            && !func.is_generator_like()
+                            && self.specialization_has_datastack_space_for_func(vm, func)
+                            && let Some(layout) = func.resolve_kw_call(nargs_usize + 1, &[])
+                        {
+                            self.tailcall_prepare_kw_frame(
+                                Some((bound_function, bound_self)),
+                                nargs_usize,
+                                nargs_usize + 1,
+                                &[],
+                                &layout,
+                                vm,
+                            )?;
+                            return Ok(Some(ExecutionResult::TailCall));
+                        }
                         let mut args_vec = Vec::with_capacity(nargs_usize + 1);
                         args_vec.push(bound_self);
                         args_vec.extend(self.pop_multiple(nargs_usize));
@@ -7304,6 +7219,32 @@ impl ExecutingFrame<'_> {
                         return self.execute_call_kw_vectorcall(nargs, vm);
                     }
                     let nargs_usize = nargs as usize;
+                    if self.flatten == Flatten::CallAndGenResume
+                        && !func.is_generator_like()
+                        && self.specialization_has_datastack_space_for_func(vm, func)
+                    {
+                        let stack_len = self.localsplus.stack_len();
+                        let has_self = self
+                            .localsplus
+                            .stack_index(stack_len - nargs_usize - 2)
+                            .is_some();
+                        let kwnames = self.top_value().downcast_ref::<PyTuple>().unwrap();
+                        let npos = nargs_usize - kwnames.len() + usize::from(has_self);
+                        if let Some(layout) = func.resolve_kw_call(npos, kwnames.as_slice()) {
+                            let kwnames = self.pop_value();
+                            // SAFETY: just checked to be a tuple above.
+                            let kwnames = unsafe { kwnames.downcast_unchecked_ref::<PyTuple>() };
+                            self.tailcall_prepare_kw_frame(
+                                None,
+                                nargs_usize,
+                                npos,
+                                kwnames.as_slice(),
+                                &layout,
+                                vm,
+                            )?;
+                            return Ok(Some(ExecutionResult::TailCall));
+                        }
+                    }
                     let kwarg_names_obj = self.pop_value();
                     let kwarg_names_tuple = kwarg_names_obj
                         .downcast_ref::<PyTuple>()
@@ -7362,6 +7303,29 @@ impl ExecutingFrame<'_> {
                             return self.execute_call_kw_vectorcall(nargs, vm);
                         }
                         let nargs_usize = nargs as usize;
+                        if self.flatten == Flatten::CallAndGenResume
+                            && !func.is_generator_like()
+                            && self.specialization_has_datastack_space_for_func(vm, func)
+                            && !self.specialization_call_recursion_guard(vm)
+                        {
+                            let kwnames = self.top_value().downcast_ref::<PyTuple>().unwrap();
+                            let npos = nargs_usize - kwnames.len() + 1;
+                            if let Some(layout) = func.resolve_kw_call(npos, kwnames.as_slice()) {
+                                let kwnames = self.pop_value();
+                                // SAFETY: just checked to be a tuple above.
+                                let kwnames =
+                                    unsafe { kwnames.downcast_unchecked_ref::<PyTuple>() };
+                                self.tailcall_prepare_kw_frame(
+                                    Some((bound_function, bound_self)),
+                                    nargs_usize,
+                                    npos,
+                                    kwnames.as_slice(),
+                                    &layout,
+                                    vm,
+                                )?;
+                                return Ok(Some(ExecutionResult::TailCall));
+                            }
+                        }
                         let kwarg_names_obj = self.pop_value();
                         let kwarg_names_tuple = kwarg_names_obj
                             .downcast_ref::<PyTuple>()
@@ -11748,6 +11712,102 @@ impl ExecutingFrame<'_> {
         vm.set_pending_tailcall_owner(bound_function);
 
         vm.set_pending_tailcall(callee_iframe);
+    }
+
+    /// Prepare a TailCall for a call that binds through a keyword layout —
+    /// defaults, keyword arguments, `*args`/`**kwargs` — moving the arguments
+    /// from the caller's stack straight into the callee's fastlocals.
+    ///
+    /// Stack: `[callable, self_or_null, arg1, ..., argN]`, with the call's
+    /// kwnames tuple (if any) already popped and passed as `kwnames`. For a
+    /// bound method, `bound` holds its function and `self`, and `callable` is
+    /// the bound method; otherwise `callable` is the function itself.
+    /// `npos` counts the positional arguments including any `self`.
+    ///
+    /// Everything is off the caller's stack when this returns, whether or not
+    /// binding succeeded; on error (a missing argument) there is no pending
+    /// frame and the error is the call's.
+    fn tailcall_prepare_kw_frame(
+        &mut self,
+        bound: Option<(PyObjectRef, PyObjectRef)>,
+        nargs: usize,
+        npos: usize,
+        kwnames: &[PyObjectRef],
+        layout: &KwCallLayout,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let stack_len = self.localsplus.stack_len();
+        let callable_idx = stack_len - nargs - 2;
+        let (bound_function, bound_self) = bound.unzip();
+        let func_obj: *const PyObject = match &bound_function {
+            Some(f) => &**f,
+            None => self.nth_value(nargs as u32 + 1),
+        };
+        // SAFETY: the function is either `bound_function` or the callable,
+        // which stays on the stack until after binding; both outlive `func`.
+        let func = unsafe { (*func_obj).downcast_unchecked_ref::<PyFunction>() };
+        let code: &Py<PyCode> = &func.code;
+
+        let locals = if code.flags.contains(bytecode::CodeFlags::NEWLOCALS) {
+            FrameLocals::lazy()
+        } else {
+            FrameLocals::with_locals(crate::function::ArgMapping::from_dict_exact(
+                func.globals.clone(),
+            ))
+        };
+        let callee_iframe = unsafe {
+            // SAFETY: the function object is handed to the trampoline as the
+            // pending owner below, keeping the borrowed fields alive while the
+            // callee runs.
+            InterpreterFrame::new_on_datastack(
+                code,
+                &func.globals,
+                &func.builtins,
+                Some(func.as_object()),
+                locals,
+                func.closure.as_ref().map_or(&[], |c| c.as_slice()),
+                vm,
+            )
+        };
+
+        let localsplus = &mut *self.localsplus;
+        let args = bound_self
+            .into_iter()
+            .chain((callable_idx + 1..stack_len).filter_map(|idx| {
+                localsplus
+                    .stack_index_mut(idx)
+                    .take()
+                    .map(|sr| sr.to_pyobj())
+            }));
+        let bound_ok = func.bind_kw_call(
+            callee_iframe.localsplus.fastlocals_mut(),
+            args,
+            npos,
+            kwnames,
+            layout,
+            vm,
+        );
+        let callable = self
+            .localsplus
+            .stack_index_mut(callable_idx)
+            .take()
+            .unwrap()
+            .to_pyobj();
+        self.localsplus.stack_truncate(callable_idx);
+        if let Err(exc) = bound_ok {
+            unsafe {
+                if let Some((base, size)) = callee_iframe.release_datastack_frame() {
+                    vm.datastack_pop_frame(base, size);
+                }
+            }
+            return Err(exc);
+        }
+
+        // A bound method's function owns the callee's fields; the bound
+        // method itself is no longer needed, matching the recursive path.
+        vm.set_pending_tailcall_owner(bound_function.unwrap_or(callable));
+        vm.set_pending_tailcall(callee_iframe);
+        Ok(())
     }
 
     #[inline]

@@ -395,6 +395,30 @@ impl PyFunction {
             )));
         }
 
+        self.fill_defaults(fastlocals, nargs, vm)
+    }
+
+    /// Fill the parameters a call left empty from `__defaults__` and
+    /// `__kwdefaults__`, raising the "missing required argument" errors for
+    /// any that have none. `nargs` is how many positional arguments the call
+    /// supplied.
+    fn fill_defaults(
+        &self,
+        fastlocals: &mut [Option<PyObjectRef>],
+        nargs: usize,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let code: &Py<PyCode> = &self.code;
+        let n_expected_args = code.arg_count as usize;
+        let total_args = n_expected_args + code.kwonlyarg_count as usize;
+        // Every parameter supplied: nothing to fill, and no need to take the
+        // defaults lock to find that out.
+        if fastlocals[nargs.min(n_expected_args)..total_args]
+            .iter()
+            .all(Option::is_some)
+        {
+            return Ok(());
+        }
         let mut defaults_and_kwdefaults = None;
         // can't be a closure cause it returns a reference to a captured variable :/
         macro_rules! get_defaults {
@@ -414,17 +438,11 @@ impl PyFunction {
 
             // Given the number of defaults available, check all the arguments for which we
             // _don't_ have defaults; if any are missing, raise an exception
-            let mut missing: Vec<_> = (nargs..n_required)
-                .filter_map(|i| {
-                    if fastlocals[i].is_none() {
-                        Some(&code.varnames[i])
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if !missing.is_empty() {
+            if (nargs..n_required).any(|i| fastlocals[i].is_none()) {
+                let mut missing: Vec<_> = (nargs..n_required)
+                    .filter(|&i| fastlocals[i].is_none())
+                    .map(|i| &code.varnames[i])
+                    .collect();
                 return Err(vm.new_type_error(format_missing_args(
                     self.__qualname__(),
                     "positional",
@@ -776,59 +794,12 @@ impl Py<PyFunction> {
         datastack_frame_size_bytes_for_code(&self.code)
     }
 
-    pub(crate) fn prepare_exact_args_frame(
-        &self,
-        args: impl ExactSizeIterator<Item = PyObjectRef>,
-        vm: &VirtualMachine,
-    ) -> FrameObjectRef {
-        let code: PyRef<PyCode> = (*self.code).to_owned();
-
-        debug_assert_eq!(args.len(), code.arg_count as usize);
-        debug_assert!(code.flags.contains(bytecode::CodeFlags::OPTIMIZED));
-        debug_assert!(
-            !code
-                .flags
-                .intersects(bytecode::CodeFlags::VARARGS | bytecode::CodeFlags::VARKEYWORDS)
-        );
-        debug_assert_eq!(code.kwonlyarg_count, 0);
-        debug_assert!(!code.flags.intersects(
-            bytecode::CodeFlags::GENERATOR
-                | bytecode::CodeFlags::COROUTINE
-                | bytecode::CodeFlags::ASYNC_GENERATOR,
-        ));
-
-        let locals = if code.flags.contains(bytecode::CodeFlags::NEWLOCALS) {
-            None
-        } else {
-            Some(ArgMapping::from_dict_exact(self.globals.clone()))
-        };
-
-        let frame = FrameObject::new_ref(
-            code,
-            Scope::new(locals, self.globals.clone()),
-            self.builtins.clone(),
-            self.closure.as_ref().map_or(&[], |c| c.as_slice()),
-            Some(self.to_owned().into()),
-            true, // Exact-args fast path is only used for non-gen/coro functions.
-            vm,
-        );
-
-        {
-            let fastlocals = unsafe { frame.fastlocals_mut() };
-            for (slot, arg) in fastlocals.iter_mut().zip(args) {
-                *slot = Some(arg);
-            }
-        }
-
-        frame
-    }
-
     /// Build the generator/coroutine a generator-like function returns, with
     /// the call's positional arguments bound straight into the new frame's
     /// fastlocals.
     ///
-    /// The counterpart of `prepare_exact_args_frame` for the one call shape it
-    /// refuses. Same preconditions as `can_specialize_call`: every parameter is
+    /// The generator counterpart of `invoke_prepared_exact_args`. Same
+    /// preconditions as `can_specialize_call`: every parameter is
     /// positional and this call fills each of them exactly once, so none of
     /// what `fill_locals_from_args_inner` exists for -- varargs packing,
     /// keyword matching, defaults -- can apply, and the `FuncArgs` those need
@@ -887,6 +858,25 @@ impl Py<PyFunction> {
         args: impl ExactSizeIterator<Item = PyObjectRef>,
         vm: &VirtualMachine,
     ) -> PyResult {
+        self.invoke_on_datastack(
+            |fastlocals| {
+                for (slot, arg) in fastlocals.iter_mut().zip(args) {
+                    *slot = Some(arg);
+                }
+                Ok(())
+            },
+            vm,
+        )
+    }
+
+    /// Call this (non-generator) function on a frame pushed onto the thread's
+    /// data stack, with `bind` filling the new frame's fastlocals.
+    #[inline(always)]
+    fn invoke_on_datastack(
+        &self,
+        bind: impl FnOnce(&mut [Option<PyObjectRef>]) -> PyResult<()>,
+        vm: &VirtualMachine,
+    ) -> PyResult {
         let code = &*self.code;
 
         let locals = if code.flags.contains(bytecode::CodeFlags::NEWLOCALS) {
@@ -911,15 +901,8 @@ impl Py<PyFunction> {
             )
         };
 
-        // Fill arguments directly into fastlocals
-        {
-            let fastlocals = iframe.localsplus.fastlocals_mut();
-            for (slot, arg) in fastlocals.iter_mut().zip(args) {
-                *slot = Some(arg);
-            }
-        }
-
-        let result = vm.run_frame_fast(iframe);
+        let result =
+            bind(iframe.localsplus.fastlocals_mut()).and_then(|()| vm.run_frame_fast(iframe));
         unsafe {
             if let Some((base, size)) = iframe.release_datastack_frame() {
                 vm.datastack_pop_frame(base, size);
@@ -1712,82 +1695,150 @@ impl Representable for PyCell {
     }
 }
 
-/// Largest keyword count the in-place fast path below handles with a
-/// stack-allocated scratch buffer. Calls with more keywords than this simply
-/// fall back to the slow path (extremely rare in practice).
+/// Largest keyword count the keyword binder below handles with a fixed-size
+/// layout. Calls with more keywords than this simply fall back to the
+/// `FuncArgs` path (extremely rare in practice).
 const MAX_INLINE_KW: usize = 16;
 
-/// Try to resolve every keyword in `kwnames` to a distinct fastlocals slot in
-/// `posonlyarg_count..arg_count` that isn't already filled by a positional
-/// argument, without allocating an `IndexMap`, a `Vec`, or cloning any
-/// keyword name.
-///
-/// On success, `args` is reordered into positional order in place (ready for
-/// [`PyFunction::prepare_exact_args_frame`]) and returned as `Ok`. On any
-/// mismatch (too many keywords, unknown keyword, positional/keyword overlap,
-/// non-str/non-UTF8 name) `args` is hand back completely untouched as `Err`
-/// so the caller can fall back to the slow path, which reproduces CPython's
-/// exact error messages.
-///
-/// Only called when `nargs + kwnames.len() == code.arg_count`, i.e. every
-/// parameter is exactly filled by the call with no defaults needed. That
-/// invariant means the keyword values, initially at `args[nargs..]`, are
-/// exactly the values for slots `nargs..arg_count` in some order — so the
-/// whole reorder happens by draining that suffix into a small on-stack
-/// buffer and pushing it back in the resolved order. `args`'s original
-/// allocation is reused; no new allocation is needed.
-fn try_reorder_simple_kwargs(
-    code: &Py<PyCode>,
-    mut args: Vec<PyObjectRef>,
-    nargs: usize,
-    kwnames: &[PyObjectRef],
-) -> Result<Vec<PyObjectRef>, Vec<PyObjectRef>> {
-    let arg_count = code.arg_count as usize;
-    let posonly = code.posonlyarg_count as usize;
-    let kw_count = kwnames.len();
-    if kw_count > MAX_INLINE_KW {
-        return Err(args);
-    }
+/// A [`KwCallLayout`] slot for a keyword no named parameter takes, which goes
+/// into the function's `**kwargs` dict instead.
+const KW_TO_VARKEYWORDS: u16 = u16::MAX;
 
-    // Resolve target slots (relative to `nargs`) first, without touching
-    // `args`, so a mismatch can bail out leaving `args` untouched.
-    let mut rel_positions = [0usize; MAX_INLINE_KW];
-    for (i, name_obj) in kwnames.iter().enumerate() {
-        let Some(name_str) = name_obj.downcast_ref::<PyStr>().and_then(|s| s.to_str()) else {
-            return Err(args);
-        };
-        let Some(pos) = code.varnames[posonly..arg_count]
-            .iter()
-            .position(|v| v.as_str() == name_str)
-            .map(|p| p + posonly)
-        else {
-            // Unexpected keyword argument; let the slow path report it.
-            return Err(args);
-        };
-        let rel = match pos.checked_sub(nargs) {
-            // Positional/keyword overlap; let the slow path report the
-            // exact "multiple values for argument" error.
-            None => return Err(args),
-            Some(rel) => rel,
-        };
-        if rel_positions[..i].contains(&rel) {
-            // Duplicate keyword landing on the same slot.
-            return Err(args);
+/// Where each keyword of a call lands among the callee's parameters, worked
+/// out from the keyword names alone, before any argument is moved.
+///
+/// This is what lets a keyword call bind straight into the new frame's
+/// fastlocals — the way CPython's `CALL_KW_PY` does — instead of building a
+/// `FuncArgs` keyword map (one `Wtf8Buf` and one hash insert per keyword) and
+/// unpacking it again.
+pub(crate) struct KwCallLayout {
+    slots: [u16; MAX_INLINE_KW],
+}
+
+impl Py<PyFunction> {
+    /// Resolve a call with `nargs` positional arguments and the keywords
+    /// `kwnames`, or `None` if the call cannot be bound this way.
+    ///
+    /// `None` covers every call that `fill_locals_from_args_inner` would
+    /// reject for its shape — too many positional arguments, an unexpected
+    /// keyword, one given twice — so that those keep taking the `FuncArgs`
+    /// path and its exact error messages. Missing arguments are not decided
+    /// here: [`bind_kw_call`](Self::bind_kw_call) fills defaults and reports
+    /// them with the same code the `FuncArgs` path uses.
+    pub(crate) fn resolve_kw_call(
+        &self,
+        nargs: usize,
+        kwnames: &[PyObjectRef],
+    ) -> Option<KwCallLayout> {
+        let code: &Py<PyCode> = &self.code;
+        let arg_count = code.arg_count as usize;
+        let posonly = code.posonlyarg_count as usize;
+        let total_args = arg_count + code.kwonlyarg_count as usize;
+        if kwnames.len() > MAX_INLINE_KW || total_args >= KW_TO_VARKEYWORDS as usize {
+            return None;
         }
-        rel_positions[i] = rel;
+        if nargs > arg_count && !code.flags.contains(bytecode::CodeFlags::VARARGS) {
+            return None;
+        }
+        let filled_positionally = nargs.min(arg_count);
+        let params = &code.varnames[posonly..total_args];
+
+        let mut layout = KwCallLayout {
+            slots: [0; MAX_INLINE_KW],
+        };
+        for (i, name_obj) in kwnames.iter().enumerate() {
+            // Keyword names from the compiler are interned, as are parameter
+            // names, so identity almost always settles it.
+            let pos = match params.iter().position(|v| v.as_object().is(name_obj)) {
+                Some(pos) => Some(pos),
+                None => {
+                    let name = name_obj.downcast_ref::<PyStr>()?.to_str()?;
+                    params.iter().position(|v| v.as_str() == name)
+                }
+            };
+            layout.slots[i] = match pos {
+                Some(pos) => {
+                    let slot = (pos + posonly) as u16;
+                    if (slot as usize) < filled_positionally || layout.slots[..i].contains(&slot) {
+                        return None;
+                    }
+                    slot
+                }
+                None if code.flags.contains(bytecode::CodeFlags::VARKEYWORDS) => KW_TO_VARKEYWORDS,
+                None => return None,
+            };
+        }
+        Some(layout)
     }
 
-    // Every keyword maps to a distinct free slot in nargs..arg_count.
-    // Drain the keyword values into a stack buffer ordered by slot, then
-    // push them back — reusing `args`'s own allocation, no heap Vec needed.
-    let mut buf: [Option<PyObjectRef>; MAX_INLINE_KW] = [const { None }; MAX_INLINE_KW];
-    for (i, value) in args.drain(nargs..nargs + kw_count).enumerate() {
-        buf[rel_positions[i]] = Some(value);
+    /// Bind a call resolved by [`resolve_kw_call`](Self::resolve_kw_call)
+    /// into a fresh frame's `fastlocals`. `args` yields the `nargs` positional
+    /// arguments followed by one value for each name in `kwnames`.
+    pub(crate) fn bind_kw_call(
+        &self,
+        fastlocals: &mut [Option<PyObjectRef>],
+        mut args: impl Iterator<Item = PyObjectRef>,
+        nargs: usize,
+        kwnames: &[PyObjectRef],
+        layout: &KwCallLayout,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let code: &Py<PyCode> = &self.code;
+        let arg_count = code.arg_count as usize;
+        let filled_positionally = nargs.min(arg_count);
+
+        for (slot, arg) in fastlocals[..filled_positionally]
+            .iter_mut()
+            .zip(args.by_ref())
+        {
+            *slot = Some(arg);
+        }
+        let mut extra_idx = arg_count + code.kwonlyarg_count as usize;
+        if code.flags.contains(bytecode::CodeFlags::VARARGS) {
+            let rest: Vec<_> = args.by_ref().take(nargs - filled_positionally).collect();
+            fastlocals[extra_idx] = Some(vm.ctx.new_tuple(rest).into());
+            extra_idx += 1;
+        }
+        let kwargs = code
+            .flags
+            .contains(bytecode::CodeFlags::VARKEYWORDS)
+            .then(|| {
+                let d = vm.ctx.new_dict();
+                fastlocals[extra_idx] = Some(d.clone().into());
+                d
+            });
+        for ((name, &slot), value) in kwnames.iter().zip(&layout.slots).zip(args) {
+            if slot == KW_TO_VARKEYWORDS {
+                let kwargs = kwargs.as_ref().expect("layout sends a keyword to **kwargs");
+                kwargs.set_item(&**name, value, vm)?;
+            } else {
+                fastlocals[slot as usize] = Some(value);
+            }
+        }
+        self.fill_defaults(fastlocals, nargs, vm)
     }
-    for slot in buf.iter_mut().take(kw_count) {
-        args.push(slot.take().unwrap());
+
+    /// Call this function with a keyword layout from
+    /// [`resolve_kw_call`](Self::resolve_kw_call), binding `args` (as for
+    /// [`bind_kw_call`](Self::bind_kw_call)) straight into a data stack frame.
+    ///
+    /// Not for generator-like functions, whose frames outlive the call, nor
+    /// while tracing, which needs a frame object.
+    pub(crate) fn invoke_kw_call(
+        &self,
+        args: impl Iterator<Item = PyObjectRef>,
+        nargs: usize,
+        kwnames: &[PyObjectRef],
+        layout: &KwCallLayout,
+        vm: &VirtualMachine,
+    ) -> PyResult {
+        debug_assert!(!self.is_generator_like());
+        debug_assert!(!vm.use_tracing.get());
+        self.invoke_on_datastack(
+            |fastlocals| self.bind_kw_call(fastlocals, args, nargs, kwnames, layout, vm),
+            vm,
+        )
     }
-    Ok(args)
 }
 
 /// Vectorcall implementation for PyFunction (PEP 590).
@@ -1824,7 +1875,6 @@ pub(crate) fn vectorcall_function(
             | bytecode::CodeFlags::COROUTINE
             | bytecode::CodeFlags::ASYNC_GENERATOR,
     );
-    let base_simple = positional_only && !is_generator_like;
 
     if !has_kwargs && positional_only && is_generator_like && nargs == code.arg_count as usize {
         // FAST PATH: generator/coroutine call, exact arg count. Binds the
@@ -1836,36 +1886,17 @@ pub(crate) fn vectorcall_function(
         return Ok(zelf.make_generator_exact_args(args.into_iter(), vm));
     }
 
-    if !has_kwargs && base_simple && nargs == code.arg_count as usize {
-        // FAST PATH: simple positional-only call, exact arg count.
-        // Move owned args directly into fastlocals — no clone needed.
-        args.truncate(nargs);
-        let frame = zelf.prepare_exact_args_frame(args.into_iter(), vm);
-
-        let result = vm.run_frame(frame.clone());
-        crate::frame::release_datastack_frame(&frame, vm);
-        return result;
-    }
-
-    if has_kwargs
-        && base_simple
-        && let Some(kwnames) = kwnames
-        && nargs + kwnames.len() == code.arg_count as usize
+    if !is_generator_like
+        && code.flags.contains(bytecode::CodeFlags::OPTIMIZED)
+        && !vm.use_tracing.get()
     {
-        // FAST PATH: plain function, no *args/**kwargs/kwonly, every
-        // parameter filled exactly by this call. Reorder into positional
-        // order with no IndexMap/Wtf8Buf allocation; any mismatch falls
-        // through to the slow path below with `args` untouched.
-        match try_reorder_simple_kwargs(code, args, nargs, kwnames) {
-            Ok(ordered) => {
-                let frame = zelf.prepare_exact_args_frame(ordered.into_iter(), vm);
-                let result = vm.run_frame(frame.clone());
-                crate::frame::release_datastack_frame(&frame, vm);
-                return result;
-            }
-            Err(restored) => {
-                args = restored;
-            }
+        // FAST PATH: bind positional and keyword arguments straight into a
+        // data stack frame, with defaults filled in there; no `FuncArgs`.
+        // A call that doesn't fit falls through with `args` untouched.
+        let kwnames = kwnames.unwrap_or_default();
+        if let Some(layout) = zelf.resolve_kw_call(nargs, kwnames) {
+            let args = args.into_iter().take(nargs + kwnames.len());
+            return zelf.invoke_kw_call(args, nargs, kwnames, &layout, vm);
         }
     }
 
