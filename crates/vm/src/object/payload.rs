@@ -62,6 +62,9 @@ pub trait PyPayload: MaybeTraverse + PyThreadingConstraint + Sized + 'static {
     /// to clear. Its dealloc then only drops the payload and returns the
     /// memory to the freelist or the allocator. Instances of subclasses, which
     /// can add all of those back, still take the generic path.
+    ///
+    /// The same facts let [`Self::into_ref`] build an exact instance without
+    /// the dict and tracking checks (see `PyRef::new_trivial_exact`).
     const TRIVIAL_EXACT_DEALLOC: bool = false;
 
     /// Whether this type has a freelist. Types with freelists require
@@ -136,6 +139,9 @@ pub trait PyPayload: MaybeTraverse + PyThreadingConstraint + Sized + 'static {
     where
         Self: core::fmt::Debug,
     {
+        if Self::TRIVIAL_EXACT_DEALLOC {
+            return PyRef::new_trivial_exact(self, ctx);
+        }
         let cls = Self::class(ctx);
         self._into_ref(cls.to_owned(), ctx)
     }

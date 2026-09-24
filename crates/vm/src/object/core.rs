@@ -1483,6 +1483,54 @@ impl<T: PyPayload> FreeList<T> {
     }
 }
 
+impl<T: PyPayload> FreeList<T> {
+    /// Push a dead object onto this thread's freelist in `key`, if it has room.
+    ///
+    /// Works on the list in place: taking it out of the `Cell` and putting it
+    /// back costs a copy of the vector each way, plus dropping the empty list
+    /// left behind, on every object freed.
+    ///
+    /// # Safety
+    /// As [`PyPayload::freelist_push`].
+    #[inline]
+    pub(crate) unsafe fn push_to(
+        key: &'static std::thread::LocalKey<core::cell::Cell<Self>>,
+        obj: *mut PyObject,
+    ) -> bool {
+        key.try_with(|cell| {
+            // SAFETY: nothing below can reach this freelist again (growing the
+            // vector only calls the allocator), so this is the only reference
+            // to it while it lives.
+            let list = unsafe { &mut *cell.as_ptr() };
+            if list.len() < T::MAX_FREELIST {
+                list.push(obj);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+    }
+
+    /// Pop an object from this thread's freelist in `key`; see
+    /// [`Self::push_to`].
+    ///
+    /// # Safety
+    /// As [`PyPayload::freelist_pop`].
+    #[inline]
+    pub(crate) unsafe fn pop_from(
+        key: &'static std::thread::LocalKey<core::cell::Cell<Self>>,
+    ) -> Option<NonNull<PyObject>> {
+        key.try_with(|cell| {
+            // SAFETY: as in `push_to`.
+            let list = unsafe { &mut *cell.as_ptr() };
+            list.pop().map(|p| unsafe { NonNull::new_unchecked(p) })
+        })
+        .ok()
+        .flatten()
+    }
+}
+
 impl<T: PyPayload> Default for FreeList<T> {
     fn default() -> Self {
         Self::new()
@@ -2883,6 +2931,39 @@ impl<T: PyPayload + crate::object::MaybeTraverse + core::fmt::Debug> PyRef<T> {
         }
 
         Self { ptr }
+    }
+}
+
+impl<T: PyPayload + core::fmt::Debug> PyRef<T> {
+    /// [`Self::new_ref`] for an instance of exactly `T::class()` of a payload
+    /// that sets [`PyPayload::TRIVIAL_EXACT_DEALLOC`].
+    ///
+    /// Such a class has no instance dict and its instances are never tracked,
+    /// so neither needs checking. And both dealloc paths only put exact
+    /// instances on the freelist, so a reused object already holds the
+    /// reference to its class that it needs: the new object takes it over,
+    /// rather than taking a fresh one and dropping the old, each an atomic
+    /// read-modify-write on the class's refcount.
+    #[inline(always)]
+    pub(crate) fn new_trivial_exact(payload: T, ctx: &crate::vm::Context) -> Self {
+        debug_assert!(T::TRIVIAL_EXACT_DEALLOC);
+        if let Some(cached) = unsafe { T::freelist_pop(&payload) } {
+            let inner = cached.as_ptr() as *mut PyInner<T>;
+            unsafe {
+                debug_assert!(core::ptr::eq(&*(*inner).typ, T::class(ctx)));
+                core::ptr::write(&mut (*inner).ref_count, RefCount::new());
+                (*inner).gc_bits.store(0, Ordering::Relaxed);
+                core::ptr::drop_in_place(&mut (*inner).payload);
+                core::ptr::write(&mut (*inner).payload, payload);
+                return Self {
+                    ptr: NonNull::new_unchecked(inner.cast::<Py<T>>()),
+                };
+            }
+        }
+        let inner = PyInner::new(payload, T::class(ctx).to_owned(), None);
+        Self {
+            ptr: unsafe { NonNull::new_unchecked(inner.cast::<Py<T>>()) },
+        }
     }
 }
 
