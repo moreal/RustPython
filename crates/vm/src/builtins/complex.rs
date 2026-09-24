@@ -34,6 +34,7 @@ thread_local! {
 impl PyPayload for PyComplex {
     const MAX_FREELIST: usize = 100;
     const HAS_FREELIST: bool = true;
+    const TRIVIAL_EXACT_DEALLOC: bool = true;
 
     #[inline]
     fn class(ctx: &Context) -> &'static Py<PyType> {
@@ -42,32 +43,12 @@ impl PyPayload for PyComplex {
 
     #[inline]
     unsafe fn freelist_push(obj: *mut PyObject) -> bool {
-        COMPLEX_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let stored = if list.len() < Self::MAX_FREELIST {
-                    list.push(obj);
-                    true
-                } else {
-                    false
-                };
-                fl.set(list);
-                stored
-            })
-            .unwrap_or(false)
+        unsafe { crate::object::FreeList::push_to(&COMPLEX_FREELIST, obj) }
     }
 
     #[inline]
     unsafe fn freelist_pop(_payload: &Self) -> Option<NonNull<PyObject>> {
-        COMPLEX_FREELIST
-            .try_with(|fl| {
-                let mut list = fl.take();
-                let result = list.pop().map(|p| unsafe { NonNull::new_unchecked(p) });
-                fl.set(list);
-                result
-            })
-            .ok()
-            .flatten()
+        unsafe { crate::object::FreeList::pop_from(&COMPLEX_FREELIST) }
     }
 }
 

@@ -179,6 +179,13 @@ thread_local! {
     static CURRENT_STOP_REQUESTED: Cell<*const core::sync::atomic::AtomicBool> =
         const { Cell::new(core::ptr::null()) };
 
+    /// Cached pointer to this thread's `ThreadSlot::state`, kept alongside
+    /// `CURRENT_STOP_REQUESTED`, so the GC can ask whether this thread is
+    /// attached on every allocation for one relaxed load.
+    #[cfg(feature = "threading")]
+    static CURRENT_THREAD_STATE: Cell<*const core::sync::atomic::AtomicI32> =
+        const { Cell::new(core::ptr::null()) };
+
 }
 
 #[must_use]
@@ -492,6 +499,7 @@ fn set_current_thread_slot(slot: CurrentFrameSlot) {
         cache.top_iframe.set(&slot.top_iframe);
     });
     CURRENT_STOP_REQUESTED.with(|c| c.set(&slot.stop_requested));
+    CURRENT_THREAD_STATE.with(|c| c.set(&slot.state));
     CURRENT_THREAD_SLOT.with(|current| {
         *current.borrow_mut() = Some(slot);
     });
@@ -787,7 +795,7 @@ pub fn attach_for_callback<R>(_vm: &VirtualMachine, f: impl FnOnce() -> R) -> R 
 /// suspended like any other thread — so this rests on a local invariant rather
 /// than on the reference behavior.
 #[cfg(feature = "threading")]
-fn wait_detached_from_interpreter(wait: &dyn Fn()) {
+pub(crate) fn wait_detached_from_interpreter(wait: &dyn Fn()) {
     // Read the VM out before waiting: attaching afterwards reaches for the
     // same thread locals, which must not still be borrowed here.
     let current = VM_STACK
@@ -932,6 +940,28 @@ fn do_suspend(state: &PyGlobalState) {
         s.stop_requested.store(false, Ordering::Release);
         super::stw_trace(format_args!("suspend resume -> ATTACHED"));
     });
+}
+
+/// Whether this thread is ATTACHED to the interpreter it last entered.
+///
+/// Only this thread moves its own slot out of ATTACHED, and a stop-the-world
+/// request cannot park a thread that is ATTACHED until it reaches a safepoint,
+/// so a `true` here stays true until this thread itself detaches or reaches a
+/// safepoint. The GC relies on that to touch this thread's young list without
+/// a lock (see `gc_state::LocalYoung`).
+#[cfg(feature = "threading")]
+#[inline]
+#[must_use]
+pub(crate) fn current_thread_is_attached() -> bool {
+    CURRENT_THREAD_STATE
+        .try_with(|cached| {
+            let state = cached.get();
+            // SAFETY: as in `stop_requested_for_current_thread`, the pointer is
+            // non-null only while `CURRENT_THREAD_SLOT` keeps its slot alive.
+            !state.is_null()
+                && unsafe { &*state }.load(Ordering::Relaxed) == ThreadState::Attached as i32
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(feature = "threading")]
@@ -1176,6 +1206,8 @@ pub fn cleanup_current_thread_frames(vm: &VirtualMachine) {
             });
             #[cfg(feature = "threading")]
             CURRENT_STOP_REQUESTED.with(|c| c.set(core::ptr::null()));
+            #[cfg(feature = "threading")]
+            CURRENT_THREAD_STATE.with(|c| c.set(core::ptr::null()));
         }
     });
 }
@@ -1244,6 +1276,8 @@ pub fn reinit_frame_slot_after_fork(vm: &VirtualMachine) {
     });
     #[cfg(feature = "threading")]
     CURRENT_STOP_REQUESTED.with(|c| c.set(&new_slot.stop_requested));
+    #[cfg(feature = "threading")]
+    CURRENT_THREAD_STATE.with(|c| c.set(&new_slot.state));
 
     // Lock is safe: reinit_locks_after_fork() already reset it to unlocked.
     let mut registry = vm.state.thread_frames.lock();

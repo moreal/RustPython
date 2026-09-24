@@ -4,6 +4,8 @@
 
 use crate::common::linked_list::LinkedList;
 use crate::common::lock::{PyMutex, PyRwLock};
+#[cfg(feature = "threading")]
+use crate::object::GC_LOCAL_YOUNG;
 use crate::object::{GC_NO_OWNER, GC_PERMANENT, GC_REACHABLE, GC_UNTRACKED, GcLink, GcOwner};
 use crate::{AsObject, PyObject, PyObjectRef};
 use core::ptr::NonNull;
@@ -277,7 +279,6 @@ impl CollectStopTheWorld {
     }
 
     /// Whether this collection actually stopped the world.
-    #[cfg(all(unix, debug_assertions))]
     fn is_stopped(&self) -> bool {
         !self.stopped.is_empty()
     }
@@ -319,6 +320,9 @@ pub struct GcState {
     /// collection adopts them — tags them `GC_NO_OWNER` again — as it walks,
     /// rather than leaving them for a collector that will never come.
     retired: PyMutex<Vec<GcOwner>>,
+    /// Every thread's young list, by the id objects in it carry.
+    #[cfg(feature = "threading")]
+    young: PyRwLock<young::Registry>,
 }
 
 // SAFETY: All fields are either inherently Send/Sync (atomics, RwLock, Mutex) or protected by PyMutex.
@@ -353,6 +357,8 @@ impl GcState {
             collecting: PyMutex::new(()),
             next_owner: AtomicU16::new(GC_NO_OWNER + 1),
             retired: PyMutex::new(Vec::new()),
+            #[cfg(feature = "threading")]
+            young: PyRwLock::new(young::Registry::new()),
         }
     }
 
@@ -382,11 +388,30 @@ impl GcState {
     /// process-wide even though the thresholds they are compared against are
     /// per interpreter.
     pub fn get_count(&self) -> (usize, usize, usize) {
+        let count0 = self.counts[0].load(Ordering::Relaxed);
+        // Young lists keep their own tally until it grows large enough to be
+        // worth folding in; see `young::FLUSH`.
+        #[cfg(feature = "threading")]
+        let count0 = self.young.read().pending().saturating_add_unsigned(count0);
+        #[cfg(feature = "threading")]
+        let count0 = count0.max(0) as usize;
         (
-            self.counts[0].load(Ordering::Relaxed),
+            count0,
             self.counts[1].load(Ordering::Relaxed),
             self.counts[2].load(Ordering::Relaxed),
         )
+    }
+
+    /// Add `delta` to the shared gen0 count, without wrapping below zero.
+    #[cfg(feature = "threading")]
+    fn add_count0(&self, delta: isize) {
+        if delta >= 0 {
+            self.counts[0].fetch_add(delta as usize, Ordering::Relaxed);
+        } else {
+            let _ = self.counts[0].try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_sub(delta.unsigned_abs()))
+            });
+        }
     }
 
     /// Track a new object (add to gen0) as owned by `owner`.
@@ -465,6 +490,12 @@ impl GcState {
         loop {
             let obj_gen = obj_ref.gc_generation();
 
+            #[cfg(feature = "threading")]
+            if obj_gen == GC_LOCAL_YOUNG {
+                unsafe { self.untrack_young_live(obj) };
+                return;
+            }
+
             let (list_lock, count) = if obj_gen <= 2 {
                 (
                     &self.generation_lists[obj_gen as usize] as &PyRwLock<LinkedList<GcLink>>,
@@ -501,6 +532,229 @@ impl GcState {
         }
     }
 
+    /// Untrack an object whose dealloc is running.
+    ///
+    /// Returns the young list the object has to be handed back to when that
+    /// list belongs to another thread: only its owner may unlink from it, so
+    /// the object stays linked, and the caller passes its memory to
+    /// [`ForeignYoung::give_back`] once the fields are dropped.
+    ///
+    /// # Safety
+    /// As [`Self::untrack_object`]; in addition, nothing but this dealloc may
+    /// still reach `obj`.
+    pub(crate) unsafe fn untrack_for_dealloc(
+        &self,
+        obj: NonNull<PyObject>,
+    ) -> Option<ForeignYoung> {
+        #[cfg(feature = "threading")]
+        if unsafe { obj.as_ref() }.gc_generation() == GC_LOCAL_YOUNG {
+            return unsafe { self.untrack_young(obj, true) };
+        }
+        unsafe { self.untrack_object(obj) };
+        None
+    }
+
+    /// Untrack an object that sits in a young list. `dying` says whether its
+    /// dealloc is the caller, in which case another thread's list is left for
+    /// that thread to unlink from (see [`Self::untrack_for_dealloc`]).
+    #[cfg(feature = "threading")]
+    unsafe fn untrack_young(&self, obj: NonNull<PyObject>, dying: bool) -> Option<ForeignYoung> {
+        let obj_ref = unsafe { obj.as_ref() };
+        if let Some(mine) = young::LocalYoung::current()
+            && mine.holds(obj_ref)
+        {
+            if crate::vm::thread::current_thread_is_attached() {
+                // SAFETY: attached, and the object is in this thread's list.
+                unsafe { mine.untrack_owned(self, obj, dying) };
+                return None;
+            }
+            if unsafe { mine.untrack_owned_locked(self, obj, dying) } {
+                return None;
+            }
+            // A collection moved it to the shared lists while this thread was
+            // detached.
+            unsafe { self.untrack_object(obj) };
+            return None;
+        }
+
+        if !dying {
+            unsafe { self.untrack_young_foreign_live(obj) };
+            return None;
+        }
+        loop {
+            if obj_ref.gc_generation() != GC_LOCAL_YOUNG {
+                unsafe { self.untrack_object(obj) };
+                return None;
+            }
+            let owner = self.young.read().get(obj_ref.gc_young_slot());
+            if let Some(owner) = owner {
+                return Some(ForeignYoung(owner));
+            }
+            // That list was retired, which moved its objects to the shared
+            // lists before letting go of the registry: the generation read
+            // again above now says where the object went.
+        }
+    }
+
+    /// [`Self::untrack_object`] for an object in a young list.
+    #[cfg(feature = "threading")]
+    unsafe fn untrack_young_live(&self, obj: NonNull<PyObject>) {
+        let foreign = unsafe { self.untrack_young(obj, false) };
+        debug_assert!(foreign.is_none());
+    }
+
+    /// Untrack a live object that sits in another thread's young list.
+    ///
+    /// Only that thread may unlink from its list while it is attached, so
+    /// this stops the world and moves every young list to the shared gen0
+    /// list first. It is the slow path of a rare call: `untrack_object` on an
+    /// object another thread allocated, which the interpreter itself never
+    /// does (C API extensions can).
+    #[cfg(feature = "threading")]
+    #[cold]
+    #[inline(never)]
+    unsafe fn untrack_young_foreign_live(&self, obj: NonNull<PyObject>) {
+        let serial = self.lock_collecting_for_stop();
+        let stw = CollectStopTheWorld::new();
+        if stw.is_stopped() {
+            // SAFETY: the world is stopped.
+            unsafe { self.splice_young() };
+            drop(stw);
+            drop(serial);
+            unsafe { self.untrack_object(obj) };
+            return;
+        }
+        drop(stw);
+        drop(serial);
+        // No VM is attached here, so the world cannot be stopped. Taking the
+        // list's lock excludes its owner only while that owner is detached;
+        // nothing in the interpreter gets here.
+        debug_assert!(
+            false,
+            "untracking another thread's young object needs an attached VM"
+        );
+        let obj_ref = unsafe { obj.as_ref() };
+        let owner = self.young.read().get(obj_ref.gc_young_slot());
+        if let Some(owner) = owner
+            && unsafe { owner.untrack_owned_locked(self, obj, false) }
+        {
+            return;
+        }
+        if obj_ref.gc_generation() != GC_LOCAL_YOUNG {
+            unsafe { self.untrack_object(obj) };
+        }
+    }
+
+    /// Move every thread's young objects to the shared gen0 list, and free
+    /// the objects other threads handed back to those lists.
+    ///
+    /// # Safety
+    /// Every thread that owns a young list must be stopped or detached: an
+    /// attached owner touches its list without the lock this takes.
+    #[cfg(feature = "threading")]
+    unsafe fn splice_young(&self) {
+        let registry = self.young.read();
+        let mut husks = Vec::new();
+        {
+            let mut gen0 = self.generation_lists[0].write();
+            for young in registry.iter() {
+                unsafe { young.splice_into(self, &mut gen0, &mut husks) };
+            }
+        }
+        drop(registry);
+        young::free_husks(husks);
+    }
+
+    /// Make every young object visible to a reader of the shared lists, for
+    /// the callers that walk them outside a collection.
+    ///
+    /// With no VM attached the world cannot be stopped, and the young objects
+    /// stay where they are, out of sight.
+    #[cfg(feature = "threading")]
+    fn gather_young(&self) {
+        let _serial = self.lock_collecting_for_stop();
+        let stw = CollectStopTheWorld::new();
+        if stw.is_stopped() {
+            // SAFETY: the world is stopped.
+            unsafe { self.splice_young() };
+        }
+    }
+
+    /// Serialize a stop-the-world that is not a collection with collections.
+    ///
+    /// Two requesters stopping the world at once deadlock: the loser blocks on
+    /// the admission lock while still attached, so the winner waits forever
+    /// for it to park. Collections avoid that by holding `collecting` first,
+    /// and so must everything else that stops the world here. The wait for it
+    /// happens detached, so a collector that is stopping the world meanwhile
+    /// can count this thread as parked. `None` when this thread is the one
+    /// collecting (a finalizer calling back in), which already serializes it.
+    #[cfg(feature = "threading")]
+    fn lock_collecting_for_stop(&self) -> Option<crate::common::lock::PyMutexGuard<'_, ()>> {
+        if young::HoldsCollecting::is_set() {
+            return None;
+        }
+        if let Some(guard) = self.collecting.try_lock() {
+            return Some(guard);
+        }
+        let slot = core::cell::Cell::new(None);
+        crate::vm::thread::wait_detached_from_interpreter(&|| {
+            slot.set(Some(self.collecting.lock()));
+        });
+        slot.into_inner()
+    }
+
+    /// Take an exiting thread's young list out of service: its objects move to
+    /// the shared gen0 list, and its id becomes free for another thread.
+    #[cfg(feature = "threading")]
+    fn retire_young(&self, young: &young::LocalYoung) {
+        let mut registry = self.young.write();
+        let mut husks = Vec::new();
+        {
+            let mut gen0 = self.generation_lists[0].write();
+            // SAFETY: the owner is this thread, which is exiting and so no
+            // longer uses the lock-free path.
+            unsafe { young.splice_into(self, &mut gen0, &mut husks) };
+        }
+        registry.remove(young.id());
+        drop(registry);
+        young::free_husks(husks);
+    }
+
+    /// After fork() only the forking thread survives; the other threads' young
+    /// lists would never be drained by their owners again, so they are
+    /// retired here.
+    ///
+    /// # Safety
+    /// As [`Self::reinit_after_fork`], and only after it reset the registry
+    /// lock.
+    #[cfg(all(unix, feature = "threading"))]
+    unsafe fn reinit_young_after_fork(&self) {
+        let current = young::LocalYoung::current().map_or(core::ptr::null(), |y| y as *const _);
+        let mut registry = self.young.write();
+        let mut husks = Vec::new();
+        let dead: Vec<_> = registry
+            .iter()
+            .filter(|young| !core::ptr::eq(alloc::sync::Arc::as_ptr(young), current))
+            .cloned()
+            .collect();
+        for young in registry.iter() {
+            unsafe { young.reinit_after_fork() };
+        }
+        {
+            let mut gen0 = self.generation_lists[0].write();
+            for young in &dead {
+                // SAFETY: their owners are gone.
+                unsafe { young.splice_into(self, &mut gen0, &mut husks) };
+            }
+        }
+        for young in &dead {
+            registry.remove(young.id());
+        }
+        drop(registry);
+        young::free_husks(husks);
+    }
+
     /// Get the objects `owner` tracks (for gc.get_objects), plus the ones no
     /// interpreter owns.
     /// If generation is None, returns all such objects.
@@ -514,6 +768,11 @@ impl GcState {
                 .filter(move |obj| is_owned_by(obj, owner))
                 .filter_map(|obj| obj.try_to_owned())
         }
+
+        // Objects in young lists are only readable with their threads stopped;
+        // move them to the shared gen0 list, where the reads below find them.
+        #[cfg(feature = "threading")]
+        self.gather_young();
 
         match generation {
             None => {
@@ -536,13 +795,16 @@ impl GcState {
     /// Check if automatic GC should run and run it if needed.
     /// Called after object allocation.
     /// Returns true if GC was run, false otherwise.
-    fn maybe_collect(&self, gc: &GcInterpreterState) -> bool {
+    fn maybe_collect(&self, gc: &GcInterpreterState, young_pending: isize) -> bool {
         if !gc.is_enabled() {
             return false;
         }
 
-        // Check gen0 threshold
-        let count0 = self.counts[0].load(Ordering::Relaxed) as u32;
+        // Check gen0 threshold, counting what this thread's young list has not
+        // folded into the shared count yet.
+        let count0 = self.counts[0]
+            .load(Ordering::Relaxed)
+            .saturating_add_signed(young_pending) as u32;
         let threshold0 = gc.generations[0].threshold();
         if threshold0 > 0 && count0 >= threshold0 {
             #[cfg(feature = "threading")]
@@ -581,6 +843,8 @@ impl GcState {
         let Some(_guard) = self.collecting.try_lock() else {
             return CollectResult::default();
         };
+        #[cfg(feature = "threading")]
+        let _held = young::HoldsCollecting::enter();
 
         let start_time = cfg_select! {
             target_arch = "wasm32" => (),
@@ -623,6 +887,16 @@ impl GcState {
         // aware; the exclusion above only serializes the fork/GC requesters.
         #[cfg(feature = "threading")]
         let mut stw = CollectStopTheWorld::new();
+
+        // Every thread's young objects join the shared gen0 list, which is what
+        // the scan below walks. That needs every thread stopped; without a
+        // barrier they stay where they are and act as roots, which only makes
+        // this collection more conservative.
+        #[cfg(feature = "threading")]
+        if stw.is_stopped() {
+            // SAFETY: the world is stopped.
+            unsafe { self.splice_young() };
+        }
 
         // Step 1: Gather objects from generations 0..=generation
         // Hold read locks for the entire scan to prevent concurrent modifications.
@@ -1176,6 +1450,9 @@ impl GcState {
     /// generation).
     /// Lock order: generation_lists[i] → permanent_list (consistent with unfreeze).
     fn freeze(&self, owner: GcOwner) {
+        #[cfg(feature = "threading")]
+        self.gather_young();
+
         let mut count = 0usize;
 
         for (gen_idx, gen_list) in self.generation_lists.iter().enumerate() {
@@ -1251,6 +1528,9 @@ impl GcState {
                 reinit_rwlock_after_fork(rw);
             }
             reinit_rwlock_after_fork(&self.permanent_list);
+
+            reinit_rwlock_after_fork(&self.young);
+            self.reinit_young_after_fork();
         }
     }
 }
@@ -1428,8 +1708,14 @@ pub(crate) unsafe fn track_new_object(obj: NonNull<PyObject>) {
     };
     // SAFETY: as in `current_owner`.
     let gc = unsafe { gc.as_ref() };
+    #[cfg(feature = "threading")]
+    if let Some(young) = young::LocalYoung::current_attached() {
+        let pending = unsafe { young.track_fresh(state, obj, gc.owner) };
+        state.maybe_collect(gc, pending);
+        return;
+    }
     unsafe { state.track_object_fresh(obj, gc.owner) };
-    state.maybe_collect(gc);
+    state.maybe_collect(gc, 0);
 }
 
 /// Track a generator (or coroutine, or async generator) together with the
@@ -1447,8 +1733,452 @@ pub(crate) unsafe fn track_new_pair(obj: NonNull<PyObject>, frame: NonNull<PyObj
     };
     // SAFETY: as in `current_owner`.
     let gc = unsafe { gc.as_ref() };
+    #[cfg(feature = "threading")]
+    if let Some(young) = young::LocalYoung::current_attached() {
+        unsafe { young.track_fresh(state, obj, gc.owner) };
+        let pending = unsafe { young.track_fresh(state, frame, gc.owner) };
+        state.maybe_collect(gc, pending);
+        return;
+    }
     unsafe { state.track_pair_fresh(obj, frame, gc.owner) };
-    state.maybe_collect(gc);
+    state.maybe_collect(gc, 0);
+}
+
+/// Where an object that sits in another thread's young list goes when this
+/// thread deallocates it.
+#[cfg(feature = "threading")]
+pub(crate) struct ForeignYoung(alloc::sync::Arc<young::LocalYoung>);
+
+/// Young lists are per thread only with threading; without it nothing is ever
+/// handed back.
+#[cfg(not(feature = "threading"))]
+pub(crate) enum ForeignYoung {}
+
+impl ForeignYoung {
+    /// Hand the memory of a dead object back to the thread whose young list it
+    /// is linked into; that thread unlinks and frees it. Gives the memory back
+    /// to the caller if the object has left that list in the meantime, in
+    /// which case it now sits in the shared lists.
+    ///
+    /// # Safety
+    /// `obj` must be the object [`GcState::untrack_for_dealloc`] returned this
+    /// for, with its fields dropped into `mem`.
+    pub(crate) unsafe fn give_back(
+        self,
+        obj: NonNull<PyObject>,
+        mem: crate::object::RawAlloc,
+    ) -> Result<(), crate::object::RawAlloc> {
+        cfg_select! {
+            feature = "threading" => unsafe { self.0.give_back(obj, mem) },
+            _ => {
+                let _ = (obj, mem);
+                match self {}
+            }
+        }
+    }
+}
+
+/// Thread-local young lists.
+///
+/// Every allocation of a tracked object used to push it onto the one shared
+/// gen0 list under its write lock, and every dealloc took the lock again to
+/// unlink it, plus an atomic update of the shared count each time. A thread
+/// attached to an interpreter now keeps its own young list instead, and
+/// touches it with no lock and no atomic read-modify-write at all.
+///
+/// That is sound because of who can reach a thread's list:
+///
+/// * The owner, while attached, with no lock. A stop-the-world cannot park an
+///   attached thread anywhere but a safepoint, and no list operation contains
+///   one, so nothing else reads the list while the owner is using it.
+/// * The owner while detached, a collector, or the thread-exit hand-off, each
+///   under the list's `husks` lock. A collector only does so with the world
+///   stopped, so the owner cannot be attached at the same time.
+/// * Nobody else. Another thread that deallocates an object linked into this
+///   list cannot unlink it, so it drops the object's fields itself (finalizers
+///   and weakref callbacks still run right away, on that thread) and hands the
+///   bare memory back through the `husks` queue. The owner unlinks and frees
+///   those husks at its next tracked allocation, a collection at its start,
+///   and the thread-exit hand-off before the list goes away.
+///
+/// A collection starts by moving every young list onto the shared gen0 list
+/// (`GcState::splice_young`), so everything after that point, and every other
+/// reader of the lists, only ever sees the shared lists. An object carries the
+/// id of its young list in `gc_refs` (unused outside a collection) and
+/// [`GC_LOCAL_YOUNG`] as its generation.
+///
+/// CPython's free-threaded build (3.13t) keeps no list at all and finds GC
+/// objects by walking mimalloc's heaps. RustPython allocates through the
+/// global allocator, which offers no such walk, so the lists stay.
+#[cfg(feature = "threading")]
+mod young {
+    use super::{GcState, PyObject};
+    use crate::common::linked_list::LinkedList;
+    use crate::common::lock::{PyMutex, PyRwLockWriteGuard};
+    use crate::object::{GC_LOCAL_YOUNG, GC_UNTRACKED, GcLink, RawAlloc};
+    use alloc::sync::Arc;
+    use core::cell::{Cell, UnsafeCell};
+    use core::ptr::NonNull;
+    use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+
+    /// How far a young list's own count may drift from zero before it is
+    /// folded into the shared gen0 count. Keeps the shared count, which the
+    /// collection threshold of every thread is compared against, within this
+    /// much per thread of the truth, for one atomic add per this many
+    /// allocations.
+    pub(super) const FLUSH: isize = 64;
+
+    /// Every thread's young list, by id.
+    pub(in crate::gc_state) struct Registry {
+        slots: Vec<Option<Arc<LocalYoung>>>,
+        free: Vec<u32>,
+    }
+
+    impl Registry {
+        pub(in crate::gc_state) const fn new() -> Self {
+            Self {
+                slots: Vec::new(),
+                free: Vec::new(),
+            }
+        }
+
+        pub(super) fn get(&self, id: u32) -> Option<Arc<LocalYoung>> {
+            self.slots.get(id as usize)?.clone()
+        }
+
+        pub(super) fn iter(&self) -> impl Iterator<Item = &Arc<LocalYoung>> {
+            self.slots.iter().flatten()
+        }
+
+        pub(super) fn remove(&mut self, id: u32) {
+            if let Some(slot) = self.slots.get_mut(id as usize)
+                && slot.take().is_some()
+            {
+                self.free.push(id);
+            }
+        }
+
+        /// Tracked-minus-untracked objects not yet folded into the shared
+        /// gen0 count, across every young list.
+        pub(super) fn pending(&self) -> isize {
+            self.iter()
+                .map(|young| young.count.load(Ordering::Relaxed))
+                .sum()
+        }
+
+        fn insert(&mut self) -> Arc<LocalYoung> {
+            let id = self.free.pop().unwrap_or_else(|| {
+                self.slots.push(None);
+                u32::try_from(self.slots.len() - 1).expect("too many threads")
+            });
+            let young = Arc::new(LocalYoung {
+                id,
+                list: UnsafeCell::new(LinkedList::new()),
+                count: AtomicIsize::new(0),
+                husks: PyMutex::new(Vec::new()),
+                has_husks: AtomicBool::new(false),
+            });
+            self.slots[id as usize] = Some(young.clone());
+            young
+        }
+    }
+
+    /// A dead object another thread handed back: still linked into the list,
+    /// with only its memory left.
+    pub(super) struct Husk {
+        obj: NonNull<PyObject>,
+        mem: RawAlloc,
+    }
+
+    // SAFETY: nothing but the husk refers to the object any more.
+    unsafe impl Send for Husk {}
+
+    pub(super) fn free_husks(husks: Vec<Husk>) {
+        for husk in husks {
+            // SAFETY: unlinked, and nothing else refers to it.
+            unsafe { husk.mem.free() };
+        }
+    }
+
+    /// One thread's young list. See the module docs for who may touch what.
+    pub(crate) struct LocalYoung {
+        id: u32,
+        list: UnsafeCell<LinkedList<GcLink>>,
+        /// Tracked-minus-untracked objects of this list not yet folded into
+        /// `GcState::counts[0]`. Written by whoever may touch `list` at the
+        /// time, and read by `gc.get_count()` from anywhere, so it is atomic,
+        /// but only ever loaded and stored.
+        count: AtomicIsize,
+        /// Objects other threads handed back; also the lock that everyone but
+        /// the attached owner takes to touch `list`.
+        husks: PyMutex<Vec<Husk>>,
+        /// Whether `husks` may be non-empty, so the owner can look without
+        /// taking the lock.
+        has_husks: AtomicBool,
+    }
+
+    // SAFETY: `list` is only touched under the protocol in the module docs;
+    // everything else is atomic or locked.
+    unsafe impl Send for LocalYoung {}
+    unsafe impl Sync for LocalYoung {}
+
+    std::thread_local! {
+        /// Whether this thread holds `GcState::collecting`.
+        static HOLDS_COLLECTING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Marks this thread as the one holding `GcState::collecting` for as long
+    /// as it lives.
+    pub(super) struct HoldsCollecting(());
+
+    impl HoldsCollecting {
+        pub(super) fn enter() -> Self {
+            HOLDS_COLLECTING.set(true);
+            Self(())
+        }
+
+        pub(super) fn is_set() -> bool {
+            HOLDS_COLLECTING.get()
+        }
+    }
+
+    impl Drop for HoldsCollecting {
+        fn drop(&mut self) {
+            HOLDS_COLLECTING.set(false);
+        }
+    }
+
+    std::thread_local! {
+        /// This thread's young list, for the lock-free fast path. Kept apart
+        /// from `OWNER` so that reading it needs no lazy-initialization check.
+        static CURRENT: Cell<*const LocalYoung> = const { Cell::new(core::ptr::null()) };
+        /// Keeps this thread's young list alive, and retires it at thread exit.
+        static OWNER: Owner = const { Owner(Cell::new(None)) };
+    }
+
+    struct Owner(Cell<Option<Arc<LocalYoung>>>);
+
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            if let Some(young) = self.0.take() {
+                CURRENT.set(core::ptr::null());
+                super::gc_state().retire_young(&young);
+            }
+        }
+    }
+
+    impl LocalYoung {
+        pub(super) const fn id(&self) -> u32 {
+            self.id
+        }
+
+        /// This thread's young list, if it has one.
+        pub(super) fn current() -> Option<&'static Self> {
+            let ptr = CURRENT.get();
+            // SAFETY: `OWNER` keeps the list alive until it clears `CURRENT`.
+            (!ptr.is_null()).then(|| unsafe { &*ptr })
+        }
+
+        /// This thread's young list, created on first use, if this thread is
+        /// attached and so may use it without a lock.
+        #[inline]
+        pub(super) fn current_attached() -> Option<&'static Self> {
+            if !crate::vm::thread::current_thread_is_attached() {
+                return None;
+            }
+            Self::current().or_else(Self::init_current)
+        }
+
+        #[cold]
+        #[inline(never)]
+        fn init_current() -> Option<&'static Self> {
+            // Fails once this thread's locals are being destroyed; the shared
+            // list takes over from there.
+            OWNER
+                .try_with(|owner| {
+                    let young = super::gc_state().young.write().insert();
+                    let ptr = Arc::as_ptr(&young);
+                    owner.0.set(Some(young));
+                    CURRENT.set(ptr);
+                    // SAFETY: as in `current`.
+                    unsafe { &*ptr }
+                })
+                .ok()
+        }
+
+        /// Whether `obj` is linked into this list.
+        pub(super) fn holds(&self, obj: &PyObject) -> bool {
+            obj.gc_generation() == GC_LOCAL_YOUNG && obj.gc_young_slot() == self.id
+        }
+
+        /// Adjust `count` by `delta`, folding it into the shared count once it
+        /// drifts too far. Returns what is left pending here.
+        #[inline(always)]
+        fn add_count(&self, state: &GcState, delta: isize) -> isize {
+            let pending = self.count.load(Ordering::Relaxed) + delta;
+            // Only the direction `delta` moves in can cross a bound.
+            let crossed = if delta > 0 {
+                pending >= FLUSH
+            } else {
+                pending <= -FLUSH
+            };
+            if crossed {
+                state.add_count0(pending);
+                self.count.store(0, Ordering::Relaxed);
+                0
+            } else {
+                self.count.store(pending, Ordering::Relaxed);
+                pending
+            }
+        }
+
+        /// Track a freshly allocated object in this list. Returns the count
+        /// still pending here, for the collection threshold check.
+        ///
+        /// # Safety
+        /// This must be the current thread's list, and the thread attached.
+        /// `obj` must be valid and its `gc_bits` still `0`.
+        #[inline]
+        pub(super) unsafe fn track_fresh(
+            &self,
+            state: &GcState,
+            obj: NonNull<PyObject>,
+            owner: super::GcOwner,
+        ) -> isize {
+            if self.has_husks.load(Ordering::Relaxed) {
+                unsafe { self.reclaim_husks(state) };
+            }
+            let obj_ref = unsafe { obj.as_ref() };
+            obj_ref.init_gc_tracked_bit();
+            obj_ref.set_gc_generation(GC_LOCAL_YOUNG);
+            obj_ref.set_gc_owner(owner);
+            obj_ref.set_gc_young_slot(self.id);
+            // SAFETY: attached owner.
+            unsafe { (*self.list.get()).push_front(obj) };
+            self.add_count(state, 1)
+        }
+
+        /// Unlink and free what other threads handed back.
+        ///
+        /// # Safety
+        /// As [`Self::track_fresh`].
+        #[cold]
+        #[inline(never)]
+        unsafe fn reclaim_husks(&self, state: &GcState) {
+            let husks = {
+                let mut queue = self.husks.lock();
+                self.has_husks.store(false, Ordering::Relaxed);
+                core::mem::take(&mut *queue)
+            };
+            // SAFETY: attached owner.
+            let list = unsafe { &mut *self.list.get() };
+            for husk in &husks {
+                let removed = unsafe { list.remove(husk.obj) };
+                debug_assert!(removed.is_some());
+            }
+            self.add_count(state, -(husks.len() as isize));
+            free_husks(husks);
+        }
+
+        /// Untrack an object in this list.
+        ///
+        /// # Safety
+        /// This must be the current thread's list, the thread attached (or
+        /// holding the `husks` lock), and `obj` linked into it. `dying` may
+        /// only be set when nothing but the caller can reach `obj`.
+        pub(super) unsafe fn untrack_owned(
+            &self,
+            state: &GcState,
+            obj: NonNull<PyObject>,
+            dying: bool,
+        ) {
+            let obj_ref = unsafe { obj.as_ref() };
+            debug_assert!(self.holds(obj_ref));
+            let removed = unsafe { (*self.list.get()).remove(obj) };
+            debug_assert!(removed.is_some());
+            if dying {
+                obj_ref.clear_gc_tracked_unshared();
+            } else {
+                obj_ref.clear_gc_tracked();
+            }
+            obj_ref.set_gc_generation(GC_UNTRACKED);
+            self.add_count(state, -1);
+        }
+
+        /// [`Self::untrack_owned`] for a thread that is not attached, which
+        /// needs the lock, and may find that a collection moved `obj` to the
+        /// shared lists in the meantime (returning `false`).
+        ///
+        /// # Safety
+        /// As [`Self::untrack_owned`], except for the attachment.
+        pub(super) unsafe fn untrack_owned_locked(
+            &self,
+            state: &GcState,
+            obj: NonNull<PyObject>,
+            dying: bool,
+        ) -> bool {
+            let _guard = self.husks.lock();
+            if !self.holds(unsafe { obj.as_ref() }) {
+                return false;
+            }
+            unsafe { self.untrack_owned(state, obj, dying) };
+            true
+        }
+
+        /// See [`super::ForeignYoung::give_back`].
+        pub(super) unsafe fn give_back(
+            &self,
+            obj: NonNull<PyObject>,
+            mem: RawAlloc,
+        ) -> Result<(), RawAlloc> {
+            let mut queue = self.husks.lock();
+            // Under the lock, membership cannot change: moving the list to the
+            // shared one takes it too.
+            if !self.holds(unsafe { obj.as_ref() }) {
+                return Err(mem);
+            }
+            queue.push(Husk { obj, mem });
+            self.has_husks.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        /// Move this list's objects onto `gen0`, unlinking the husks into
+        /// `husks` for the caller to free once it has let go of its locks.
+        ///
+        /// # Safety
+        /// The owner must not be attached, or must be the caller.
+        pub(super) unsafe fn splice_into(
+            &self,
+            state: &GcState,
+            gen0: &mut PyRwLockWriteGuard<'_, LinkedList<GcLink>>,
+            husks: &mut Vec<Husk>,
+        ) {
+            let mut queue = self.husks.lock();
+            // SAFETY: the lock is held and the owner is not attached.
+            let list = unsafe { &mut *self.list.get() };
+            let mut pending = self.count.load(Ordering::Relaxed);
+            for husk in queue.drain(..) {
+                let removed = unsafe { list.remove(husk.obj) };
+                debug_assert!(removed.is_some());
+                pending -= 1;
+                husks.push(husk);
+            }
+            self.has_husks.store(false, Ordering::Relaxed);
+            while let Some(obj) = list.pop_front() {
+                unsafe { obj.as_ref() }.set_gc_generation(0);
+                gen0.push_front(obj);
+            }
+            self.count.store(0, Ordering::Relaxed);
+            state.add_count0(pending);
+        }
+
+        /// # Safety
+        /// Only in the child after fork().
+        #[cfg(unix)]
+        pub(super) unsafe fn reinit_after_fork(&self) {
+            unsafe { crate::common::lock::reinit_mutex_after_fork(&self.husks) };
+        }
+    }
 }
 
 /// Get a reference to the GC state.
