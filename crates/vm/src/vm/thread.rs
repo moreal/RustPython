@@ -104,16 +104,6 @@ pub struct ThreadSlot {
 #[cfg(feature = "threading")]
 pub type CurrentFrameSlot = Arc<ThreadSlot>;
 
-/// A thread that queues an object for this one to merge (biased reference
-/// counting) trips this thread's eval breaker, and only this thread's.
-/// `suspend_if_needed` clears the bit again when no stop is pending.
-#[cfg(feature = "threading")]
-impl crate::common::refcount::OwnerWakeup for ThreadSlot {
-    fn wake(&self) {
-        self.stop_requested.store(true, Ordering::Release);
-    }
-}
-
 /// Coalesced per-thread frame-publishing state, touched on every
 /// `enter_iframe`/`exit_iframe`. Bundling `current_frame` together with
 /// the cached `top_frame`/`top_iframe` slot pointers means
@@ -506,7 +496,6 @@ fn set_current_thread_slot(slot: CurrentFrameSlot) {
         cache.top_iframe.set(&slot.top_iframe);
     });
     CURRENT_STOP_REQUESTED.with(|c| c.set(&slot.stop_requested));
-    crate::common::refcount::set_current_thread_wakeup(Some(slot.clone()));
     CURRENT_THREAD_SLOT.with(|current| {
         *current.borrow_mut() = Some(slot);
     });
@@ -1210,8 +1199,6 @@ pub fn cleanup_current_thread_frames(vm: &VirtualMachine) {
             });
             #[cfg(feature = "threading")]
             CURRENT_STOP_REQUESTED.with(|c| c.set(core::ptr::null()));
-            #[cfg(feature = "threading")]
-            crate::common::refcount::set_current_thread_wakeup(None);
         }
     });
 }
@@ -1281,7 +1268,6 @@ pub fn reinit_frame_slot_after_fork(vm: &VirtualMachine) {
     });
     #[cfg(feature = "threading")]
     CURRENT_STOP_REQUESTED.with(|c| c.set(&new_slot.stop_requested));
-    crate::common::refcount::set_current_thread_wakeup(Some(new_slot.clone()));
 
     // Lock is safe: reinit_locks_after_fork() already reset it to unlocked.
     let mut registry = vm.state.thread_frames.lock();

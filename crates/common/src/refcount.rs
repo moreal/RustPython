@@ -13,9 +13,8 @@ mod single;
 
 #[cfg(feature = "threading")]
 pub use biased::{
-    OwnerWakeup, RefCount, after_fork_child, current_owner_id, exit_current_thread,
-    has_queued_objects, merge_queued_objects, merge_queued_objects_of, others_have_queued_objects,
-    reinit_after_fork, set_current_thread_wakeup,
+    RefCount, after_fork_child, current_owner_id, exit_current_thread, has_queued_objects,
+    merge_queued_objects, merge_queued_objects_of, others_have_queued_objects, reinit_after_fork,
 };
 #[cfg(not(feature = "threading"))]
 pub use single::RefCount;

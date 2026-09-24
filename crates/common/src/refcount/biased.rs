@@ -120,20 +120,11 @@ fn refcount_overflow() -> ! {
     std::process::abort()
 }
 
-/// How a thread that queues an object asks its owner to merge soon: the
-/// interpreter trips the owner's own eval breaker, so threads with nothing
-/// queued keep their fast path.
-pub trait OwnerWakeup: Send + Sync {
-    /// Called with the registry lock held; must not touch a reference count.
-    fn wake(&self);
-}
-
 struct Owner {
     /// Objects handed over by other threads, each carrying one reference.
     objects: Vec<usize>,
     /// Whether `objects` is nonempty, readable without the registry lock.
     pending: Arc<AtomicBool>,
-    wakeup: Option<Arc<dyn OwnerWakeup>>,
 }
 
 struct Registry {
@@ -195,7 +186,6 @@ fn register_current_thread() -> u32 {
         Owner {
             objects: Vec::new(),
             pending,
-            wakeup: None,
         },
     );
     CURRENT_TID.set(tid);
@@ -218,31 +208,13 @@ fn take_queue(registry: &mut Registry, tid: u32) -> Vec<usize> {
     objects
 }
 
-/// Deregister `tid`, returning its entry. The caller drops the entry after
-/// releasing the registry lock: its wakeup may own objects.
+/// Deregister `tid`, returning its entry.
 fn remove_owner(registry: &mut Registry, tid: u32) -> Option<Owner> {
     let owner = registry.owners.remove(&tid)?;
     if !owner.objects.is_empty() {
         registry.pending_owners -= 1;
     }
     Some(owner)
-}
-
-/// Set how other threads wake the current thread when they queue an object
-/// for it (`None` while it has no interpreter to run). Registers the thread.
-pub fn set_current_thread_wakeup(wakeup: Option<Arc<dyn OwnerWakeup>>) {
-    let tid = current_owner_id();
-    if tid == UNOWNED {
-        return;
-    }
-    let old = {
-        let mut registry = REGISTRY.lock();
-        let Some(owner) = registry.owners.get_mut(&tid) else {
-            return;
-        };
-        core::mem::replace(&mut owner.wakeup, wakeup)
-    };
-    drop(old);
 }
 
 /// The current thread's owner id, registering it if needed. Zero when it
@@ -694,14 +666,10 @@ impl RefCount {
             if let Some(owner) = registry.owners.get_mut(&tid) {
                 if owner.objects.is_empty() {
                     registry.pending_owners += 1;
-                    owner.pending.store(true, Ordering::Relaxed);
+                    // The owner's eval breaker polls this flag.
+                    owner.pending.store(true, Ordering::Release);
                 }
                 owner.objects.push(self as *const Self as usize);
-                // Every time, not only on the first push: the owner may have
-                // cleared a request it took for something else.
-                if let Some(wakeup) = &owner.wakeup {
-                    wakeup.wake();
-                }
                 return false;
             }
         }
