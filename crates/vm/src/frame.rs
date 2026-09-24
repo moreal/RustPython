@@ -12,7 +12,9 @@ use crate::{
         builtin_func::PyNativeFunction,
         descriptor::{MemberGetter, PyMemberDescriptor, PyMethodDescriptor},
         frame::stack_analysis,
-        function::{PyBoundMethod, PyCell, PyCellRef, PyFunction, vectorcall_function},
+        function::{
+            KwCallLayout, PyBoundMethod, PyCell, PyCellRef, PyFunction, vectorcall_function,
+        },
         list::PyListIterator,
         range::PyRangeIterator,
         tuple::{PyTuple, PyTupleIterator, PyTupleRef},
@@ -6849,8 +6851,10 @@ impl ExecutingFrame<'_> {
                     if call_conv == PyMethodFlags::O && effective_nargs == 1 {
                         let (callable, args_vec) = self.take_call_args(nargs as usize);
                         debug_assert_eq!(args_vec.len(), effective_nargs as usize);
-                        let result =
-                            callable.vectorcall(args_vec, effective_nargs as usize, None, vm)?;
+                        // SAFETY: checked to be an exact PyNativeFunction above.
+                        let native =
+                            unsafe { callable.downcast_unchecked_ref::<PyNativeFunction>() };
+                        let result = native.call_positional(args_vec, vm)?;
                         self.push_value(result);
                         return Ok(None);
                     }
@@ -6876,8 +6880,10 @@ impl ExecutingFrame<'_> {
                     if call_conv == PyMethodFlags::FASTCALL {
                         let (callable, args_vec) = self.take_call_args(nargs as usize);
                         debug_assert_eq!(args_vec.len(), effective_nargs as usize);
-                        let result =
-                            callable.vectorcall(args_vec, effective_nargs as usize, None, vm)?;
+                        // SAFETY: checked to be an exact PyNativeFunction above.
+                        let native =
+                            unsafe { callable.downcast_unchecked_ref::<PyNativeFunction>() };
+                        let result = native.call_positional(args_vec, vm)?;
                         self.push_value(result);
                         return Ok(None);
                     }
@@ -6902,6 +6908,28 @@ impl ExecutingFrame<'_> {
                     }
                     if self.specialization_call_recursion_guard(vm) {
                         return self.execute_call_vectorcall(nargs, vm);
+                    }
+                    if self.flatten == Flatten::CallAndGenResume
+                        && !func.is_generator_like()
+                        && self.specialization_has_datastack_space_for_func(vm, func)
+                    {
+                        let stack_len = self.localsplus.stack_len();
+                        let has_self = self
+                            .localsplus
+                            .stack_index(stack_len - nargs as usize - 1)
+                            .is_some();
+                        let npos = nargs as usize + usize::from(has_self);
+                        if let Some(layout) = func.resolve_kw_call(npos, &[]) {
+                            self.tailcall_prepare_kw_frame(
+                                None,
+                                nargs as usize,
+                                npos,
+                                &[],
+                                &layout,
+                                vm,
+                            )?;
+                            return Ok(Some(ExecutionResult::TailCall));
+                        }
                     }
                     let (callable, args_vec) = self.take_call_args(nargs as usize);
                     let effective_nargs = args_vec.len();
@@ -6943,6 +6971,21 @@ impl ExecutingFrame<'_> {
                             return self.execute_call_vectorcall(nargs, vm);
                         }
                         let nargs_usize = nargs as usize;
+                        if self.flatten == Flatten::CallAndGenResume
+                            && !func.is_generator_like()
+                            && self.specialization_has_datastack_space_for_func(vm, func)
+                            && let Some(layout) = func.resolve_kw_call(nargs_usize + 1, &[])
+                        {
+                            self.tailcall_prepare_kw_frame(
+                                Some((bound_function, bound_self)),
+                                nargs_usize,
+                                nargs_usize + 1,
+                                &[],
+                                &layout,
+                                vm,
+                            )?;
+                            return Ok(Some(ExecutionResult::TailCall));
+                        }
                         let mut args_vec = Vec::with_capacity(nargs_usize + 1);
                         args_vec.push(bound_self);
                         args_vec.extend(self.pop_multiple(nargs_usize));
@@ -7250,8 +7293,10 @@ impl ExecutingFrame<'_> {
                     if call_conv == (PyMethodFlags::FASTCALL | PyMethodFlags::KEYWORDS) {
                         let (callable, args_vec) = self.take_call_args(nargs as usize);
                         debug_assert_eq!(args_vec.len(), effective_nargs as usize);
-                        let result =
-                            callable.vectorcall(args_vec, effective_nargs as usize, None, vm)?;
+                        // SAFETY: checked to be an exact PyNativeFunction above.
+                        let native =
+                            unsafe { callable.downcast_unchecked_ref::<PyNativeFunction>() };
+                        let result = native.call_positional(args_vec, vm)?;
                         self.push_value(result);
                         return Ok(None);
                     }
@@ -7304,6 +7349,32 @@ impl ExecutingFrame<'_> {
                         return self.execute_call_kw_vectorcall(nargs, vm);
                     }
                     let nargs_usize = nargs as usize;
+                    if self.flatten == Flatten::CallAndGenResume
+                        && !func.is_generator_like()
+                        && self.specialization_has_datastack_space_for_func(vm, func)
+                    {
+                        let stack_len = self.localsplus.stack_len();
+                        let has_self = self
+                            .localsplus
+                            .stack_index(stack_len - nargs_usize - 2)
+                            .is_some();
+                        let kwnames = self.top_value().downcast_ref::<PyTuple>().unwrap();
+                        let npos = nargs_usize - kwnames.len() + usize::from(has_self);
+                        if let Some(layout) = func.resolve_kw_call(npos, kwnames.as_slice()) {
+                            let kwnames = self.pop_value();
+                            // SAFETY: just checked to be a tuple above.
+                            let kwnames = unsafe { kwnames.downcast_unchecked_ref::<PyTuple>() };
+                            self.tailcall_prepare_kw_frame(
+                                None,
+                                nargs_usize,
+                                npos,
+                                kwnames.as_slice(),
+                                &layout,
+                                vm,
+                            )?;
+                            return Ok(Some(ExecutionResult::TailCall));
+                        }
+                    }
                     let kwarg_names_obj = self.pop_value();
                     let kwarg_names_tuple = kwarg_names_obj
                         .downcast_ref::<PyTuple>()
@@ -7362,6 +7433,29 @@ impl ExecutingFrame<'_> {
                             return self.execute_call_kw_vectorcall(nargs, vm);
                         }
                         let nargs_usize = nargs as usize;
+                        if self.flatten == Flatten::CallAndGenResume
+                            && !func.is_generator_like()
+                            && self.specialization_has_datastack_space_for_func(vm, func)
+                            && !self.specialization_call_recursion_guard(vm)
+                        {
+                            let kwnames = self.top_value().downcast_ref::<PyTuple>().unwrap();
+                            let npos = nargs_usize - kwnames.len() + 1;
+                            if let Some(layout) = func.resolve_kw_call(npos, kwnames.as_slice()) {
+                                let kwnames = self.pop_value();
+                                // SAFETY: just checked to be a tuple above.
+                                let kwnames =
+                                    unsafe { kwnames.downcast_unchecked_ref::<PyTuple>() };
+                                self.tailcall_prepare_kw_frame(
+                                    Some((bound_function, bound_self)),
+                                    nargs_usize,
+                                    npos,
+                                    kwnames.as_slice(),
+                                    &layout,
+                                    vm,
+                                )?;
+                                return Ok(Some(ExecutionResult::TailCall));
+                            }
+                        }
                         let kwarg_names_obj = self.pop_value();
                         let kwarg_names_tuple = kwarg_names_obj
                             .downcast_ref::<PyTuple>()
@@ -11748,6 +11842,102 @@ impl ExecutingFrame<'_> {
         vm.set_pending_tailcall_owner(bound_function);
 
         vm.set_pending_tailcall(callee_iframe);
+    }
+
+    /// Prepare a TailCall for a call that binds through a keyword layout —
+    /// defaults, keyword arguments, `*args`/`**kwargs` — moving the arguments
+    /// from the caller's stack straight into the callee's fastlocals.
+    ///
+    /// Stack: `[callable, self_or_null, arg1, ..., argN]`, with the call's
+    /// kwnames tuple (if any) already popped and passed as `kwnames`. For a
+    /// bound method, `bound` holds its function and `self`, and `callable` is
+    /// the bound method; otherwise `callable` is the function itself.
+    /// `npos` counts the positional arguments including any `self`.
+    ///
+    /// Everything is off the caller's stack when this returns, whether or not
+    /// binding succeeded; on error (a missing argument) there is no pending
+    /// frame and the error is the call's.
+    fn tailcall_prepare_kw_frame(
+        &mut self,
+        bound: Option<(PyObjectRef, PyObjectRef)>,
+        nargs: usize,
+        npos: usize,
+        kwnames: &[PyObjectRef],
+        layout: &KwCallLayout,
+        vm: &VirtualMachine,
+    ) -> PyResult<()> {
+        let stack_len = self.localsplus.stack_len();
+        let callable_idx = stack_len - nargs - 2;
+        let (bound_function, bound_self) = bound.unzip();
+        let func_obj: *const PyObject = match &bound_function {
+            Some(f) => &**f,
+            None => self.nth_value(nargs as u32 + 1),
+        };
+        // SAFETY: the function is either `bound_function` or the callable,
+        // which stays on the stack until after binding; both outlive `func`.
+        let func = unsafe { (*func_obj).downcast_unchecked_ref::<PyFunction>() };
+        let code: &Py<PyCode> = &func.code;
+
+        let locals = if code.flags.contains(bytecode::CodeFlags::NEWLOCALS) {
+            FrameLocals::lazy()
+        } else {
+            FrameLocals::with_locals(crate::function::ArgMapping::from_dict_exact(
+                func.globals.clone(),
+            ))
+        };
+        let callee_iframe = unsafe {
+            // SAFETY: the function object is handed to the trampoline as the
+            // pending owner below, keeping the borrowed fields alive while the
+            // callee runs.
+            InterpreterFrame::new_on_datastack(
+                code,
+                &func.globals,
+                &func.builtins,
+                Some(func.as_object()),
+                locals,
+                func.closure.as_ref().map_or(&[], |c| c.as_slice()),
+                vm,
+            )
+        };
+
+        let localsplus = &mut *self.localsplus;
+        let args = bound_self
+            .into_iter()
+            .chain((callable_idx + 1..stack_len).filter_map(|idx| {
+                localsplus
+                    .stack_index_mut(idx)
+                    .take()
+                    .map(|sr| sr.to_pyobj())
+            }));
+        let bound_ok = func.bind_kw_call(
+            callee_iframe.localsplus.fastlocals_mut(),
+            args,
+            npos,
+            kwnames,
+            layout,
+            vm,
+        );
+        let callable = self
+            .localsplus
+            .stack_index_mut(callable_idx)
+            .take()
+            .unwrap()
+            .to_pyobj();
+        self.localsplus.stack_truncate(callable_idx);
+        if let Err(exc) = bound_ok {
+            unsafe {
+                if let Some((base, size)) = callee_iframe.release_datastack_frame() {
+                    vm.datastack_pop_frame(base, size);
+                }
+            }
+            return Err(exc);
+        }
+
+        // A bound method's function owns the callee's fields; the bound
+        // method itself is no longer needed, matching the recursive path.
+        vm.set_pending_tailcall_owner(bound_function.unwrap_or(callable));
+        vm.set_pending_tailcall(callee_iframe);
+        Ok(())
     }
 
     #[inline]
