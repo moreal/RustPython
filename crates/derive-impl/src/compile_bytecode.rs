@@ -49,12 +49,29 @@ struct CompilationSource {
 
 /// Read a source file as text. A byte order mark belongs to the file's
 /// encoding rather than to the text, so it never reaches the compiler.
-fn read_source_file(path: &Path) -> std::io::Result<String> {
-    let mut source = fs::read_to_string(path)?;
+fn read_source_file(path: &Path, dependencies: &mut TokenStream) -> std::io::Result<String> {
+    let mut source = read_tracked_file(path, dependencies)?;
     if source.starts_with('\u{feff}') {
         source.drain(..'\u{feff}'.len_utf8());
     }
     Ok(source)
+}
+
+fn read_tracked_file(path: &Path, dependencies: &mut TokenStream) -> std::io::Result<String> {
+    let source = fs::read_to_string(path);
+    // Decoding errors may be skipped for some modules, but changes still need tracking.
+    if let Err(err) = &source
+        && err.kind() != std::io::ErrorKind::InvalidData
+    {
+        return source;
+    }
+    let path = std::path::absolute(path)?;
+    // Rust string literals cannot represent every OS path. Preserve compilation for
+    // those paths, even though include_bytes! cannot track them.
+    if let Some(path) = path.to_str() {
+        dependencies.extend(quote! { const _: &[u8] = ::core::include_bytes!(#path); });
+    }
+    source
 }
 
 pub trait Compiler {
@@ -88,15 +105,16 @@ impl CompilationSource {
         mode: Mode,
         module_name: &str,
         compiler: &dyn Compiler,
+        dependencies: &mut TokenStream,
     ) -> Result<HashMap<String, CompiledModule>, Diagnostic> {
         match &self.kind {
             CompilationSourceKind::Dir { base, rel_path } => {
-                self.compile_dir(base, &base.join(rel_path), "", mode, compiler)
+                self.compile_dir(base, &base.join(rel_path), "", mode, compiler, dependencies)
             }
             _ => Ok(core::iter::once((
                 module_name.to_string(),
                 CompiledModule {
-                    code: self.compile_single(mode, module_name, compiler)?,
+                    code: self.compile_single(mode, module_name, compiler, dependencies)?,
                     package: false,
                 },
             ))
@@ -109,11 +127,12 @@ impl CompilationSource {
         mode: Mode,
         module_name: &str,
         compiler: &dyn Compiler,
+        dependencies: &mut TokenStream,
     ) -> Result<CodeObject, Diagnostic> {
         match &self.kind {
             CompilationSourceKind::File { base, rel_path } => {
                 let path = base.join(rel_path);
-                let source = read_source_file(&path).map_err(|err| {
+                let source = read_source_file(&path, dependencies).map_err(|err| {
                     Diagnostic::spans_error(
                         self.span,
                         format!("Error reading file {path:?}: {err}"),
@@ -141,12 +160,14 @@ impl CompilationSource {
         parent: &str,
         mode: Mode,
         compiler: &dyn Compiler,
+        dependencies: &mut TokenStream,
     ) -> Result<HashMap<String, CompiledModule>, Diagnostic> {
         let mut code_map = HashMap::new();
         let paths = fs::read_dir(path)
             .or_else(|e| {
                 if cfg!(windows)
-                    && let Ok(real_path) = fs::read_to_string(path.canonicalize().unwrap())
+                    && let Ok(real_path) =
+                        read_tracked_file(&path.canonicalize().unwrap(), dependencies)
                 {
                     return fs::read_dir(real_path.trim());
                 }
@@ -169,7 +190,14 @@ impl CompilationSource {
                 } else {
                     format!("{parent}.{file_name}")
                 };
-                code_map.extend(self.compile_dir(base, &path, &nparent, mode, compiler)?);
+                code_map.extend(self.compile_dir(
+                    base,
+                    &path,
+                    &nparent,
+                    mode,
+                    compiler,
+                    dependencies,
+                )?);
             } else if file_name.ends_with(".py") {
                 let stem = path.file_stem().unwrap().to_str().unwrap();
                 let is_init = stem == "__init__";
@@ -181,8 +209,8 @@ impl CompilationSource {
                     &format!("{parent}.{stem}")
                 };
 
-                let compile_path = |src_path: &Path| {
-                    let source = read_source_file(src_path).map_err(|err| {
+                let mut compile_path = |src_path: &Path| {
+                    let source = read_source_file(src_path, dependencies).map_err(|err| {
                         Diagnostic::spans_error(
                             self.span,
                             format!("Error reading file {path:?}: {err}"),
@@ -348,16 +376,18 @@ pub(crate) fn impl_py_compile(
     let args = PyCompileArgs::parse(input, false)?;
 
     let crate_name = args.crate_name;
-    let code = args
-        .source
-        .compile_single(args.mode, &args.module_name, compiler)?;
+    let mut dependencies = TokenStream::new();
+    let code =
+        args.source
+            .compile_single(args.mode, &args.module_name, compiler, &mut dependencies)?;
 
     let frozen = frozen::FrozenCodeObject::encode(&code);
     let bytes = LitByteStr::new(&frozen.bytes, Span::call_site());
 
-    let output = quote! {
+    let output = quote! {{
+        #dependencies
         #crate_name::frozen::FrozenCodeObject { bytes: &#bytes[..] }
-    };
+    }};
 
     Ok(output)
 }
@@ -369,9 +399,10 @@ pub(crate) fn impl_py_freeze(
     let args = PyCompileArgs::parse(input, true)?;
 
     let crate_name = args.crate_name;
-    let code_map = args
-        .source
-        .compile(args.mode, &args.module_name, compiler)?;
+    let mut dependencies = TokenStream::new();
+    let code_map =
+        args.source
+            .compile(args.mode, &args.module_name, compiler, &mut dependencies)?;
 
     let data = frozen::FrozenLib::encode(code_map.iter().map(|(k, v)| {
         let v = frozen::FrozenModule {
@@ -382,9 +413,10 @@ pub(crate) fn impl_py_freeze(
     }));
     let bytes = LitByteStr::new(&data.bytes, Span::call_site());
 
-    let output = quote! {
+    let output = quote! {{
+        #dependencies
         #crate_name::frozen::FrozenLib::from_ref(#bytes)
-    };
+    }};
 
     Ok(output)
 }
