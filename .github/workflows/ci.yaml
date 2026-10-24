@@ -394,10 +394,10 @@ jobs:
           target: x86_64-pc-windows-gnu
           dependencies:
             gcc-mingw-w64-x86-64: true
+        # macOS runners have the smallest concurrency limit, so both macOS
+        # targets share one runner. `target` is a comma-separated list.
         - os: macos-latest
-          target: aarch64-apple-ios
-        - os: macos-latest
-          target: x86_64-apple-darwin
+          target: aarch64-apple-ios,x86_64-apple-darwin
       fail-fast: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
