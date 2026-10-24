@@ -343,6 +343,11 @@ jobs:
       - name: Build example projects
         if: env.RUN_RUST_TESTS == 'true' && runner.os == 'Linux'
         run: |
+          # The example projects have no lockfile of their own. Resolve them
+          # like the workspace, so a new release of a dependency cannot pull in
+          # a second, incompatible version of a crate the workspace pins.
+          cp Cargo.lock example_projects/barebone/
+          cp Cargo.lock example_projects/frozen_stdlib/
           cargo build --manifest-path example_projects/barebone/Cargo.toml
           cargo build --manifest-path example_projects/frozen_stdlib/Cargo.toml
         env:
