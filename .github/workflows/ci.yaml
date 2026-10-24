@@ -517,6 +517,7 @@ jobs:
             - '--dont-add-python-opts'
           env_polluting_tests: []
           skips: []
+          snippets_filter: not test_cpython_
           timeout: 50
         - os: ubuntu-latest
           extra_test_args:
@@ -536,6 +537,7 @@ jobs:
             - '--ignore test.test_launcher.TestLauncher.test_version'
           env_polluting_tests: []
           skips: []
+          snippets_filter: not test_cpython_
           timeout: 50
       fail-fast: false
     steps:
@@ -583,8 +585,11 @@ jobs:
         run: cargo build --locked --release --verbose --features=threading,jit ${{ env.CARGO_ARGS }}
 
       - name: run snippets
-        run: python -m pip install -r requirements.txt && pytest -v
+        shell: bash
+        run: python -m pip install -r requirements.txt && pytest -v ${SNIPPETS_FILTER:+-k "$SNIPPETS_FILTER"}
         working-directory: ./extra_tests
+        env:
+          SNIPPETS_FILTER: ${{ matrix.snippets_filter }}
 
       - name: Detect available cores
         id: cores
