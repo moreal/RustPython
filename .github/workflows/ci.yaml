@@ -412,9 +412,10 @@ jobs:
           dependencies:
             gcc-mingw-w64-x86-64: true
         # macOS runners have the smallest concurrency limit, so both macOS
-        # targets share one runner. `target` is a comma-separated list.
+        # targets share one runner. `target` is a space-separated list
+        # (cache keys cannot contain commas).
         - os: macos-latest
-          target: aarch64-apple-ios,x86_64-apple-darwin
+          target: aarch64-apple-ios x86_64-apple-darwin
       fail-fast: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -484,7 +485,7 @@ jobs:
 
       - name: Check compilation with threading
         run: |
-          IFS=, read -ra targets <<< "$TARGETS"
+          read -ra targets <<< "$TARGETS"
           cargo check --locked "${targets[@]/#/--target=}" ${{ env.CARGO_ARGS_NO_SSL }} --features threading
         env:
           TARGETS: ${{ matrix.target }}
@@ -492,7 +493,7 @@ jobs:
       - name: Check compilation with ssl
         if: ${{ !matrix.skip_ssl }}
         run: |
-          IFS=, read -ra targets <<< "$TARGETS"
+          read -ra targets <<< "$TARGETS"
           cargo check --locked "${targets[@]/#/--target=}" ${{ env.CARGO_ARGS }}
         env:
           TARGETS: ${{ matrix.target }}
