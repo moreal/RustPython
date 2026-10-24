@@ -21,6 +21,8 @@ env:
   CARGO_PROFILE_RELEASE_DEBUG: 0
   # Keep feature list in sync with CI's release build in .github/workflows/ci.yaml.
   CARGO_ARGS: --workspace --no-default-features --features stdlib,importlib,stdio,encodings,sqlite,ssl-rustls-aws-lc,host_env,threading,jit,doc --exclude rustpython_wasm --exclude rustpython-venvlauncher
+  # Keep in sync with CARGO_ARGS in .github/workflows/ci.yaml.
+  CARGO_TEST_ARGS: --no-default-features --features stdlib,importlib,stdio,encodings,sqlite,ssl-rustls-aws-lc,host_env,doc
 
 jobs:
   build-caches:
@@ -39,11 +41,9 @@ jobs:
             toolchain: stable
             target: ""
     steps:
-      - name: Checkout RustPython main branch
+      - name: Checkout RustPython
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: RustPython/RustPython
-          ref: main
           persist-credentials: false
 
       - name: Setup Rust
@@ -67,8 +67,10 @@ jobs:
       - name: Build dev cache # dev profile used by check & doc
         run: cargo build --locked --profile dev ${{ env.CARGO_ARGS }}
 
+      # Same command as the rust_tests job in ci.yaml, so the cache also holds
+      # the dev-dependencies and the feature set those tests build with.
       - name: Build test cache
-        run: cargo build --locked --profile test ${{ env.CARGO_ARGS }}
+        run: cargo test --no-run --locked --workspace --exclude rustpython-capi --exclude rustpython_wasm --exclude rustpython-venvlauncher --features threading ${{ env.CARGO_TEST_ARGS }}
 
       - name: Build release cache
         run: cargo build --locked --profile release ${{ env.CARGO_ARGS }}
