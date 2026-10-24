@@ -238,6 +238,11 @@ jobs:
           "CARGO_HOME=$env:RUNNER_TEMP\c" >> $env:GITHUB_ENV
           git config --global core.longpaths true
 
+      - name: Put the target directory on a Dev Drive
+        if: env.RUN_RUST_TESTS == 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: .github/workflows/setup-dev-drive.ps1
+
       - name: Restore cache
         if: env.RUN_RUST_TESTS == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -273,6 +278,13 @@ jobs:
         run: cargo test --locked --workspace --exclude rustpython-capi ${{ env.WORKSPACE_EXCLUDES }} --features threading ${{ env.CARGO_ARGS }} --lib --bins --tests
         env:
           INSTA_WORKSPACE_ROOT: ${{ github.workspace }}
+
+      - name: Show Dev Drive state
+        if: always() && env.RUN_RUST_TESTS == 'true' && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Item target | Format-List FullName, Attributes, LinkType, Target
+          fsutil volume diskfree "$env:DEV_DRIVE"
 
       - name: Run rust doctests
         if: env.RUN_RUST_TESTS == 'true'
@@ -466,11 +478,19 @@ jobs:
       #     args: --ignore-rust-version
 
       - name: Check compilation with threading
-        run: cargo check --locked --target "${{ matrix.target }}" ${{ env.CARGO_ARGS_NO_SSL }} --features threading
+        run: |
+          IFS=, read -ra targets <<< "$TARGETS"
+          cargo check --locked "${targets[@]/#/--target=}" ${{ env.CARGO_ARGS_NO_SSL }} --features threading
+        env:
+          TARGETS: ${{ matrix.target }}
 
       - name: Check compilation with ssl
         if: ${{ !matrix.skip_ssl }}
-        run: cargo check --locked --target "${{ matrix.target }}" ${{ env.CARGO_ARGS }}
+        run: |
+          IFS=, read -ra targets <<< "$TARGETS"
+          cargo check --locked "${targets[@]/#/--target=}" ${{ env.CARGO_ARGS }}
+        env:
+          TARGETS: ${{ matrix.target }}
 
   snippets_cpython:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip:ci') }}
@@ -529,6 +549,11 @@ jobs:
           "CARGO_HOME=$env:RUNNER_TEMP\c" >> $env:GITHUB_ENV
           git config --global core.longpaths true
 
+      - name: Put the target directory on a Dev Drive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .github/workflows/setup-dev-drive.ps1
+
       - name: Restore cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -558,6 +583,13 @@ jobs:
       # Keep features in sync with update-caches.yml CARGO_ARGS.
       - name: build rustpython
         run: cargo build --locked --release --verbose --features=threading,jit ${{ env.CARGO_ARGS }}
+
+      - name: Show Dev Drive state
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Item target | Format-List FullName, Attributes, LinkType, Target
+          fsutil volume diskfree "$env:DEV_DRIVE"
 
       - name: run snippets
         shell: bash
@@ -683,6 +715,11 @@ jobs:
           "CARGO_HOME=$env:RUNNER_TEMP\c" >> $env:GITHUB_ENV
           git config --global core.longpaths true
 
+      - name: Put the target directory on a Dev Drive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .github/workflows/setup-dev-drive.ps1
+
       - name: Restore cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -704,6 +741,13 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --locked --keep-going ${{ env.CARGO_ARGS_MOST_FEATS }} --workspace --all-targets --bins --examples --tests ${{ env.WORKSPACE_EXCLUDES }} -- -Dwarnings
+
+      - name: Show Dev Drive state
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Item target | Format-List FullName, Attributes, LinkType, Target
+          fsutil volume diskfree "$env:DEV_DRIVE"
 
   # macOS/Windows clippy uses the same OS-surface filter as cargo check.
   # Force with the run:cross-check label. Check names stay clippy (<os>).
