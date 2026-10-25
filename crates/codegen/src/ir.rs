@@ -55,6 +55,48 @@ fn is_within_opcode_range(opcode: AnyOpcode) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct ConstantPool {
     constants: Vec<ConstantData>,
+    /// De-dup index: canonical digest of a stored constant -> positions in
+    /// `constants` sharing that digest. NaN-bearing constants are never
+    /// registered here because they must never be deduplicated (see
+    /// `find_existing`). A digest collision only costs an extra
+    /// `constant_key_eq` check during the bucket scan; it can never cause
+    /// an incorrect match, because the final decision is always made by the
+    /// equality comparison.
+    index: IndexMap<u64, Vec<u32>>,
+    /// Coarse bucket for code-object constants. Code objects are compared
+    /// structurally by code_objects_equivalent, which is far too expensive
+    /// to run against every stored constant. Structurally equivalent code
+    /// objects always share obj_name, qualname and instruction count, so
+    /// bucketing on those is conservative: it can only add extra equality
+    /// checks, never miss a match.
+    code_index: IndexMap<u64, Vec<u32>>,
+}
+
+/// A small deterministic FNV-1a accumulator used to build the
+/// `ConstantPool` de-dup digests. It only needs to be deterministic within
+/// a single compilation; there is no cross-process stability contract.
+struct ConstantDigestHasher(u64);
+
+impl ConstantDigestHasher {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+}
+
+impl core::hash::Hasher for ConstantDigestHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
 }
 
 impl ConstantPool {
@@ -160,13 +202,169 @@ impl ConstantPool {
     /// Index of an already-stored constant equal to `constant`, if any.
     /// _PyCode_ConstantKey() keeps NaN-bearing constants distinct because
     /// Python-level NaN keys do not compare equal.
+    /// Digest of a constant, consistent with constant_key_eq.
+    ///
+    /// Two constants that constant_key_eq considers equal must produce the
+    /// same digest, or deduplication would miss and the pool would grow a
+    /// duplicate constant. The converse is not required: a digest collision
+    /// only costs an extra constant_key_eq check inside the bucket scan.
+    ///
+    /// Code constants are excluded from the indexed path. The PartialEq and
+    /// Hash impls for Code are pointer-identity based while constant_key_eq
+    /// compares code objects structurally, so no cheap digest can be
+    /// consistent with that comparison; those keep the linear scan.
+    fn constant_digest(constant: &ConstantData) -> Option<u64> {
+        use core::hash::Hasher;
+        if Self::constant_contains_nan(constant) {
+            return None;
+        }
+        if Self::constant_key_needs_linear_scan(constant) {
+            return None;
+        }
+        let mut hasher = ConstantDigestHasher::new();
+        Self::hash_constant_key(constant, &mut hasher);
+        Some(hasher.finish())
+    }
+
+    /// Whether deduplicating this constant must fall back to the linear scan
+    /// because it transitively contains a code object.
+    fn constant_key_needs_linear_scan(constant: &ConstantData) -> bool {
+        match constant {
+            ConstantData::Code { .. } => true,
+            ConstantData::Tuple { elements } | ConstantData::Frozenset { elements } => {
+                elements.iter().any(Self::constant_key_needs_linear_scan)
+            }
+            ConstantData::Slice { elements } => {
+                elements.iter().any(Self::constant_key_needs_linear_scan)
+            }
+            _ => false,
+        }
+    }
+
+    fn hash_constant_key<H: core::hash::Hasher>(constant: &ConstantData, state: &mut H) {
+        use core::hash::Hash;
+        use core::hash::Hasher;
+        match constant {
+            ConstantData::Tuple { elements } => {
+                state.write_u8(1);
+                elements.len().hash(state);
+                for element in elements {
+                    Self::hash_constant_key(element, state);
+                }
+            }
+            ConstantData::Slice { elements } => {
+                state.write_u8(2);
+                for element in elements.iter() {
+                    Self::hash_constant_key(element, state);
+                }
+            }
+            ConstantData::Frozenset { elements } => {
+                // frozenset_key_eq is order independent, so the digest must be
+                // too: combine element digests commutatively and mix in the
+                // length rather than hashing elements positionally.
+                state.write_u8(3);
+                elements.len().hash(state);
+                let mut combined: u64 = 0;
+                for element in elements {
+                    let mut inner = ConstantDigestHasher::new();
+                    Self::hash_constant_key(element, &mut inner);
+                    combined = combined.wrapping_add(inner.finish().rotate_left(17));
+                }
+                combined.hash(state);
+            }
+            other => {
+                state.write_u8(4);
+                other.hash(state);
+            }
+        }
+    }
+
+    /// Index of an already-stored constant equal to constant, if any.
     fn find_existing(&self, constant: &ConstantData) -> Option<usize> {
         if Self::constant_contains_nan(constant) {
             return None;
         }
-        self.constants
+        if let ConstantData::Code { code } = constant {
+            return self
+                .code_candidates(code)
+                .into_iter()
+                .find(|&idx| Self::constant_key_eq(&self.constants[idx], constant));
+        }
+        let Some(digest) = Self::constant_digest(constant) else {
+            return self
+                .constants
+                .iter()
+                .position(|existing| Self::constant_key_eq(existing, constant));
+        };
+        let bucket = self.index.get(&digest)?;
+        bucket
             .iter()
-            .position(|existing| Self::constant_key_eq(existing, constant))
+            .copied()
+            .map(|idx| idx as usize)
+            .find(|&idx| Self::constant_key_eq(&self.constants[idx], constant))
+    }
+
+    /// Register the constant stored at idx in the digest index.
+
+    /// Coarse digest for a code-object constant, used only to narrow the set
+    /// of candidates that the structural comparison must examine.
+    fn code_object_digest(code: &CodeObject) -> u64 {
+        use core::hash::{Hash, Hasher};
+        let mut hasher = ConstantDigestHasher::new();
+        code.obj_name.hash(&mut hasher);
+        code.qualname.hash(&mut hasher);
+        code.instructions.len().hash(&mut hasher);
+        code.arg_count.hash(&mut hasher);
+        code.posonlyarg_count.hash(&mut hasher);
+        code.kwonlyarg_count.hash(&mut hasher);
+        code.constants.len().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Candidate positions for a code-object constant, narrowed by the coarse
+    /// digest. Falls back to every position when the bucket is unavailable.
+    pub fn code_candidates(&self, code: &CodeObject) -> Vec<usize> {
+        match self.code_index.get(&Self::code_object_digest(code)) {
+            Some(bucket) => bucket.iter().map(|&idx| idx as usize).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Register the code-object constant stored at idx in the coarse index.
+    fn index_insert_code(&mut self, code: &CodeObject, idx: usize) {
+        self.code_index
+            .entry(Self::code_object_digest(code))
+            .or_default()
+            .push(idx as u32);
+    }
+
+    fn index_insert(&mut self, constant: &ConstantData, idx: usize) {
+        if let ConstantData::Code { code } = constant {
+            self.index_insert_code(code, idx);
+            return;
+        }
+        if let Some(digest) = Self::constant_digest(constant) {
+            self.index.entry(digest).or_default().push(idx as u32);
+        }
+    }
+
+    /// Rebuild the digest index from the current contents of constants.
+    /// Needed after remove_unused_consts compacts and truncates the vector.
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        self.code_index.clear();
+        let mut code_entries: Vec<(u64, u32)> = Vec::new();
+        for idx in 0..self.constants.len() {
+            let constant = &self.constants[idx];
+            if let ConstantData::Code { code } = constant {
+                code_entries.push((Self::code_object_digest(code), idx as u32));
+            } else if let Some(digest) = Self::constant_digest(constant) {
+                self.index.entry(digest).or_default().push(idx as u32);
+            }
+        }
+        for (digest, idx) in code_entries {
+            self.code_index.entry(digest).or_default().push(idx);
+        }
     }
 
     pub fn insert_full(&mut self, constant: ConstantData) -> (usize, bool) {
@@ -175,6 +373,7 @@ impl ConstantPool {
             return (idx, false);
         }
         let idx = self.constants.len();
+        self.index_insert(&constant, idx);
         self.constants.push(constant);
         (idx, true)
     }
@@ -188,6 +387,7 @@ impl ConstantPool {
             .try_reserve_exact(1)
             .map_err(|_| InternalError::MalformedControlFlowGraph)?;
         let idx = self.constants.len();
+        self.index_insert(&constant, idx);
         self.constants.push(constant);
         Ok((idx, true))
     }
@@ -198,7 +398,13 @@ impl ConstantPool {
 
     #[must_use]
     pub fn from_ordered(constants: Vec<ConstantData>) -> Self {
-        Self { constants }
+        let mut pool = Self {
+            constants,
+            index: IndexMap::default(),
+            code_index: IndexMap::default(),
+        };
+        pool.rebuild_index();
+        pool
     }
 
     #[must_use]
@@ -2858,6 +3064,8 @@ impl Blocks {
 
         // Truncate the consts list at its new size.
         consts.constants.truncate(n_used_consts);
+        // The index still lists compacted-away positions; rebuild it.
+        consts.rebuild_index();
 
         // Adjust const indices in the bytecode.
         let mut reverse_index_map = Vec::new();

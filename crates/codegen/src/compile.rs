@@ -202,6 +202,10 @@ struct Compiler<'a> {
     syntax_warning_handler: Option<&'a mut SyntaxWarningHandler<'a>>,
     /// If true, keep unoptimized nested instruction sequences on the parent.
     save_nested_seqs: bool,
+    /// Names that some non-inlined nested scope of the module declares
+    /// explicitly global, computed once per module compile instead of
+    /// re-walking the whole symbol table for every module-level name.
+    module_nested_globals: Option<std::collections::HashSet<Name>>,
 }
 
 /// A Python `__future__` feature flag imported via `from __future__ import <feature>`.
@@ -1329,6 +1333,7 @@ impl<'warnings> Compiler<'warnings> {
             disable_warning: 0,
             syntax_warning_handler,
             save_nested_seqs: false,
+            module_nested_globals: None,
         }
     }
 
@@ -3411,6 +3416,47 @@ impl<'warnings> Compiler<'warnings> {
         })
     }
 
+    /// Collect every name that a non-inlined nested scope declares explicitly
+    /// global, in one pass over the module symbol table.
+    fn collect_module_nested_globals(
+        table: &SymbolTable,
+        out: &mut std::collections::HashSet<Name>,
+    ) {
+        for subtable in &table.sub_tables {
+            if !subtable.comp_inlined {
+                for (name, symbol) in &subtable.symbols {
+                    if symbol.scope == SymbolScope::GlobalExplicit {
+                        out.insert(name.clone());
+                    }
+                }
+            }
+            Self::collect_module_nested_globals(subtable, out);
+        }
+    }
+
+    /// Whether a nested scope of the module declares this name explicitly
+    /// global. The answer is independent of the current code position, so the
+    /// set is collected once per module compile rather than re-walking the
+    /// symbol table tree for every module-level name.
+    fn module_name_declared_global_in_nested_scope_cached(&mut self, name: &Name) -> bool {
+        if self.current_symbol_table().typ != CompilerScope::Module {
+            return false;
+        }
+        if self.module_nested_globals.is_none() {
+            let mut globals = std::collections::HashSet::new();
+            Self::collect_module_nested_globals(
+                self.symbol_table_stack
+                    .first()
+                    .expect("module symbol table"),
+                &mut globals,
+            );
+            self.module_nested_globals = Some(globals);
+        }
+        self.module_nested_globals
+            .as_ref()
+            .is_some_and(|globals| globals.contains(name))
+    }
+
     // = compiler_nameop
     fn compile_name(&mut self, name: &Name, usage: NameUsage) -> CompileResult<()> {
         enum NameOp {
@@ -3531,18 +3577,17 @@ impl<'warnings> Compiler<'warnings> {
             }
         };
 
-        let module_global_from_nested_scope = {
-            let current_table = self.current_symbol_table();
-            current_table.typ == CompilerScope::Module
-                && Self::module_name_declared_global_in_nested_scope(current_table, name.as_ref())
-        };
+        // This walk is only consulted for the Local and Unknown scopes below.
+        // Running it for every name costs a full symbol-table tree traversal per
+        // module-level name, which is quadratic in the number of nested
+        // definitions, so compute it lazily at the two places that read it.
 
         // Determine operation type based on scope
         let op_type = match actual_scope {
             SymbolScope::Free => NameOp::Deref,
             SymbolScope::Cell => NameOp::Deref,
             SymbolScope::Local => {
-                if module_global_from_nested_scope {
+                if self.module_name_declared_global_in_nested_scope_cached(name.as_ref()) {
                     NameOp::Global
                 } else if is_function_like
                     || self
@@ -3581,7 +3626,7 @@ impl<'warnings> Compiler<'warnings> {
                 }
             }
             SymbolScope::Unknown => {
-                if module_global_from_nested_scope {
+                if self.module_name_declared_global_in_nested_scope_cached(name.as_ref()) {
                     NameOp::Global
                 } else {
                     NameOp::Name
@@ -11865,14 +11910,18 @@ impl<'warnings> Compiler<'warnings> {
     fn arg_constant(&mut self, constant: ConstantData) -> oparg::ConstIdx {
         let info = self.current_code_info();
         if let ConstantData::Code { code } = &constant
-            && let Some(idx) = info.metadata.consts.iter().position(|existing| {
-                matches!(
-                    existing,
-                    ConstantData::Code {
-                        code: existing_code
-                    } if Self::code_objects_equivalent(existing_code, code)
-                )
-            })
+            && let Some(idx) = info
+                .metadata
+                .consts
+                .code_candidates(code)
+                .into_iter()
+                .find(|&idx| {
+                    matches!(
+                        &info.metadata.consts[idx],
+                        ConstantData::Code { code: existing_code }
+                            if Self::code_objects_equivalent(existing_code, code)
+                    )
+                })
         {
             return u32::try_from(idx)
                 .expect("constant table index overflow")
