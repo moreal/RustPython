@@ -347,6 +347,13 @@ jobs:
       #   run: cargo build --features tkinter
       #   if: runner.os == 'Linux'
 
+      - name: Check example project dependencies
+        if: env.RUN_RUST_TESTS == 'true' && runner.os == 'Linux'
+        run: |
+          cargo generate-lockfile --manifest-path example_projects/barebone/Cargo.toml
+          cargo generate-lockfile --manifest-path example_projects/frozen_stdlib/Cargo.toml
+          python3 scripts/check_example_lockfiles.py Cargo.lock example_projects/barebone/Cargo.lock example_projects/frozen_stdlib/Cargo.lock
+
       - name: Build example projects
         if: env.RUN_RUST_TESTS == 'true' && runner.os == 'Linux'
         run: |
