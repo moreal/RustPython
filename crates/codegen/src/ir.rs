@@ -63,12 +63,11 @@ pub struct ConstantPool {
     /// an incorrect match, because the final decision is always made by the
     /// equality comparison.
     index: IndexMap<u64, Vec<u32>>,
-    /// Coarse bucket for code-object constants. Code objects are compared
-    /// structurally by code_objects_equivalent, which is far too expensive
-    /// to run against every stored constant. Structurally equivalent code
-    /// objects always share obj_name, qualname and instruction count, so
-    /// bucketing on those is conservative: it can only add extra equality
-    /// checks, never miss a match.
+    /// Structural digest bucket for code-object constants. Code objects are
+    /// compared by code_objects_equivalent, which is far too expensive to run
+    /// against every stored constant. Equal code objects share the digest;
+    /// collisions only add extra equality checks. Nested code contributes
+    /// shallow metadata to avoid re-hashing whole subtrees at every ancestor.
     code_index: IndexMap<u64, Vec<u32>>,
 }
 
@@ -112,21 +111,51 @@ impl ConstantPool {
         }
     }
 
-    fn frozenset_key_contains(elements: &[ConstantData], needle: &ConstantData) -> bool {
-        if Self::constant_contains_nan(needle) {
-            return false;
+    fn register_constant_key(
+        index: &mut IndexMap<u64, Vec<usize>>,
+        previous: &[ConstantData],
+        constant: &ConstantData,
+    ) -> Option<u64> {
+        let digest = Self::constant_key_digest(constant);
+        if !Self::constant_contains_nan(constant) {
+            let bucket = index.entry(digest).or_default();
+            if bucket
+                .iter()
+                .any(|&idx| Self::constant_key_eq(&previous[idx], constant))
+            {
+                return None;
+            }
+            bucket.push(previous.len());
         }
-        elements.iter().any(|element| {
-            !Self::constant_contains_nan(element) && Self::constant_key_eq(element, needle)
-        })
+        Some(digest)
     }
 
     fn frozenset_key_eq(left: &[ConstantData], right: &[ConstantData]) -> bool {
-        left.iter()
-            .all(|element| Self::frozenset_key_contains(right, element))
-            && right
+        if left.iter().chain(right).any(Self::constant_contains_nan) {
+            return false;
+        }
+        let mut index = IndexMap::default();
+        let mut unique_count = 0;
+        for (idx, element) in right.iter().enumerate() {
+            if Self::register_constant_key(&mut index, &right[..idx], element).is_some() {
+                unique_count += 1;
+            }
+        }
+        let mut matched = IndexSet::default();
+        for element in left {
+            let digest = Self::constant_key_digest(element);
+            let Some(bucket) = index.get(&digest) else {
+                return false;
+            };
+            let Some(&idx) = bucket
                 .iter()
-                .all(|element| Self::frozenset_key_contains(left, element))
+                .find(|&&idx| Self::constant_key_eq(element, &right[idx]))
+            else {
+                return false;
+            };
+            matched.insert(idx);
+        }
+        matched.len() == unique_count
     }
 
     fn constant_key_eq(left: &ConstantData, right: &ConstantData) -> bool {
@@ -177,12 +206,13 @@ impl ConstantPool {
             }
             ConstantData::Frozenset { elements } => {
                 let mut canonical = Vec::new();
+                let mut index = IndexMap::default();
                 canonical
                     .try_reserve_exact(elements.len())
                     .map_err(|_| InternalError::MalformedControlFlowGraph)?;
                 for element in elements {
                     let element = Self::canonicalize_constant_key(element)?;
-                    if !Self::frozenset_key_contains(&canonical, &element) {
+                    if Self::register_constant_key(&mut index, &canonical, &element).is_some() {
                         canonical.push(element);
                     }
                 }
@@ -199,9 +229,6 @@ impl ConstantPool {
             .expect("constant key canonicalization only fails on allocation error")
     }
 
-    /// Index of an already-stored constant equal to `constant`, if any.
-    /// _PyCode_ConstantKey() keeps NaN-bearing constants distinct because
-    /// Python-level NaN keys do not compare equal.
     /// Digest of a constant, consistent with constant_key_eq.
     ///
     /// Two constants that constant_key_eq considers equal must produce the
@@ -209,21 +236,24 @@ impl ConstantPool {
     /// duplicate constant. The converse is not required: a digest collision
     /// only costs an extra constant_key_eq check inside the bucket scan.
     ///
-    /// Code constants are excluded from the indexed path. The PartialEq and
-    /// Hash impls for Code are pointer-identity based while constant_key_eq
-    /// compares code objects structurally, so no cheap digest can be
-    /// consistent with that comparison; those keep the linear scan.
+    /// Code inside containers retains pointer equality and uses the fallback
+    /// scan. Top-level code uses a separate index; compiler code insertion
+    /// additionally checks structural equality.
     fn constant_digest(constant: &ConstantData) -> Option<u64> {
-        use core::hash::Hasher;
         if Self::constant_contains_nan(constant) {
             return None;
         }
         if Self::constant_key_needs_linear_scan(constant) {
             return None;
         }
+        Some(Self::constant_key_digest(constant))
+    }
+
+    fn constant_key_digest(constant: &ConstantData) -> u64 {
+        use core::hash::Hasher;
         let mut hasher = ConstantDigestHasher::new();
         Self::hash_constant_key(constant, &mut hasher);
-        Some(hasher.finish())
+        hasher.finish()
     }
 
     /// Whether deduplicating this constant must fall back to the linear scan
@@ -243,7 +273,6 @@ impl ConstantPool {
 
     fn hash_constant_key<H: core::hash::Hasher>(constant: &ConstantData, state: &mut H) {
         use core::hash::Hash;
-        use core::hash::Hasher;
         match constant {
             ConstantData::Tuple { elements } => {
                 state.write_u8(1);
@@ -254,22 +283,27 @@ impl ConstantPool {
             }
             ConstantData::Slice { elements } => {
                 state.write_u8(2);
-                for element in elements.iter() {
+                for element in elements {
                     Self::hash_constant_key(element, state);
                 }
             }
             ConstantData::Frozenset { elements } => {
-                // frozenset_key_eq is order independent, so the digest must be
-                // too: combine element digests commutatively and mix in the
-                // length rather than hashing elements positionally.
+                // frozenset_key_eq ignores order and duplicates, so the digest
+                // must too. Combine only the first occurrence of each element
+                // commutatively and mix in the number of unique elements.
                 state.write_u8(3);
-                elements.len().hash(state);
+                let mut index = IndexMap::default();
+                let mut unique_len = 0usize;
                 let mut combined: u64 = 0;
-                for element in elements {
-                    let mut inner = ConstantDigestHasher::new();
-                    Self::hash_constant_key(element, &mut inner);
-                    combined = combined.wrapping_add(inner.finish().rotate_left(17));
+                for (idx, element) in elements.iter().enumerate() {
+                    if let Some(digest) =
+                        Self::register_constant_key(&mut index, &elements[..idx], element)
+                    {
+                        unique_len += 1;
+                        combined = combined.wrapping_add(digest.rotate_left(17));
+                    }
                 }
+                unique_len.hash(state);
                 combined.hash(state);
             }
             other => {
@@ -304,25 +338,86 @@ impl ConstantPool {
             .find(|&idx| Self::constant_key_eq(&self.constants[idx], constant))
     }
 
-    /// Register the constant stored at idx in the digest index.
+    fn hash_code_constant<H: core::hash::Hasher>(constant: &ConstantData, state: &mut H) {
+        use core::hash::Hash;
 
-    /// Coarse digest for a code-object constant, used only to narrow the set
-    /// of candidates that the structural comparison must examine.
+        core::mem::discriminant(constant).hash(state);
+        match constant {
+            ConstantData::Tuple { elements } | ConstantData::Frozenset { elements } => {
+                elements.len().hash(state);
+                for element in elements {
+                    Self::hash_code_constant(element, state);
+                }
+            }
+            ConstantData::Slice { elements } => {
+                for element in elements {
+                    Self::hash_code_constant(element, state);
+                }
+            }
+            ConstantData::Code { code } => {
+                // Descendants are separately indexed when compiled. Walking
+                // their bodies here again makes deeply nested scopes costly.
+                code.obj_name.hash(state);
+                code.qualname.hash(state);
+                code.first_line_number.map(|line| line.get()).hash(state);
+                code.instructions.len().hash(state);
+                code.posonlyarg_count.hash(state);
+                code.arg_count.hash(state);
+                code.kwonlyarg_count.hash(state);
+                code.constants.len().hash(state);
+            }
+            other => other.hash(state),
+        }
+    }
+
+    fn hash_code_object<H: core::hash::Hasher>(code: &CodeObject, state: &mut H) {
+        use core::hash::Hash;
+
+        code.instructions.len().hash(state);
+        for instruction in code.instructions.iter() {
+            u8::from(instruction.op).hash(state);
+            u8::from(instruction.arg).hash(state);
+        }
+        code.locations.len().hash(state);
+        for (start, end) in &code.locations {
+            start.line.get().hash(state);
+            start.character_offset.get().hash(state);
+            end.line.get().hash(state);
+            end.character_offset.get().hash(state);
+        }
+        code.flags.bits().hash(state);
+        code.posonlyarg_count.hash(state);
+        code.arg_count.hash(state);
+        code.kwonlyarg_count.hash(state);
+        code.source_path.hash(state);
+        code.first_line_number.map(|line| line.get()).hash(state);
+        code.max_stackdepth.hash(state);
+        code.obj_name.hash(state);
+        code.qualname.hash(state);
+        code.constants.len().hash(state);
+        for constant in code.constants.iter() {
+            Self::hash_code_constant(constant, state);
+        }
+        code.names.hash(state);
+        code.varnames.hash(state);
+        code.cellvars.hash(state);
+        code.freevars.hash(state);
+        code.localspluskinds.hash(state);
+        code.linetable.hash(state);
+        code.exceptiontable.hash(state);
+    }
+
+    /// Structural digest for a code-object constant, used to narrow the set
+    /// of candidates that the final equality comparison must examine.
     fn code_object_digest(code: &CodeObject) -> u64 {
-        use core::hash::{Hash, Hasher};
+        use core::hash::Hasher;
         let mut hasher = ConstantDigestHasher::new();
-        code.obj_name.hash(&mut hasher);
-        code.qualname.hash(&mut hasher);
-        code.instructions.len().hash(&mut hasher);
-        code.arg_count.hash(&mut hasher);
-        code.posonlyarg_count.hash(&mut hasher);
-        code.kwonlyarg_count.hash(&mut hasher);
-        code.constants.len().hash(&mut hasher);
+        Self::hash_code_object(code, &mut hasher);
         hasher.finish()
     }
 
-    /// Candidate positions for a code-object constant, narrowed by the coarse
-    /// digest. Falls back to every position when the bucket is unavailable.
+    /// Candidate positions for a code-object constant, narrowed by its
+    /// structural digest.
     pub fn code_candidates(&self, code: &CodeObject) -> Vec<usize> {
         match self.code_index.get(&Self::code_object_digest(code)) {
             Some(bucket) => bucket.iter().map(|&idx| idx as usize).collect(),
@@ -330,7 +425,32 @@ impl ConstantPool {
         }
     }
 
-    /// Register the code-object constant stored at idx in the coarse index.
+    /// Insert compiler code constants with structural equality, computing the
+    /// digest once for both candidate lookup and registration.
+    /// `equivalent` must require equality of the fields used by the digest.
+    pub(crate) fn insert_code(
+        &mut self,
+        code: Box<CodeObject>,
+        equivalent: impl Fn(&CodeObject, &CodeObject) -> bool,
+    ) -> (usize, bool) {
+        let digest = Self::code_object_digest(&code);
+        if let Some(bucket) = self.code_index.get(&digest) {
+            for &idx in bucket {
+                let idx = idx as usize;
+                if let ConstantData::Code { code: existing } = &self.constants[idx]
+                    && equivalent(existing, &code)
+                {
+                    return (idx, false);
+                }
+            }
+        }
+        let idx = self.constants.len();
+        self.code_index.entry(digest).or_default().push(idx as u32);
+        self.constants.push(ConstantData::Code { code });
+        (idx, true)
+    }
+
+    /// Register the code-object constant stored at idx in the code index.
     fn index_insert_code(&mut self, code: &CodeObject, idx: usize) {
         self.code_index
             .entry(Self::code_object_digest(code))
@@ -353,17 +473,16 @@ impl ConstantPool {
     fn rebuild_index(&mut self) {
         self.index.clear();
         self.code_index.clear();
-        let mut code_entries: Vec<(u64, u32)> = Vec::new();
         for idx in 0..self.constants.len() {
             let constant = &self.constants[idx];
             if let ConstantData::Code { code } = constant {
-                code_entries.push((Self::code_object_digest(code), idx as u32));
+                self.code_index
+                    .entry(Self::code_object_digest(code))
+                    .or_default()
+                    .push(idx as u32);
             } else if let Some(digest) = Self::constant_digest(constant) {
                 self.index.entry(digest).or_default().push(idx as u32);
             }
-        }
-        for (digest, idx) in code_entries {
-            self.code_index.entry(digest).or_default().push(idx);
         }
     }
 
@@ -433,6 +552,8 @@ impl ConstantPool {
 
     pub fn clear(&mut self) {
         self.constants.clear();
+        self.index.clear();
+        self.code_index.clear();
     }
 }
 
@@ -7459,6 +7580,30 @@ mod tests {
         ConstantData::Float { value: f64::NAN }
     }
 
+    fn test_code_object(constants: Vec<ConstantData>, first_line: usize) -> CodeObject {
+        CodeObject {
+            instructions: Vec::new().into(),
+            locations: Vec::new().into_boxed_slice(),
+            flags: CodeFlags::empty(),
+            posonlyarg_count: 0,
+            arg_count: 0,
+            kwonlyarg_count: 0,
+            source_path: "source_path".to_owned(),
+            first_line_number: Some(OneIndexed::new(first_line).unwrap()),
+            max_stackdepth: 1,
+            obj_name: "f".to_owned(),
+            qualname: "f".to_owned(),
+            constants: constants.into_iter().collect(),
+            names: Vec::new().into_boxed_slice(),
+            varnames: Vec::new().into_boxed_slice(),
+            cellvars: Vec::new().into_boxed_slice(),
+            freevars: Vec::new().into_boxed_slice(),
+            localspluskinds: Vec::new().into_boxed_slice(),
+            linetable: Vec::new().into_boxed_slice(),
+            exceptiontable: Vec::new().into_boxed_slice(),
+        }
+    }
+
     #[test]
     fn constant_pool_frozenset_key_ignores_order_and_duplicates_like_cpython() {
         let mut pool = ConstantPool::default();
@@ -7498,6 +7643,200 @@ mod tests {
                     matches!(constant, ConstantData::Float { value } if value.is_nan())
                 }).count() == 2
         ));
+    }
+
+    #[test]
+    fn constant_pool_frozenset_key_preserves_numeric_variants_and_zero_signs() {
+        let elements = vec![
+            int_const(0),
+            ConstantData::Boolean { value: false },
+            ConstantData::Float { value: 0.0 },
+            ConstantData::Float { value: -0.0 },
+            ConstantData::Complex {
+                value: Complex::new(0.0, 0.0),
+            },
+            ConstantData::Complex {
+                value: Complex::new(-0.0, 0.0),
+            },
+            ConstantData::Complex {
+                value: Complex::new(0.0, -0.0),
+            },
+            ConstantData::Complex {
+                value: Complex::new(-0.0, -0.0),
+            },
+        ];
+        let mut repeated = elements.clone();
+        repeated.extend(elements.clone());
+        let mut pool = ConstantPool::default();
+        assert_eq!(
+            pool.insert_full(ConstantData::Frozenset { elements: repeated }),
+            (0, true)
+        );
+        assert!(matches!(&pool[0], ConstantData::Frozenset { elements } if elements.len() == 8));
+
+        let reversed = elements.into_iter().rev().collect();
+        assert_eq!(
+            pool.insert_full(ConstantData::Frozenset { elements: reversed }),
+            (0, false)
+        );
+    }
+
+    #[test]
+    fn constant_pool_clear_resets_dedup_indexes() {
+        let mut pool = ConstantPool::default();
+        assert_eq!(pool.insert_full(int_const(1)), (0, true));
+
+        pool.clear();
+
+        assert_eq!(pool.insert_full(int_const(1)), (0, true));
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn constant_pool_clear_resets_code_index() {
+        let code = test_code_object(vec![int_const(1)], 1);
+        let mut pool = ConstantPool::from_ordered(vec![ConstantData::Code {
+            code: Box::new(code.clone()),
+        }]);
+        pool.clear();
+
+        assert!(pool.code_candidates(&code).is_empty());
+        assert_eq!(
+            pool.insert_full(ConstantData::Code {
+                code: Box::new(code)
+            }),
+            (0, true)
+        );
+    }
+
+    #[test]
+    fn frozenset_keys_reject_transitively_nan_elements() {
+        for element in [
+            nan_const(),
+            ConstantData::Tuple {
+                elements: vec![nan_const()],
+            },
+            ConstantData::Slice {
+                elements: Box::new([nan_const(), int_const(1), int_const(2)]),
+            },
+        ] {
+            assert!(!ConstantPool::frozenset_key_eq(
+                &[],
+                core::slice::from_ref(&element)
+            ));
+            assert!(!ConstantPool::frozenset_key_eq(
+                core::slice::from_ref(&element),
+                &[]
+            ));
+            assert!(!ConstantPool::frozenset_key_eq(
+                core::slice::from_ref(&element),
+                core::slice::from_ref(&element)
+            ));
+        }
+    }
+
+    #[test]
+    fn constant_pool_compaction_rebuilds_code_positions() {
+        let unused = test_code_object(Vec::new(), 1);
+        let kept = test_code_object(Vec::new(), 2);
+        let mut pool = ConstantPool::from_ordered(vec![
+            int_const(0),
+            ConstantData::Code {
+                code: Box::new(unused.clone()),
+            },
+            ConstantData::Code {
+                code: Box::new(kept.clone()),
+            },
+        ]);
+        let mut block = Block::default();
+        let mut load = test_instr(Instruction::Nop, 1);
+        load.instr = Opcode::LoadConst.into();
+        load.arg = OpArg::new(2);
+        test_block_push(&mut block, load);
+        test_block_push(&mut block, test_instr(Instruction::ReturnValue, 1));
+        let mut blocks = Blocks::from([block]);
+
+        blocks.remove_unused_consts(&mut pool).unwrap();
+
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.code_candidates(&kept), vec![1]);
+        assert!(pool.code_candidates(&unused).is_empty());
+        assert_eq!(u32::from(blocks[BlockIdx::new(0)].instructions[0].arg), 1);
+    }
+
+    #[test]
+    fn constant_pool_code_candidates_distinguish_first_line() {
+        let first = test_code_object(Vec::new(), 1);
+        let mut second = first.clone();
+        second.first_line_number = Some(OneIndexed::new(2).unwrap());
+
+        let mut pool = ConstantPool::default();
+        pool.insert_full(ConstantData::Code {
+            code: Box::new(first),
+        });
+
+        assert!(pool.code_candidates(&second).is_empty());
+    }
+
+    #[test]
+    fn constant_pool_code_candidates_distinguish_constant_data() {
+        let first = test_code_object(vec![int_const(1)], 1);
+        let second = test_code_object(vec![int_const(2)], 1);
+        let mut pool = ConstantPool::default();
+        pool.insert_full(ConstantData::Code {
+            code: Box::new(first),
+        });
+
+        assert!(pool.code_candidates(&second).is_empty());
+    }
+
+    #[test]
+    fn constant_pool_code_candidates_keep_structurally_cloned_nested_code() {
+        let nested = test_code_object(vec![int_const(1)], 1);
+        let first = test_code_object(
+            vec![ConstantData::Code {
+                code: Box::new(nested),
+            }],
+            1,
+        );
+        let second = first.clone();
+        let mut pool = ConstantPool::default();
+        pool.insert_full(ConstantData::Code {
+            code: Box::new(first),
+        });
+
+        assert_eq!(pool.code_candidates(&second), vec![0]);
+    }
+
+    #[test]
+    fn constant_pool_from_ordered_indexes_noncanonical_frozenset_keys() {
+        let mut pool = ConstantPool::from_ordered(vec![ConstantData::Frozenset {
+            elements: vec![int_const(1), int_const(1)],
+        }]);
+
+        assert_eq!(
+            pool.insert_full(ConstantData::Frozenset {
+                elements: vec![int_const(1)],
+            }),
+            (0, false)
+        );
+        assert_eq!(pool.len(), 1);
+
+        let nested = ConstantData::Tuple {
+            elements: vec![ConstantData::Frozenset {
+                elements: vec![int_const(2), int_const(1), int_const(1)],
+            }],
+        };
+        let mut pool = ConstantPool::from_ordered(vec![nested]);
+        assert_eq!(
+            pool.insert_full(ConstantData::Tuple {
+                elements: vec![ConstantData::Frozenset {
+                    elements: vec![int_const(1), int_const(2)],
+                }],
+            }),
+            (0, false)
+        );
+        assert_eq!(pool.len(), 1);
     }
 
     fn test_location(line: u32) -> SourceLocation {

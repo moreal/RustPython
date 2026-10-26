@@ -731,6 +731,7 @@ impl SymbolTableAnalyzer {
             .extend(inlined_blocks);
 
         let sub_tables = &*symbol_table.sub_tables;
+        let inner_scopes = self.summarize_inner_scopes(sub_tables, symbol_table.typ);
 
         for symbol in symbol_table.symbols.values_mut() {
             if inlined_cells.contains(&symbol.name) {
@@ -745,7 +746,7 @@ impl SymbolTableAnalyzer {
                 symbol,
                 symbol_table.typ,
                 symbol_table.skip_enclosing_function_scope,
-                sub_tables,
+                &inner_scopes,
                 class_entry,
             )?;
 
@@ -805,7 +806,7 @@ impl SymbolTableAnalyzer {
         symbol: &mut Symbol,
         st_typ: CompilerScope,
         skip_enclosing_function_scope: bool,
-        sub_tables: &[SymbolTable],
+        inner_scopes: &IndexMap<Name, SymbolScope>,
         class_entry: Option<&SymbolMap>,
     ) -> SymbolTableResult {
         if symbol
@@ -883,7 +884,9 @@ impl SymbolTableAnalyzer {
                         // should not force the outer name itself to CELL.
                         SymbolScope::Local
                     } else {
-                        self.found_in_inner_scope(sub_tables, &symbol.name, st_typ)
+                        inner_scopes
+                            .get(&symbol.name)
+                            .copied()
                             .unwrap_or(SymbolScope::Local)
                     }
                 } else if let Some(scope) = class_entry
@@ -1017,36 +1020,55 @@ impl SymbolTableAnalyzer {
         decl_depth.map(|_| SymbolScope::Free)
     }
 
-    fn found_in_inner_scope(
+    fn summarize_inner_scopes(
         &self,
         sub_tables: &[SymbolTable],
-        name: &Name,
         st_typ: CompilerScope,
-    ) -> Option<SymbolScope> {
-        sub_tables.iter().find_map(|st| {
+    ) -> IndexMap<Name, SymbolScope> {
+        // Build this once per scope. Looking up every bound name by scanning
+        // every child makes wide modules with many definitions quadratic.
+        let mut inner_scopes = IndexMap::default();
+        self.extend_inner_scope_summary(&mut inner_scopes, sub_tables, st_typ);
+        inner_scopes
+    }
+
+    fn extend_inner_scope_summary(
+        &self,
+        inner_scopes: &mut IndexMap<Name, SymbolScope>,
+        sub_tables: &[SymbolTable],
+        st_typ: CompilerScope,
+    ) {
+        for st in sub_tables {
             // PEP 709: For inlined comprehensions, check their children
             // instead of the comp itself (its symbols are merged into parent).
             if st.comp_inlined {
-                return self.found_in_inner_scope(&st.sub_tables, name, st_typ);
+                self.extend_inner_scope_summary(inner_scopes, &st.sub_tables, st_typ);
+                continue;
             }
-            let sym = st.symbols.get(name)?;
-            if sym.scope == SymbolScope::Free
-                || (sym.flags.contains(SymbolFlags::DEF_FREE_CLASS)
-                    && !matches!(st_typ, CompilerScope::Module))
-            {
-                if st_typ == CompilerScope::Class {
-                    None
+
+            for sym in st.symbols.values() {
+                let scope = if sym.scope == SymbolScope::Free
+                    || (sym.flags.contains(SymbolFlags::DEF_FREE_CLASS)
+                        && !matches!(st_typ, CompilerScope::Module))
+                {
+                    if st_typ == CompilerScope::Class {
+                        None
+                    } else {
+                        Some(SymbolScope::Cell)
+                    }
+                } else if sym.scope == SymbolScope::GlobalExplicit && self.tables.is_empty() {
+                    // the symbol is defined on the module level, and an inner scope declares
+                    // a global that points to it
+                    Some(SymbolScope::GlobalExplicit)
                 } else {
-                    Some(SymbolScope::Cell)
+                    None
+                };
+
+                if let Some(scope) = scope {
+                    inner_scopes.entry(sym.name.clone()).or_insert(scope);
                 }
-            } else if sym.scope == SymbolScope::GlobalExplicit && self.tables.is_empty() {
-                // the symbol is defined on the module level, and an inner scope declares
-                // a global that points to it
-                Some(SymbolScope::GlobalExplicit)
-            } else {
-                None
             }
-        })
+        }
     }
 }
 
@@ -3438,7 +3460,9 @@ pub(crate) fn maybe_mangle_name<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{CompilerScope, SymbolFlags, SymbolTable, mangle_name};
+    use super::{
+        CompilerScope, SymbolFlags, SymbolScope, SymbolTable, SymbolTableAnalyzer, mangle_name,
+    };
     use rustpython_compiler_core::SourceFileBuilder;
 
     fn scan_source(source: &str) -> SymbolTable {
@@ -3458,6 +3482,35 @@ mod tests {
             _ => unreachable!(),
         };
         SymbolTable::scan_program(&module, source_file)
+    }
+
+    #[test]
+    fn inner_scope_summary_uses_first_relevant_child_scope() {
+        let table = scan_source(
+            "x = 0\ndef local_child():\n    x = 1\ndef global_child():\n    global x\n    x = 2\n",
+        );
+
+        let summary = SymbolTableAnalyzer::default()
+            .summarize_inner_scopes(&table.sub_tables, CompilerScope::Module);
+
+        assert_eq!(summary.get("x"), Some(&SymbolScope::GlobalExplicit));
+    }
+
+    #[test]
+    fn inner_scope_summary_marks_function_binding_as_cell() {
+        let table = scan_source(
+            "def outer():\n    x = 1\n    def inner():\n        return x\n    return inner\n",
+        );
+        let outer = table
+            .sub_tables
+            .iter()
+            .find(|table| table.name == "outer")
+            .expect("missing outer function scope");
+
+        let summary = SymbolTableAnalyzer::default()
+            .summarize_inner_scopes(&outer.sub_tables, CompilerScope::Function);
+
+        assert_eq!(summary.get("x"), Some(&SymbolScope::Cell));
     }
 
     #[test]

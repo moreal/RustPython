@@ -3406,16 +3406,6 @@ impl<'warnings> Compiler<'warnings> {
         symboltable::maybe_mangle_name(private.map(Name::from).as_ref(), mangled_names, name)
     }
 
-    fn module_name_declared_global_in_nested_scope(table: &SymbolTable, name: &Name) -> bool {
-        table.sub_tables.iter().any(|subtable| {
-            (!subtable.comp_inlined
-                && subtable
-                    .lookup(name)
-                    .is_some_and(|symbol| symbol.scope == SymbolScope::GlobalExplicit))
-                || Self::module_name_declared_global_in_nested_scope(subtable, name)
-        })
-    }
-
     /// Collect every name that a non-inlined nested scope declares explicitly
     /// global, in one pass over the module symbol table.
     fn collect_module_nested_globals(
@@ -9685,12 +9675,13 @@ impl<'warnings> Compiler<'warnings> {
         let Some(outermost) = generators.first() else {
             return Ok(None);
         };
-        let (comp_table, _) = self
+        let is_coroutine = self
             .lookup_comprehension_symbol_table_after_skipped_nested_scopes_in_expr(
                 &outermost.iter,
                 ComprehensionType::Generator,
+                |table, _| table.is_coroutine,
             )?;
-        if comp_table.is_coroutine {
+        if is_coroutine {
             return Ok(None);
         }
         Ok(Some(id.as_str()))
@@ -10828,11 +10819,12 @@ impl<'warnings> Compiler<'warnings> {
         );
     }
 
-    fn lookup_comprehension_symbol_table_after_skipped_nested_scopes_in_expr(
+    fn lookup_comprehension_symbol_table_after_skipped_nested_scopes_in_expr<T>(
         &mut self,
         expression: &ast::Expr,
         comprehension_type: ComprehensionType,
-    ) -> CompileResult<(SymbolTable, ComprehensionSymbolSource)> {
+        select: impl FnOnce(&SymbolTable, ComprehensionSymbolSource) -> T,
+    ) -> CompileResult<T> {
         let saved_cursor = self
             .symbol_table_stack
             .last()
@@ -10854,10 +10846,10 @@ impl<'warnings> Compiler<'warnings> {
                     .inlined_comprehension_blocks
                     .get(current_table.next_inlined_comprehension_block)
             {
-                return Ok((table.clone(), ComprehensionSymbolSource::Inlined));
+                return Ok(select(table, ComprehensionSymbolSource::Inlined));
             }
             if let Some(table) = current_table.sub_tables.get(current_table.next_sub_table) {
-                Ok((table.clone(), ComprehensionSymbolSource::Child))
+                Ok(select(table, ComprehensionSymbolSource::Child))
             } else {
                 let name = current_table.name.clone();
                 let typ = current_table.typ;
@@ -11006,6 +10998,7 @@ impl<'warnings> Compiler<'warnings> {
             .lookup_comprehension_symbol_table_after_skipped_nested_scopes_in_expr(
                 &outermost.iter,
                 comprehension_type,
+                |table, source| (table.clone(), source),
             )?;
 
         let is_inlined = self.is_inlined_comprehension_context(comprehension_type, &comp_table);
@@ -11909,25 +11902,14 @@ impl<'warnings> Compiler<'warnings> {
 
     fn arg_constant(&mut self, constant: ConstantData) -> oparg::ConstIdx {
         let info = self.current_code_info();
-        if let ConstantData::Code { code } = &constant
-            && let Some(idx) = info
+        let (idx, _) = match constant {
+            ConstantData::Code { code } => info
                 .metadata
                 .consts
-                .code_candidates(code)
-                .into_iter()
-                .find(|&idx| {
-                    matches!(
-                        &info.metadata.consts[idx],
-                        ConstantData::Code { code: existing_code }
-                            if Self::code_objects_equivalent(existing_code, code)
-                    )
-                })
-        {
-            return u32::try_from(idx)
-                .expect("constant table index overflow")
-                .into();
-        }
-        info.metadata.consts.insert_full(constant).0.to_u32().into()
+                .insert_code(code, Self::code_objects_equivalent),
+            constant => info.metadata.consts.insert_full(constant),
+        };
+        idx.to_u32().into()
     }
 
     fn constants_equivalent(lhs: &ConstantData, rhs: &ConstantData) -> bool {
@@ -14273,6 +14255,44 @@ mod tests {
     fn compile_exec(source: &str) -> CodeObject {
         let opts = CompileOpts::default();
         compile_exec_with_options(source, opts)
+    }
+
+    #[test]
+    fn code_pool_reuses_structurally_equal_clones() {
+        let code = compile_exec("def f():\n    return lambda: 12345\n");
+        let mut pool = ir::ConstantPool::default();
+
+        assert_eq!(
+            pool.insert_code(Box::new(code.clone()), Compiler::code_objects_equivalent),
+            (0, true)
+        );
+        assert_eq!(
+            pool.insert_code(Box::new(code), Compiler::code_objects_equivalent),
+            (0, false)
+        );
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn code_pool_keeps_unequal_nested_constants_in_colliding_bucket() {
+        let first = compile_exec("def f():\n    return 12345\n");
+        let second = compile_exec("def f():\n    return 54321\n");
+        let mut pool = ir::ConstantPool::default();
+
+        assert_eq!(
+            pool.insert_code(Box::new(first), Compiler::code_objects_equivalent),
+            (0, true)
+        );
+        assert_eq!(pool.code_candidates(&second), vec![0]);
+        assert_eq!(
+            pool.insert_code(Box::new(second.clone()), Compiler::code_objects_equivalent),
+            (1, true)
+        );
+        assert_eq!(
+            pool.insert_code(Box::new(second), Compiler::code_objects_equivalent),
+            (1, false)
+        );
+        assert_eq!(pool.len(), 2);
     }
 
     fn compile_single(source: &str) -> CodeObject {
