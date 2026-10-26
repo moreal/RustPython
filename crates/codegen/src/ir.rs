@@ -1,3 +1,4 @@
+use alloc::borrow::Cow;
 use core::ops::{Deref, DerefMut, Index, IndexMut};
 
 use crate::{IndexMap, IndexSet, error::InternalError};
@@ -69,33 +70,6 @@ pub struct ConstantPool {
     /// collisions only add extra equality checks. Nested code contributes
     /// shallow metadata to avoid re-hashing whole subtrees at every ancestor.
     code_index: IndexMap<u64, Vec<u32>>,
-}
-
-/// A small deterministic FNV-1a accumulator used to build the
-/// `ConstantPool` de-dup digests. It only needs to be deterministic within
-/// a single compilation; there is no cross-process stability contract.
-struct ConstantDigestHasher(u64);
-
-impl ConstantDigestHasher {
-    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    fn new() -> Self {
-        Self(Self::OFFSET_BASIS)
-    }
-}
-
-impl core::hash::Hasher for ConstantDigestHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            self.0 ^= u64::from(byte);
-            self.0 = self.0.wrapping_mul(Self::PRIME);
-        }
-    }
 }
 
 impl ConstantPool {
@@ -251,7 +225,7 @@ impl ConstantPool {
 
     fn constant_key_digest(constant: &ConstantData) -> u64 {
         use core::hash::Hasher;
-        let mut hasher = ConstantDigestHasher::new();
+        let mut hasher = rapidhash::quality::RapidHasher::default();
         Self::hash_constant_key(constant, &mut hasher);
         hasher.finish()
     }
@@ -411,7 +385,7 @@ impl ConstantPool {
     /// of candidates that the final equality comparison must examine.
     fn code_object_digest(code: &CodeObject) -> u64 {
         use core::hash::Hasher;
-        let mut hasher = ConstantDigestHasher::new();
+        let mut hasher = rapidhash::quality::RapidHasher::default();
         Self::hash_code_object(code, &mut hasher);
         hasher.finish()
     }
@@ -503,7 +477,7 @@ impl ConstantPool {
             return Ok((idx, false));
         }
         self.constants
-            .try_reserve_exact(1)
+            .try_reserve(1)
             .map_err(|_| InternalError::MalformedControlFlowGraph)?;
         let idx = self.constants.len();
         self.index_insert(&constant, idx);
@@ -733,43 +707,8 @@ impl InstructionInfo {
         );
     }
 
-    /// assemble.c instr_size
-    fn instr_size(&self) -> usize {
-        let opcode = self.instr.expect_real();
-        let oparg = u32::from(self.arg) as i32;
-        debug_assert!(
-            self.instr.has_arg() || oparg == 0,
-            "CPython assemble.c instr_size requires OPCODE_HAS_ARG or oparg == 0"
-        );
-        let extended_args =
-            (0xFF_FFFF < oparg) as usize + (0xFF_FF < oparg) as usize + (0xFF < oparg) as usize;
-        let caches = opcode.cache_entries();
-        extended_args + 1 + caches
-    }
-
     fn instruction_linetable_location(&self) -> LineTableLocation {
-        let location = self.semantic_location.unwrap_or_else(|| LineTableLocation {
-            line: self.location.line.get() as i32,
-            end_line: self.end_location.line.get() as i32,
-            col: self.location.character_offset.to_zero_indexed() as i32,
-            end_col: self.end_location.character_offset.to_zero_indexed() as i32,
-        });
-        match self.lineno_override {
-            Some(NO_LOCATION_OVERRIDE) => LineTableLocation {
-                line: NO_LOCATION_OVERRIDE,
-                end_line: NO_LOCATION_OVERRIDE,
-                col: NO_LOCATION_OVERRIDE,
-                end_col: NO_LOCATION_OVERRIDE,
-            },
-            Some(LINE_ONLY_LOCATION_OVERRIDE) => LineTableLocation {
-                col: -1,
-                end_col: -1,
-                ..location
-            },
-            Some(NEXT_LOCATION_OVERRIDE) => next_linetable_location(),
-            Some(line) => LineTableLocation { line, ..location },
-            None => location,
-        }
+        self.instr_location().linetable_location()
     }
 
     /// flowgraph.c loads_const
@@ -868,6 +807,47 @@ pub struct ExceptHandlerInfo {
     pub preserve_lasti: bool,
 }
 
+impl InstructionLocation {
+    fn linetable_location(self) -> LineTableLocation {
+        let location = self.semantic_location.unwrap_or_else(|| LineTableLocation {
+            line: self.location.line.get() as i32,
+            end_line: self.end_location.line.get() as i32,
+            col: self.location.character_offset.to_zero_indexed() as i32,
+            end_col: self.end_location.character_offset.to_zero_indexed() as i32,
+        });
+        match self.lineno_override {
+            Some(NO_LOCATION_OVERRIDE) => LineTableLocation {
+                line: NO_LOCATION_OVERRIDE,
+                end_line: NO_LOCATION_OVERRIDE,
+                col: NO_LOCATION_OVERRIDE,
+                end_col: NO_LOCATION_OVERRIDE,
+            },
+            Some(LINE_ONLY_LOCATION_OVERRIDE) => LineTableLocation {
+                col: -1,
+                end_col: -1,
+                ..location
+            },
+            Some(NEXT_LOCATION_OVERRIDE) => next_linetable_location(),
+            Some(line) => LineTableLocation { line, ..location },
+            None => location,
+        }
+    }
+}
+
+/// assemble.c instr_size
+fn instruction_size(instr: AnyInstruction, arg: OpArg) -> usize {
+    let opcode = instr.expect_real();
+    let oparg = u32::from(arg) as i32;
+    debug_assert!(
+        instr.has_arg() || oparg == 0,
+        "CPython assemble.c instr_size requires OPCODE_HAS_ARG or oparg == 0"
+    );
+    let extended_args =
+        (0xFF_FFFF < oparg) as usize + (0xFF_FF < oparg) as usize + (0xFF < oparg) as usize;
+    let caches = opcode.cache_entries();
+    extended_args + 1 + caches
+}
+
 fn no_instruction_location() -> InstructionLocation {
     InstructionLocation {
         semantic_location: None,
@@ -961,23 +941,65 @@ const ZERO_EXCEPTION_HANDLER_INFO: InstructionSequenceExceptHandlerInfo =
         preserve_lasti: 0,
     };
 
+/// Linear instructions use label operands and separate exception-handler
+/// slots, so CFG block ids and handler metadata are not stored here.
+#[derive(Clone, Copy)]
+struct LinearInstructionInfo {
+    instr: AnyInstruction,
+    arg: OpArg,
+    location: InstructionLocation,
+}
+
+impl LinearInstructionInfo {
+    fn from_cfg(info: InstructionInfo) -> Self {
+        debug_assert_eq!(info.target, BlockIdx::NULL);
+        debug_assert!(info.except_handler.is_none());
+        Self {
+            instr: info.instr,
+            arg: info.arg,
+            location: info.instr_location(),
+        }
+    }
+
+    fn into_cfg(self) -> InstructionInfo {
+        let InstructionLocation {
+            semantic_location,
+            location,
+            end_location,
+            lineno_override,
+        } = self.location;
+        InstructionInfo {
+            instr: self.instr,
+            arg: self.arg,
+            target: BlockIdx::NULL,
+            location,
+            end_location,
+            except_handler: None,
+            semantic_location,
+            lineno_override,
+        }
+    }
+
+    fn instr_size(&self) -> usize {
+        instruction_size(self.instr, self.arg)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct InstructionSequenceEntry {
-    info: InstructionInfo,
+    info: LinearInstructionInfo,
     except_handler: InstructionSequenceExceptHandlerInfo,
     i_target: i32,
     i_offset: i32,
-    python_loc: Option<[i32; 4]>,
 }
 
 impl InstructionSequenceEntry {
     fn new(info: InstructionInfo, except_handler: InstructionSequenceExceptHandlerInfo) -> Self {
         Self {
-            info,
+            info: LinearInstructionInfo::from_cfg(info),
             except_handler,
             i_target: 0,
             i_offset: 0,
-            python_loc: None,
         }
     }
 }
@@ -992,6 +1014,10 @@ pub struct InstructionSequence {
     instr_allocation: usize,
     /// CPython `instr_sequence.s_used`, the number of used entries in `s_instrs`.
     instr_used: usize,
+    /// Raw location snapshots for Python addop, absent during native codegen.
+    /// Only extends through the last Python addop; later native entries use
+    /// their InstructionInfo locations without growing this cold metadata.
+    python_locations: Option<Vec<Option<[i32; 4]>>>,
     /// CPython `instr_sequence.s_next_free_label`.
     next_free_label: i32,
     label_map: Option<Vec<i32>>,
@@ -1038,12 +1064,18 @@ impl InstructionSequence {
             return Err(InternalError::MalformedControlFlowGraph);
         }
         let loc = [lineno, col_offset, end_lineno, end_col_offset];
-        let entry =
-            instruction_sequence_addop(self, instruction_info_from_python(instr, oparg, loc))?;
+        let idx = self.instr_used;
+        let locations = self.python_locations.get_or_insert_with(Vec::new);
+        locations
+            .try_reserve(idx + 1 - locations.len())
+            .map_err(|_| InternalError::MalformedControlFlowGraph)?;
+        instruction_sequence_addop(self, instruction_info_from_python(instr, oparg, loc))?;
         // addop arguments are (lineno, col_offset, end_lineno, end_col_offset);
         // get_instructions reports (lineno, end_lineno, col_offset, end_col_offset)
         // after storing those four values in struct order.
-        entry.python_loc = Some([lineno, col_offset, end_lineno, end_col_offset]);
+        let locations = self.python_locations.as_mut().unwrap();
+        locations.resize(idx + 1, None);
+        locations[idx] = Some([lineno, col_offset, end_lineno, end_col_offset]);
         Ok(())
     }
 
@@ -1075,11 +1107,13 @@ impl InstructionSequence {
     #[must_use]
     pub fn python_instructions(&self) -> Vec<PythonInstruction> {
         let mut out = Vec::with_capacity(self.instr_used);
-        for entry in &self.instrs[..self.instr_used] {
+        for (idx, entry) in self.instrs[..self.instr_used].iter().enumerate() {
             let opcode = any_opcode_as_i32(entry.info.instr.into());
             let has_arg = AnyOpcode::from(entry.info.instr).has_arg();
-            let [lineno, end_lineno, col_offset, end_col_offset] = entry
-                .python_loc
+            let [lineno, end_lineno, col_offset, end_col_offset] = self
+                .python_locations
+                .as_ref()
+                .and_then(|locations| locations.get(idx).copied().flatten())
                 .unwrap_or_else(|| python_location_of(&entry.info));
             out.push(PythonInstruction {
                 opcode,
@@ -1115,6 +1149,7 @@ fn instruction_sequence_new() -> InstructionSequence {
         instrs: Vec::new(),
         instr_allocation: 0,
         instr_used: 0,
+        python_locations: None,
         next_free_label: 0,
         label_map: None,
         label_map_allocation: 0,
@@ -1130,8 +1165,8 @@ fn any_opcode_as_i32(opcode: AnyOpcode) -> i32 {
     }
 }
 
-fn python_location_of(info: &InstructionInfo) -> [i32; 4] {
-    let loc = info.instruction_linetable_location();
+fn python_location_of(info: &LinearInstructionInfo) -> [i32; 4] {
+    let loc = info.location.linetable_location();
     [loc.line, loc.end_line, loc.col, loc.end_col]
 }
 
@@ -1290,6 +1325,7 @@ fn instruction_sequence_addop(
     info: InstructionInfo,
 ) -> crate::InternalResult<&mut InstructionSequenceEntry> {
     info.instruction_sequence_debug_check_addop();
+    let info = LinearInstructionInfo::from_cfg(info);
     let idx = instruction_sequence_next_inst(seq)?;
     let entry = &mut seq.instrs[idx];
     entry.info = info;
@@ -1298,7 +1334,7 @@ fn instruction_sequence_addop(
 
 fn instruction_sequence_last_info_mut(
     seq: &mut InstructionSequence,
-) -> Option<&mut InstructionInfo> {
+) -> Option<&mut LinearInstructionInfo> {
     if seq.instr_used == 0 {
         None
     } else {
@@ -1313,9 +1349,22 @@ fn instruction_sequence_insert_instruction(
     info: InstructionInfo,
 ) -> crate::InternalResult<()> {
     debug_assert!(pos <= seq.instr_used);
+    let info = LinearInstructionInfo::from_cfg(info);
+    if let Some(locations) = &mut seq.python_locations
+        && pos < locations.len()
+    {
+        locations
+            .try_reserve(1)
+            .map_err(|_| InternalError::MalformedControlFlowGraph)?;
+    }
     let last_idx = instruction_sequence_next_inst(seq)?;
-    for i in (pos..last_idx).rev() {
-        seq.instrs[i + 1] = seq.instrs[i];
+    seq.instrs.copy_within(pos..last_idx, pos + 1);
+    if let Some(locations) = &mut seq.python_locations
+        && pos < locations.len()
+    {
+        // Like the other slot metadata, the inserted slot keeps its old
+        // snapshot even though its InstructionInfo is replaced below.
+        locations.insert(pos, locations[pos]);
     }
 
     seq.instrs[pos].info = info;
@@ -1515,11 +1564,11 @@ fn same_location(a: LineTableLocation, b: LineTableLocation) -> bool {
 }
 
 /// assemble.c write_instr
-fn write_instr(instructions: &mut Vec<CodeUnit>, info: &InstructionInfo, ilen: usize) {
-    let opcode = info.instr.expect_real();
-    let oparg = u32::from(info.arg) as i32;
+fn write_instr(instructions: &mut Vec<CodeUnit>, instr: AnyInstruction, arg: OpArg, ilen: usize) {
+    let opcode = instr.expect_real();
+    let oparg = u32::from(arg) as i32;
     debug_assert!(
-        info.instr.has_arg() || oparg == 0,
+        instr.has_arg() || oparg == 0,
         "CPython assemble.c write_instr requires OPCODE_HAS_ARG or oparg == 0"
     );
     let caches = opcode.cache_entries();
@@ -1555,7 +1604,7 @@ fn write_instr(instructions: &mut Vec<CodeUnit>, info: &InstructionInfo, ilen: u
 /// assemble.c assemble_emit_instr
 fn assemble_emit_instr(
     instructions: &mut Vec<CodeUnit>,
-    info: &mut InstructionInfo,
+    info: &LinearInstructionInfo,
 ) -> crate::InternalResult<()> {
     let size = info.instr_size();
     let required = instructions
@@ -1565,7 +1614,7 @@ fn assemble_emit_instr(
     if required >= instructions.capacity() {
         vec_try_resize_to_double_capacity(instructions)?;
     }
-    write_instr(instructions, info, size);
+    write_instr(instructions, info.instr, info.arg, size);
     Ok(())
 }
 
@@ -1576,9 +1625,7 @@ fn assemble_location_info(
     debug_ranges: bool,
 ) -> crate::InternalResult<Box<[u8]>> {
     for i in (0..instr_sequence.instr_used).rev() {
-        let loc = instr_sequence.instrs[i]
-            .info
-            .instruction_linetable_location();
+        let loc = instr_sequence.instrs[i].info.location.linetable_location();
         if same_location(loc, next_linetable_location()) {
             if instr_sequence.instrs[i]
                 .info
@@ -1586,13 +1633,11 @@ fn assemble_location_info(
                 .expect_real()
                 .is_terminator()
             {
-                instr_sequence.instrs[i].info.lineno_override = Some(NO_LOCATION_OVERRIDE);
+                instr_sequence.instrs[i].info.location.lineno_override = Some(NO_LOCATION_OVERRIDE);
             } else {
                 debug_assert!(i < instr_sequence.instr_used - 1);
                 let next = instr_sequence.instrs[i + 1].info;
-                instr_sequence.instrs[i]
-                    .info
-                    .instr_set_location(next.instr_location());
+                instr_sequence.instrs[i].info.location = next.location;
             }
         }
     }
@@ -1603,7 +1648,7 @@ fn assemble_location_info(
     let mut loc = no_linetable_location();
     let mut size = 0;
     for entry in instr_sequence.instrs.iter().take(instr_sequence.instr_used) {
-        let instr_loc = entry.info.instruction_linetable_location();
+        let instr_loc = entry.info.location.linetable_location();
         if !same_location(loc, instr_loc) {
             assemble_emit_location(&mut linetable, loc, size, &mut prev_line, debug_ranges)?;
             loc = instr_loc;
@@ -1628,7 +1673,7 @@ fn assemble_emit(
     )?;
 
     for i in 0..instr_sequence.instr_used {
-        let instr = &mut instr_sequence.instrs[i].info;
+        let instr = &instr_sequence.instrs[i].info;
         assemble_emit_instr(&mut instructions, instr)?;
     }
 
@@ -3178,8 +3223,7 @@ impl Blocks {
             let old_index = *item as usize;
             debug_assert!(i <= old_index && old_index < nconsts);
             if i != old_index {
-                let value = consts.constants[old_index].clone();
-                consts.constants[i] = value;
+                consts.constants.swap(i, old_index);
             }
         }
 
@@ -4293,7 +4337,7 @@ impl CodeInfo {
 
     pub(crate) fn set_last_instr_sequence_lineno_override(&mut self, lineno_override: i32) {
         if let Some(last) = instruction_sequence_last_info_mut(&mut self.instr_sequence) {
-            last.lineno_override = Some(lineno_override);
+            last.location.lineno_override = Some(lineno_override);
         }
     }
 
@@ -5021,7 +5065,10 @@ fn fold_const_binop(
 }
 
 /// flowgraph.c get_const_value
-fn get_const_value(metadata: &CodeUnitMetadata, info: &InstructionInfo) -> Option<ConstantData> {
+fn get_const_value<'a>(
+    metadata: &'a CodeUnitMetadata,
+    info: &InstructionInfo,
+) -> Option<Cow<'a, ConstantData>> {
     match info.instr.real_opcode() {
         Some(Opcode::LoadCommonConstant) => {
             use oparg::CommonConstant;
@@ -5046,10 +5093,11 @@ fn get_const_value(metadata: &CodeUnitMetadata, info: &InstructionInfo) -> Optio
         }
         _ if info.instr.has_const() => {
             let idx = u32::from(info.arg) as usize;
-            metadata.consts.get_index(idx).cloned()
+            return metadata.consts.get_index(idx).map(Cow::Borrowed);
         }
         _ => None,
     }
+    .map(Cow::Owned)
 }
 
 /// flowgraph.c const_folding_check_complexity
@@ -5757,7 +5805,7 @@ fn fold_tuple_of_constants(
         let Some(element) = get_const_value(metadata, &block.instructions[j]) else {
             return Ok(false);
         };
-        elements.push(element);
+        elements.push(element.into_owned());
     }
 
     block.nop_out(&operand_indices);
@@ -5818,7 +5866,7 @@ fn fold_constant_sequence_into_load_const(
                     let Some(value) = get_const_value(metadata, &block.instructions[idx]) else {
                         return Ok(false);
                     };
-                    elements.push(value);
+                    elements.push(value.into_owned());
                 }
             }
             debug_assert_eq!(elements.len(), consts_found);
@@ -5911,7 +5959,7 @@ fn optimize_lists_and_sets(
         let Some(element) = get_const_value(metadata, &block.instructions[j]) else {
             return Ok(false);
         };
-        elements.push(element);
+        elements.push(element.into_owned());
     }
 
     let const_data = if is_list {
@@ -7038,8 +7086,7 @@ fn cfg_from_instruction_sequence(
                     .take(annotations_code.instr_used)
                 {
                     debug_assert!(!ann_entry.info.instr.has_target());
-                    let mut info = ann_entry.info;
-                    info.target = BlockIdx::NULL;
+                    let info = ann_entry.info.into_cfg();
                     cfg_builder_addop(&mut builder, info)?;
                 }
                 offset += annotations_code.instr_used as i32 - 1;
@@ -7065,8 +7112,7 @@ fn cfg_from_instruction_sequence(
         }
         entry.info.instr = opcode;
         entry.info.arg = oparg;
-        entry.info.target = BlockIdx::NULL;
-        cfg_builder_addop(&mut builder, entry.info)?;
+        cfg_builder_addop(&mut builder, entry.info.into_cfg())?;
         i += 1;
     }
 
@@ -7580,6 +7626,50 @@ mod tests {
         ConstantData::Float { value: f64::NAN }
     }
 
+    #[test]
+    fn inspecting_constant_operands_borrows_pool_storage() {
+        for constant in [
+            ConstantData::Code {
+                code: Box::new(test_code_object(vec![int_const(42)], 1)),
+            },
+            ConstantData::Tuple {
+                elements: vec![int_const(12345), int_const(67890)],
+            },
+            ConstantData::Str {
+                value: "a constant that need not be copied".into(),
+            },
+        ] {
+            let mut code = test_code_info(Block::default());
+            let (idx, _) = code.metadata.consts.insert_full(constant);
+            let mut load = test_instr(Opcode::LoadConst.into(), 1);
+            load.arg = OpArg::new(idx as u32);
+
+            let loaded = get_const_value(&code.metadata, &load).unwrap();
+            let borrowed: &ConstantData = core::borrow::Borrow::borrow(&loaded);
+            assert!(core::ptr::eq(borrowed, &code.metadata.consts[idx]));
+        }
+    }
+
+    #[test]
+    fn fallible_constant_insertion_grows_storage_amortized() {
+        let mut pool = ConstantPool::default();
+        let mut reallocations = 0;
+        for value in 0..1024 {
+            let capacity = pool.constants.capacity();
+            let (idx, inserted) = pool.try_insert_full(int_const(value)).unwrap();
+            assert!(inserted);
+            assert_eq!(idx, value as usize);
+            reallocations += usize::from(pool.constants.capacity() != capacity);
+        }
+        assert!(reallocations < 32, "{reallocations} storage expansions");
+        for value in 0..1024 {
+            assert_eq!(
+                pool.try_insert_full(int_const(value)).unwrap(),
+                (value as usize, false)
+            );
+        }
+    }
+
     fn test_code_object(constants: Vec<ConstantData>, first_line: usize) -> CodeObject {
         CodeObject {
             instructions: Vec::new().into(),
@@ -7761,6 +7851,42 @@ mod tests {
         assert_eq!(pool.len(), 2);
         assert_eq!(pool.code_candidates(&kept), vec![1]);
         assert!(pool.code_candidates(&unused).is_empty());
+        assert_eq!(u32::from(blocks[BlockIdx::new(0)].instructions[0].arg), 1);
+    }
+
+    #[test]
+    fn constant_pool_compaction_moves_code_without_cloning_descendants() {
+        let nested = Box::new(test_code_object(vec![int_const(42)], 3));
+        let nested_address = core::ptr::from_ref(nested.as_ref());
+        let kept = Box::new(test_code_object(
+            vec![ConstantData::Code { code: nested }],
+            2,
+        ));
+        let kept_address = core::ptr::from_ref(kept.as_ref());
+        let mut pool = ConstantPool::from_ordered(vec![
+            int_const(0),
+            int_const(99),
+            ConstantData::Code { code: kept },
+        ]);
+        let mut block = Block::default();
+        let mut load = test_instr(Instruction::Nop, 1);
+        load.instr = Opcode::LoadConst.into();
+        load.arg = OpArg::new(2);
+        test_block_push(&mut block, load);
+        test_block_push(&mut block, test_instr(Instruction::ReturnValue, 1));
+        let mut blocks = Blocks::from([block]);
+
+        blocks.remove_unused_consts(&mut pool).unwrap();
+
+        let ConstantData::Code { code } = &pool[1] else {
+            panic!("retained code must move to slot 1");
+        };
+        assert_eq!(core::ptr::from_ref(code.as_ref()), kept_address);
+        let ConstantData::Code { code: nested } = &code.constants[0.into()] else {
+            panic!("retained nested code must remain a code constant");
+        };
+        assert_eq!(core::ptr::from_ref(nested.as_ref()), nested_address);
+        assert_eq!(pool.code_candidates(code), vec![1]);
         assert_eq!(u32::from(blocks[BlockIdx::new(0)].instructions[0].arg), 1);
     }
 
@@ -8142,6 +8268,272 @@ mod tests {
         );
         assert_eq!(inserted.i_target, 1);
         assert_eq!(inserted.i_offset, 42);
+    }
+
+    #[test]
+    fn native_instruction_storage_does_not_pay_for_python_export_locations() {
+        let mut seq = instruction_sequence_new();
+        for line in 1..100 {
+            instruction_sequence_addop(&mut seq, test_instr(Instruction::Nop, line)).unwrap();
+        }
+        let entry_bytes = core::mem::size_of::<InstructionSequenceEntry>();
+        eprintln!(
+            "entry={entry_bytes} info={} sequence={} allocated_slots={}",
+            core::mem::size_of::<InstructionInfo>(),
+            core::mem::size_of::<InstructionSequence>(),
+            seq.instrs.len(),
+        );
+        assert!(
+            entry_bytes * seq.instrs.len() <= 104 * seq.instrs.len(),
+            "native instruction storage exceeds its 104-byte-per-slot budget: {entry_bytes}"
+        );
+    }
+
+    #[test]
+    fn linear_instruction_storage_does_not_pay_for_cfg_metadata() {
+        let mut seq = instruction_sequence_new();
+        for line in 1..100 {
+            instruction_sequence_addop(&mut seq, test_instr(Instruction::Nop, line)).unwrap();
+        }
+        let entry_bytes = core::mem::size_of::<InstructionSequenceEntry>();
+        eprintln!(
+            "linear entry={entry_bytes} CFG info={}",
+            core::mem::size_of::<InstructionInfo>()
+        );
+        assert!(
+            entry_bytes * seq.instrs.len() <= 96 * seq.instrs.len(),
+            "linear storage exceeds its 96-byte-per-slot budget: {entry_bytes}"
+        );
+    }
+
+    #[test]
+    fn instruction_sequence_preserves_semantic_locations_and_overrides_through_cfg() {
+        let mut seq = instruction_sequence_new();
+        let mut info = test_instr(Instruction::Nop, 3);
+        info.semantic_location = Some(LineTableLocation {
+            line: 7,
+            end_line: 8,
+            col: 2,
+            end_col: 9,
+        });
+        info.lineno_override = Some(LINE_ONLY_LOCATION_OVERRIDE);
+        instruction_sequence_addop(&mut seq, info).unwrap();
+        assert_eq!(exported_locations(&seq), [[7, 8, -1, -1]]);
+        let blocks = cfg_from_instruction_sequence(seq).unwrap();
+        let info = &blocks[0].instructions[0];
+        assert_eq!(info.location.line.get(), 3);
+        assert_eq!(info.end_location.line.get(), 3);
+        assert_eq!(info.lineno_override, Some(LINE_ONLY_LOCATION_OVERRIDE));
+        let location = info.instruction_linetable_location();
+        assert_eq!(
+            [
+                location.line,
+                location.end_line,
+                location.col,
+                location.end_col
+            ],
+            [7, 8, -1, -1]
+        );
+        let semantic = info.semantic_location.unwrap();
+        assert_eq!(
+            [
+                semantic.line,
+                semantic.end_line,
+                semantic.col,
+                semantic.end_col
+            ],
+            [7, 8, 2, 9]
+        );
+        assert_eq!(info.target, BlockIdx::NULL);
+        assert!(info.except_handler.is_none());
+    }
+
+    fn exported_locations(seq: &InstructionSequence) -> Vec<[i32; 4]> {
+        seq.python_instructions()
+            .into_iter()
+            .map(|info| {
+                [
+                    info.lineno,
+                    info.end_lineno,
+                    info.col_offset,
+                    info.end_col_offset,
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn instruction_sequence_export_preserves_mixed_locations_during_insertion() {
+        for (pos, expected) in [
+            (
+                0,
+                [
+                    [99, 99, 0, 0],
+                    [30, 30, 0, 0],
+                    [11, 2, 12, 7],
+                    [40, 40, 0, 0],
+                    [-3, -5, 0, -7],
+                ],
+            ),
+            (
+                1,
+                [
+                    [30, 30, 0, 0],
+                    [11, 2, 12, 7],
+                    [11, 2, 12, 7],
+                    [40, 40, 0, 0],
+                    [-3, -5, 0, -7],
+                ],
+            ),
+            (
+                2,
+                [
+                    [30, 30, 0, 0],
+                    [11, 2, 12, 7],
+                    [99, 99, 0, 0],
+                    [40, 40, 0, 0],
+                    [-3, -5, 0, -7],
+                ],
+            ),
+            (
+                4,
+                [
+                    [30, 30, 0, 0],
+                    [11, 2, 12, 7],
+                    [40, 40, 0, 0],
+                    [-3, -5, 0, -7],
+                    [99, 99, 0, 0],
+                ],
+            ),
+        ] {
+            let mut seq = instruction_sequence_new();
+            instruction_sequence_addop(&mut seq, test_instr(Instruction::Nop, 30)).unwrap();
+            seq.addop(i32::from(Opcode::Nop.as_u8()), 0, 11, 2, 12, 7)
+                .unwrap();
+            instruction_sequence_addop(&mut seq, test_instr(Instruction::Nop, 40)).unwrap();
+            seq.addop(i32::from(Opcode::Nop.as_u8()), 0, -3, -5, 0, -7)
+                .unwrap();
+            assert_eq!(
+                exported_locations(&seq),
+                [
+                    [30, 30, 0, 0],
+                    [11, 2, 12, 7],
+                    [40, 40, 0, 0],
+                    [-3, -5, 0, -7]
+                ]
+            );
+            instruction_sequence_insert_instruction(
+                &mut seq,
+                pos,
+                test_instr(Instruction::PopTop, 99),
+            )
+            .unwrap();
+            assert_eq!(exported_locations(&seq), expected, "insert at {pos}");
+            assert_eq!(
+                seq.python_instructions()[pos].opcode,
+                i32::from(Opcode::PopTop.as_u8())
+            );
+        }
+    }
+
+    #[test]
+    fn instruction_sequence_export_survives_growth_and_independent_clones() {
+        let mut seq = instruction_sequence_new();
+        for line in 1..100 {
+            instruction_sequence_addop(&mut seq, test_instr(Instruction::Nop, line)).unwrap();
+        }
+        seq.addop(i32::from(Opcode::Nop.as_u8()), 0, 11, 2, 12, 7)
+            .unwrap();
+        for line in 101..201 {
+            instruction_sequence_addop(&mut seq, test_instr(Instruction::Nop, line)).unwrap();
+        }
+        seq.addop(i32::from(Opcode::Nop.as_u8()), 0, -3, -5, 0, -7)
+            .unwrap();
+        let locations = exported_locations(&seq);
+        assert_eq!(locations.len(), 201);
+        assert_eq!(locations[98], [99, 99, 0, 0]);
+        assert_eq!(locations[99], [11, 2, 12, 7]);
+        assert_eq!(locations[100], [101, 101, 0, 0]);
+        assert_eq!(locations[199], [200, 200, 0, 0]);
+        assert_eq!(locations[200], [-3, -5, 0, -7]);
+
+        let mut cloned = seq.clone();
+        instruction_sequence_insert_instruction(
+            &mut cloned,
+            99,
+            test_instr(Instruction::PopTop, 99),
+        )
+        .unwrap();
+        assert_eq!(
+            exported_locations(&seq)[99..101],
+            [[11, 2, 12, 7], [101, 101, 0, 0]]
+        );
+        assert_eq!(
+            exported_locations(&cloned)[99..102],
+            [[11, 2, 12, 7], [11, 2, 12, 7], [101, 101, 0, 0]]
+        );
+        seq.add_nested(cloned);
+        seq.nested_mut()[0]
+            .addop(i32::from(Opcode::Nop.as_u8()), 0, 77, 3, 78, 9)
+            .unwrap();
+        assert_eq!(exported_locations(&seq).len(), 201);
+        assert_eq!(
+            exported_locations(&seq.nested()[0]).last(),
+            Some(&[77, 3, 78, 9])
+        );
+    }
+
+    #[test]
+    fn native_appends_do_not_extend_python_export_snapshots() {
+        let mut seq = instruction_sequence_new();
+        seq.addop(i32::from(Opcode::Nop.as_u8()), 0, 11, 2, 12, 7)
+            .unwrap();
+        let initial_capacity = seq.python_locations.as_ref().unwrap().capacity();
+        for line in 2..258 {
+            instruction_sequence_addop(&mut seq, test_instr(Instruction::Nop, line)).unwrap();
+        }
+        let snapshots = seq.python_locations.as_ref().unwrap();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots.capacity(), initial_capacity);
+        assert_eq!(exported_locations(&seq)[0], [11, 2, 12, 7]);
+        assert_eq!(exported_locations(&seq)[256], [257, 257, 0, 0]);
+
+        instruction_sequence_insert_instruction(&mut seq, 100, test_instr(Instruction::Nop, 99))
+            .unwrap();
+        assert_eq!(seq.python_locations.as_ref().unwrap().len(), 1);
+        assert_eq!(exported_locations(&seq)[100], [99, 99, 0, 0]);
+
+        seq.addop(i32::from(Opcode::Nop.as_u8()), 0, -3, -5, 0, -7)
+            .unwrap();
+        let locations = exported_locations(&seq);
+        assert_eq!(locations[0], [11, 2, 12, 7]);
+        assert_eq!(locations[100], [99, 99, 0, 0]);
+        assert_eq!(locations[257], [257, 257, 0, 0]);
+        assert_eq!(locations[258], [-3, -5, 0, -7]);
+    }
+
+    #[test]
+    fn instruction_sequence_export_keeps_locations_when_resolving_labels() {
+        let mut seq = instruction_sequence_new();
+        let target = seq.new_label();
+        seq.addop(i32::from(PseudoOpcode::Jump.as_u16()), target, 11, 2, 12, 7)
+            .unwrap();
+        instruction_sequence_addop(&mut seq, test_instr(Instruction::Nop, 30)).unwrap();
+        seq.use_label(target).unwrap();
+        seq.addop(i32::from(Opcode::Nop.as_u8()), 0, -3, -5, 0, -7)
+            .unwrap();
+        seq.apply_label_map();
+        assert_eq!(seq.python_instructions()[0].oparg, Some(2));
+        assert_eq!(
+            exported_locations(&seq),
+            [[11, 2, 12, 7], [30, 30, 0, 0], [-3, -5, 0, -7]]
+        );
+        let blocks = cfg_from_instruction_sequence(seq).unwrap();
+        let first = blocks[0].instructions[0].instruction_linetable_location();
+        assert_eq!(
+            [first.line, first.end_line, first.col, first.end_col],
+            [11, 12, 2, 7]
+        );
     }
 
     #[test]
