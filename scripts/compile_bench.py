@@ -2,7 +2,21 @@
 """Compare compile-only latency for CPython and two RustPython builds.
 
 Run the controller under CPython; workers use each target interpreter.
-No third-party packages are required. See compile_bench.md for reproduction.
+No third-party packages are required. Build base and head with the same Rust
+toolchain, release profile and features, using separate target directories.
+
+Example (replace CPY, BASE and HEAD with executable paths):
+    python3.15 scripts/compile_bench.py --cpython CPY --base BASE --head HEAD
+
+Use actual executable paths, not version-manager shims. Keep the machine idle
+and do not run builds concurrently. Only compile() is timed: startup, input
+generation, code execution and result destruction are excluded. Each round
+rotates interpreter order; results include raw samples, binary/source hashes,
+the exact inputs and a report. Failed measurements are errors, not speedups.
+Revision labels are caller-supplied; version strings alone are not provenance.
+
+Check the measurement contracts with:
+    cargo run --release -- scripts/test_compile_bench.py
 """
 
 import argparse
