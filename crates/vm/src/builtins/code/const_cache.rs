@@ -7,54 +7,70 @@ use super::*;
 use crate::builtins::{PyDict, PyDictRef, PyTuple};
 use crate::dict_inner::DictKey;
 
-/// A lookup key used only after bottom-up compilation has canonicalized every
-/// child constant and each code object's co_consts tuple. Equal code constants
-/// then share that tuple's identity, so hashing need not revisit descendants.
-/// The dictionary still stores the original constant key and uses its equality.
-/// A tuple input is the two-element key made by constant_key for an exact tuple.
-struct CompilerKey<'a>(&'a PyObject);
+/// Lookup after bottom-up canonicalization of children and code metadata.
+/// Equal code constants share metadata identities, allowing shallow hashing.
+struct CanonicalConstantKey<'a> {
+    equality_key: &'a PyObject,
+    hash_input: &'a PyObject,
+}
 
-fn compiler_hash(op: &PyObject, vm: &VirtualMachine) -> PyResult<crate::common::hash::PyHash> {
+impl<'a> CanonicalConstantKey<'a> {
+    fn from_constant_key(equality_key: &'a PyObject, vm: &VirtualMachine) -> Self {
+        let hash_input = match equality_key.downcast_ref_if_exact::<PyTuple>(vm) {
+            Some(tuple_key) => &tuple_key.as_slice()[0],
+            None => equality_key,
+        };
+        Self {
+            equality_key,
+            hash_input,
+        }
+    }
+}
+
+fn hash_canonical_constant(
+    op: &PyObject,
+    vm: &VirtualMachine,
+) -> PyResult<crate::common::hash::PyHash> {
     if let Some(tuple) = op.downcast_ref_if_exact::<PyTuple>(vm) {
-        crate::common::hash::hash_tuple(tuple.iter().map(|item| compiler_hash(item, vm)))
+        crate::common::hash::hash_tuple(tuple.iter().map(|item| hash_canonical_constant(item, vm)))
     } else if let Some(code) = op.downcast_ref::<PyCode>() {
-        hash_code_with_constants(code, vm, || {
-            Ok(crate::common::hash::hash_object_id(
-                code.co_consts().get_id(),
-            ))
-        })
+        use crate::common::hash::{hash_object_id, hash_tuple};
+
+        let code_hash =
+            hash_code_with_constants(code, vm, || Ok(hash_object_id(code.co_consts().get_id())))?;
+        hash_tuple([
+            Ok(code_hash),
+            Ok(hash_object_id(code.co_names.get_id())),
+            Ok(hash_object_id(code.co_localsplusnames.get_id())),
+            Ok(hash_object_id(code.co_linetable.get_id())),
+            Ok(hash_object_id(code.co_exceptiontable.get_id())),
+        ])
     } else {
         op.hash(vm)
     }
 }
 
-impl DictKey for CompilerKey<'_> {
+impl DictKey for CanonicalConstantKey<'_> {
     type Owned = PyObjectRef;
 
     fn _to_owned(&self, vm: &VirtualMachine) -> Self::Owned {
-        self.0._to_owned(vm)
+        self.equality_key._to_owned(vm)
     }
 
     fn key_hash(&self, vm: &VirtualMachine) -> PyResult<crate::common::hash::PyHash> {
-        let key = match self.0.downcast_ref_if_exact::<PyTuple>(vm) {
-            // Equal tuple keys have equal element keys.
-            // Keep the original tuple for equality and decoding, not hashing.
-            Some(key) => &key.as_slice()[0],
-            None => self.0,
-        };
-        compiler_hash(key, vm)
+        hash_canonical_constant(self.hash_input, vm)
     }
 
     fn key_is(&self, other: &PyObject) -> bool {
-        self.0.key_is(other)
+        self.equality_key.key_is(other)
     }
 
     fn key_eq(&self, vm: &VirtualMachine, other: &PyObject) -> PyResult<bool> {
-        self.0.key_eq(vm, other)
+        self.equality_key.key_eq(vm, other)
     }
 
     fn key_as_isize(&self, vm: &VirtualMachine) -> PyResult<isize> {
-        self.0.key_as_isize(vm)
+        self.equality_key.key_as_isize(vm)
     }
 }
 
@@ -106,7 +122,7 @@ impl CompileBag<'_> {
             self.merge_compiler_key(obj)
         } else {
             // Scalar and opaque container keys use their usual hash. It is
-            // also what compiler_hash uses when it encounters them in tuples.
+            // also what hash_canonical_constant uses when it encounters them in tuples.
             const_cache_insert(self.const_cache, obj, self.vm)
         };
         result.expect("constant keys are hashable and comparable")
@@ -114,7 +130,7 @@ impl CompileBag<'_> {
 
     fn merge_compiler_key(&self, obj: PyObjectRef) -> PyResult<PyObjectRef> {
         let key = constant_key(&obj, self.vm)?;
-        let lookup = CompilerKey(&key);
+        let lookup = CanonicalConstantKey::from_constant_key(&key, self.vm);
         let hash = lookup.key_hash(self.vm)?;
         let key = self
             .const_cache
@@ -249,6 +265,28 @@ equal_code = code.replace()
 assert code is not equal_code
 assert code == equal_code
 "#;
+
+    #[test]
+    fn compiler_hash_distinguishes_code_metadata() {
+        Interpreter::without_stdlib(Default::default()).enter(|vm| {
+            let scope = vm.new_scope_with_builtins();
+            for source in [
+                "first, second = (lambda a: a).__code__, (lambda b: b).__code__",
+                "first, second = (lambda: a).__code__, (lambda: b).__code__",
+                "first, second = (lambda: 0).__code__, (lambda: 0).__code__",
+            ] {
+                run(vm, &scope, source);
+                let first = scope.globals.get_item("first", vm).unwrap();
+                let second = scope.globals.get_item("second", vm).unwrap();
+                assert_eq!(first.hash(vm).unwrap(), second.hash(vm).unwrap());
+                assert_ne!(
+                    hash_canonical_constant(&first, vm).unwrap(),
+                    hash_canonical_constant(&second, vm).unwrap(),
+                    "code with different metadata must not all share one compiler-cache bucket"
+                );
+            }
+        });
+    }
 
     #[test]
     fn compiler_cache_hashes_code_chains_without_revisiting_descendants() {

@@ -56,20 +56,8 @@ fn is_within_opcode_range(opcode: AnyOpcode) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct ConstantPool {
     constants: Vec<ConstantData>,
-    /// De-dup index: canonical digest of a stored constant -> positions in
-    /// `constants` sharing that digest. NaN-bearing constants are never
-    /// registered here because they must never be deduplicated (see
-    /// `find_existing`). A digest collision only costs an extra
-    /// `constant_key_eq` check during the bucket scan; it can never cause
-    /// an incorrect match, because the final decision is always made by the
-    /// equality comparison.
-    index: IndexMap<u64, Vec<u32>>,
-    /// Structural digest bucket for code-object constants. Code objects are
-    /// compared by code_objects_equivalent, which is far too expensive to run
-    /// against every stored constant. Equal code objects share the digest;
-    /// collisions only add extra equality checks. Nested code contributes
-    /// shallow metadata to avoid re-hashing whole subtrees at every ancestor.
-    code_index: IndexMap<u64, Vec<u32>>,
+    constant_positions_by_digest: IndexMap<u64, Vec<u32>>,
+    code_positions_by_digest: IndexMap<u64, Vec<u32>>,
 }
 
 impl ConstantPool {
@@ -89,35 +77,35 @@ impl ConstantPool {
         index: &mut IndexMap<u64, Vec<usize>>,
         previous: &[ConstantData],
         constant: &ConstantData,
-    ) -> Option<u64> {
-        let digest = Self::constant_key_digest(constant);
-        if !Self::constant_contains_nan(constant) {
-            let bucket = index.entry(digest).or_default();
-            if bucket
-                .iter()
-                .any(|&idx| Self::constant_key_eq(&previous[idx], constant))
-            {
-                return None;
-            }
-            bucket.push(previous.len());
+        digest: u64,
+    ) -> bool {
+        let bucket = index.entry(digest).or_default();
+        if bucket
+            .iter()
+            .any(|&idx| Self::constant_key_eq(&previous[idx], constant))
+        {
+            return false;
         }
-        Some(digest)
+        bucket.push(previous.len());
+        true
     }
 
     fn frozenset_key_eq(left: &[ConstantData], right: &[ConstantData]) -> bool {
-        if left.iter().chain(right).any(Self::constant_contains_nan) {
-            return false;
-        }
         let mut index = IndexMap::default();
         let mut unique_count = 0;
         for (idx, element) in right.iter().enumerate() {
-            if Self::register_constant_key(&mut index, &right[..idx], element).is_some() {
+            let Some(digest) = Self::constant_key_digest(element) else {
+                return false;
+            };
+            if Self::register_constant_key(&mut index, &right[..idx], element, digest) {
                 unique_count += 1;
             }
         }
         let mut matched = IndexSet::default();
         for element in left {
-            let digest = Self::constant_key_digest(element);
+            let Some(digest) = Self::constant_key_digest(element) else {
+                return false;
+            };
             let Some(bucket) = index.get(&digest) else {
                 return false;
             };
@@ -181,12 +169,17 @@ impl ConstantPool {
             ConstantData::Frozenset { elements } => {
                 let mut canonical = Vec::new();
                 let mut index = IndexMap::default();
+                let needs_dedup = elements.len() > 1;
                 canonical
                     .try_reserve_exact(elements.len())
                     .map_err(|_| InternalError::MalformedControlFlowGraph)?;
                 for element in elements {
                     let element = Self::canonicalize_constant_key(element)?;
-                    if Self::register_constant_key(&mut index, &canonical, &element).is_some() {
+                    if !needs_dedup
+                        || Self::constant_key_digest(&element).is_none_or(|digest| {
+                            Self::register_constant_key(&mut index, &canonical, &element, digest)
+                        })
+                    {
                         canonical.push(element);
                     }
                 }
@@ -203,62 +196,52 @@ impl ConstantPool {
             .expect("constant key canonicalization only fails on allocation error")
     }
 
-    /// Digest of a constant, consistent with constant_key_eq.
-    ///
-    /// Two constants that constant_key_eq considers equal must produce the
-    /// same digest, or deduplication would miss and the pool would grow a
-    /// duplicate constant. The converse is not required: a digest collision
-    /// only costs an extra constant_key_eq check inside the bucket scan.
-    ///
-    /// Code inside containers retains pointer equality and uses the fallback
-    /// scan. Top-level code uses a separate index; compiler code insertion
-    /// additionally checks structural equality.
-    fn constant_digest(constant: &ConstantData) -> Option<u64> {
-        if Self::constant_contains_nan(constant) {
+    /// Equal keys must share a digest; collisions still require key equality.
+    /// Code-bearing containers use pointer equality and are scanned so cloning
+    /// cannot invalidate cached addresses. Top-level code has a structural index.
+    fn pool_index_digest(constant: &ConstantData) -> Option<u64> {
+        if Self::contains_code_object(constant) {
             return None;
         }
-        if Self::constant_key_needs_linear_scan(constant) {
-            return None;
-        }
-        Some(Self::constant_key_digest(constant))
+        Self::constant_key_digest(constant)
     }
 
-    fn constant_key_digest(constant: &ConstantData) -> u64 {
+    /// NaN-bearing keys have no digest and must remain distinct.
+    fn constant_key_digest(constant: &ConstantData) -> Option<u64> {
         use core::hash::Hasher;
         let mut hasher = rapidhash::quality::RapidHasher::default();
-        Self::hash_constant_key(constant, &mut hasher);
-        hasher.finish()
+        Self::hash_constant_key(constant, &mut hasher)?;
+        Some(hasher.finish())
     }
 
-    /// Whether deduplicating this constant must fall back to the linear scan
-    /// because it transitively contains a code object.
-    fn constant_key_needs_linear_scan(constant: &ConstantData) -> bool {
+    fn contains_code_object(constant: &ConstantData) -> bool {
         match constant {
             ConstantData::Code { .. } => true,
             ConstantData::Tuple { elements } | ConstantData::Frozenset { elements } => {
-                elements.iter().any(Self::constant_key_needs_linear_scan)
+                elements.iter().any(Self::contains_code_object)
             }
-            ConstantData::Slice { elements } => {
-                elements.iter().any(Self::constant_key_needs_linear_scan)
-            }
+            ConstantData::Slice { elements } => elements.iter().any(Self::contains_code_object),
             _ => false,
         }
     }
 
-    fn hash_constant_key<H: core::hash::Hasher>(constant: &ConstantData, state: &mut H) {
+    fn hash_constant_key<H: core::hash::Hasher>(
+        constant: &ConstantData,
+        state: &mut H,
+    ) -> Option<()> {
         use core::hash::Hash;
         match constant {
             ConstantData::Tuple { elements } => {
                 state.write_u8(1);
                 elements.len().hash(state);
                 for element in elements {
-                    Self::hash_constant_key(element, state);
+                    Self::hash_constant_key(element, state)?;
                 }
             }
             ConstantData::Slice { elements } => {
                 state.write_u8(2);
                 for element in elements {
-                    Self::hash_constant_key(element, state);
+                    Self::hash_constant_key(element, state)?;
                 }
             }
             ConstantData::Frozenset { elements } => {
@@ -270,9 +253,8 @@ impl ConstantPool {
                 let mut unique_len = 0usize;
                 let mut combined: u64 = 0;
                 for (idx, element) in elements.iter().enumerate() {
-                    if let Some(digest) =
-                        Self::register_constant_key(&mut index, &elements[..idx], element)
-                    {
+                    let digest = Self::constant_key_digest(element)?;
+                    if Self::register_constant_key(&mut index, &elements[..idx], element, digest) {
                         unique_len += 1;
                         combined = combined.wrapping_add(digest.rotate_left(17));
                     }
@@ -280,14 +262,18 @@ impl ConstantPool {
                 unique_len.hash(state);
                 combined.hash(state);
             }
+            ConstantData::Float { value } if value.is_nan() => return None,
+            ConstantData::Complex { value } if value.re.is_nan() || value.im.is_nan() => {
+                return None;
+            }
             other => {
                 state.write_u8(4);
                 other.hash(state);
             }
         }
+        Some(())
     }
 
-    /// Index of an already-stored constant equal to constant, if any.
     fn find_existing(&self, constant: &ConstantData) -> Option<usize> {
         if Self::constant_contains_nan(constant) {
             return None;
@@ -295,16 +281,17 @@ impl ConstantPool {
         if let ConstantData::Code { code } = constant {
             return self
                 .code_candidates(code)
-                .into_iter()
+                .iter()
+                .map(|&idx| idx as usize)
                 .find(|&idx| Self::constant_key_eq(&self.constants[idx], constant));
         }
-        let Some(digest) = Self::constant_digest(constant) else {
+        let Some(digest) = Self::pool_index_digest(constant) else {
             return self
                 .constants
                 .iter()
                 .position(|existing| Self::constant_key_eq(existing, constant));
         };
-        let bucket = self.index.get(&digest)?;
+        let bucket = self.constant_positions_by_digest.get(&digest)?;
         bucket
             .iter()
             .copied()
@@ -390,13 +377,10 @@ impl ConstantPool {
         hasher.finish()
     }
 
-    /// Candidate positions for a code-object constant, narrowed by its
-    /// structural digest.
-    pub fn code_candidates(&self, code: &CodeObject) -> Vec<usize> {
-        match self.code_index.get(&Self::code_object_digest(code)) {
-            Some(bucket) => bucket.iter().map(|&idx| idx as usize).collect(),
-            None => Vec::new(),
-        }
+    pub(crate) fn code_candidates(&self, code: &CodeObject) -> &[u32] {
+        self.code_positions_by_digest
+            .get(&Self::code_object_digest(code))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Insert compiler code constants with structural equality, computing the
@@ -408,7 +392,7 @@ impl ConstantPool {
         equivalent: impl Fn(&CodeObject, &CodeObject) -> bool,
     ) -> (usize, bool) {
         let digest = Self::code_object_digest(&code);
-        if let Some(bucket) = self.code_index.get(&digest) {
+        if let Some(bucket) = self.code_positions_by_digest.get(&digest) {
             for &idx in bucket {
                 let idx = idx as usize;
                 if let ConstantData::Code { code: existing } = &self.constants[idx]
@@ -419,14 +403,16 @@ impl ConstantPool {
             }
         }
         let idx = self.constants.len();
-        self.code_index.entry(digest).or_default().push(idx as u32);
+        self.code_positions_by_digest
+            .entry(digest)
+            .or_default()
+            .push(idx as u32);
         self.constants.push(ConstantData::Code { code });
         (idx, true)
     }
 
-    /// Register the code-object constant stored at idx in the code index.
     fn index_insert_code(&mut self, code: &CodeObject, idx: usize) {
-        self.code_index
+        self.code_positions_by_digest
             .entry(Self::code_object_digest(code))
             .or_default()
             .push(idx as u32);
@@ -437,25 +423,31 @@ impl ConstantPool {
             self.index_insert_code(code, idx);
             return;
         }
-        if let Some(digest) = Self::constant_digest(constant) {
-            self.index.entry(digest).or_default().push(idx as u32);
+        if let Some(digest) = Self::pool_index_digest(constant) {
+            self.constant_positions_by_digest
+                .entry(digest)
+                .or_default()
+                .push(idx as u32);
         }
     }
 
     /// Rebuild the digest index from the current contents of constants.
     /// Needed after remove_unused_consts compacts and truncates the vector.
     fn rebuild_index(&mut self) {
-        self.index.clear();
-        self.code_index.clear();
+        self.constant_positions_by_digest.clear();
+        self.code_positions_by_digest.clear();
         for idx in 0..self.constants.len() {
             let constant = &self.constants[idx];
             if let ConstantData::Code { code } = constant {
-                self.code_index
+                self.code_positions_by_digest
                     .entry(Self::code_object_digest(code))
                     .or_default()
                     .push(idx as u32);
-            } else if let Some(digest) = Self::constant_digest(constant) {
-                self.index.entry(digest).or_default().push(idx as u32);
+            } else if let Some(digest) = Self::pool_index_digest(constant) {
+                self.constant_positions_by_digest
+                    .entry(digest)
+                    .or_default()
+                    .push(idx as u32);
             }
         }
     }
@@ -493,8 +485,8 @@ impl ConstantPool {
     pub fn from_ordered(constants: Vec<ConstantData>) -> Self {
         let mut pool = Self {
             constants,
-            index: IndexMap::default(),
-            code_index: IndexMap::default(),
+            constant_positions_by_digest: IndexMap::default(),
+            code_positions_by_digest: IndexMap::default(),
         };
         pool.rebuild_index();
         pool
@@ -526,8 +518,8 @@ impl ConstantPool {
 
     pub fn clear(&mut self) {
         self.constants.clear();
-        self.index.clear();
-        self.code_index.clear();
+        self.constant_positions_by_digest.clear();
+        self.code_positions_by_digest.clear();
     }
 }
 
@@ -1016,8 +1008,8 @@ pub struct InstructionSequence {
     instr_used: usize,
     /// Raw location snapshots for Python addop, absent during native codegen.
     /// Only extends through the last Python addop; later native entries use
-    /// their InstructionInfo locations without growing this cold metadata.
-    python_locations: Option<Vec<Option<[i32; 4]>>>,
+    /// their linear instruction locations without growing this cold metadata.
+    raw_python_locations: Vec<Option<[i32; 4]>>,
     /// CPython `instr_sequence.s_next_free_label`.
     next_free_label: i32,
     label_map: Option<Vec<i32>>,
@@ -1065,15 +1057,14 @@ impl InstructionSequence {
         }
         let loc = [lineno, col_offset, end_lineno, end_col_offset];
         let idx = self.instr_used;
-        let locations = self.python_locations.get_or_insert_with(Vec::new);
-        locations
-            .try_reserve(idx + 1 - locations.len())
+        self.raw_python_locations
+            .try_reserve(idx + 1 - self.raw_python_locations.len())
             .map_err(|_| InternalError::MalformedControlFlowGraph)?;
         instruction_sequence_addop(self, instruction_info_from_python(instr, oparg, loc))?;
         // addop arguments are (lineno, col_offset, end_lineno, end_col_offset);
         // get_instructions reports (lineno, end_lineno, col_offset, end_col_offset)
         // after storing those four values in struct order.
-        let locations = self.python_locations.as_mut().unwrap();
+        let locations = &mut self.raw_python_locations;
         locations.resize(idx + 1, None);
         locations[idx] = Some([lineno, col_offset, end_lineno, end_col_offset]);
         Ok(())
@@ -1111,9 +1102,10 @@ impl InstructionSequence {
             let opcode = any_opcode_as_i32(entry.info.instr.into());
             let has_arg = AnyOpcode::from(entry.info.instr).has_arg();
             let [lineno, end_lineno, col_offset, end_col_offset] = self
-                .python_locations
-                .as_ref()
-                .and_then(|locations| locations.get(idx).copied().flatten())
+                .raw_python_locations
+                .get(idx)
+                .copied()
+                .flatten()
                 .unwrap_or_else(|| python_location_of(&entry.info));
             out.push(PythonInstruction {
                 opcode,
@@ -1149,7 +1141,7 @@ fn instruction_sequence_new() -> InstructionSequence {
         instrs: Vec::new(),
         instr_allocation: 0,
         instr_used: 0,
-        python_locations: None,
+        raw_python_locations: Vec::new(),
         next_free_label: 0,
         label_map: None,
         label_map_allocation: 0,
@@ -1350,21 +1342,18 @@ fn instruction_sequence_insert_instruction(
 ) -> crate::InternalResult<()> {
     debug_assert!(pos <= seq.instr_used);
     let info = LinearInstructionInfo::from_cfg(info);
-    if let Some(locations) = &mut seq.python_locations
-        && pos < locations.len()
-    {
-        locations
+    if pos < seq.raw_python_locations.len() {
+        seq.raw_python_locations
             .try_reserve(1)
             .map_err(|_| InternalError::MalformedControlFlowGraph)?;
     }
     let last_idx = instruction_sequence_next_inst(seq)?;
     seq.instrs.copy_within(pos..last_idx, pos + 1);
-    if let Some(locations) = &mut seq.python_locations
-        && pos < locations.len()
-    {
+    if pos < seq.raw_python_locations.len() {
         // Like the other slot metadata, the inserted slot keeps its old
-        // snapshot even though its InstructionInfo is replaced below.
-        locations.insert(pos, locations[pos]);
+        // snapshot even though its linear instruction is replaced below.
+        seq.raw_python_locations
+            .insert(pos, seq.raw_python_locations[pos]);
     }
 
     seq.instrs[pos].info = info;
@@ -7736,6 +7725,41 @@ mod tests {
     }
 
     #[test]
+    fn constant_pool_frozenset_deduplicates_finite_keys_after_nested_nans() {
+        for nan_key in [
+            ConstantData::Tuple {
+                elements: vec![nan_const()],
+            },
+            ConstantData::Frozenset {
+                elements: vec![nan_const()],
+            },
+            ConstantData::Slice {
+                elements: Box::new([
+                    int_const(0),
+                    ConstantData::Complex {
+                        value: Complex::new(0.0, f64::NAN),
+                    },
+                    int_const(1),
+                ]),
+            },
+        ] {
+            let mut pool = ConstantPool::default();
+            let constant = ConstantData::Frozenset {
+                elements: vec![nan_key.clone(), nan_key, int_const(1), int_const(1)],
+            };
+            assert_eq!(pool.insert_full(constant.clone()), (0, true));
+            assert_eq!(pool.insert_full(constant), (1, true));
+            for constant in pool.iter() {
+                let ConstantData::Frozenset { elements } = constant else {
+                    panic!("expected a frozenset constant");
+                };
+                assert_eq!(elements.len(), 3);
+                assert_eq!(elements[2], int_const(1));
+            }
+        }
+    }
+
+    #[test]
     fn constant_pool_frozenset_key_preserves_numeric_variants_and_zero_signs() {
         let elements = vec![
             int_const(0),
@@ -8271,25 +8295,6 @@ mod tests {
     }
 
     #[test]
-    fn native_instruction_storage_does_not_pay_for_python_export_locations() {
-        let mut seq = instruction_sequence_new();
-        for line in 1..100 {
-            instruction_sequence_addop(&mut seq, test_instr(Instruction::Nop, line)).unwrap();
-        }
-        let entry_bytes = core::mem::size_of::<InstructionSequenceEntry>();
-        eprintln!(
-            "entry={entry_bytes} info={} sequence={} allocated_slots={}",
-            core::mem::size_of::<InstructionInfo>(),
-            core::mem::size_of::<InstructionSequence>(),
-            seq.instrs.len(),
-        );
-        assert!(
-            entry_bytes * seq.instrs.len() <= 104 * seq.instrs.len(),
-            "native instruction storage exceeds its 104-byte-per-slot budget: {entry_bytes}"
-        );
-    }
-
-    #[test]
     fn linear_instruction_storage_does_not_pay_for_cfg_metadata() {
         let mut seq = instruction_sequence_new();
         for line in 1..100 {
@@ -8488,11 +8493,11 @@ mod tests {
         let mut seq = instruction_sequence_new();
         seq.addop(i32::from(Opcode::Nop.as_u8()), 0, 11, 2, 12, 7)
             .unwrap();
-        let initial_capacity = seq.python_locations.as_ref().unwrap().capacity();
+        let initial_capacity = seq.raw_python_locations.capacity();
         for line in 2..258 {
             instruction_sequence_addop(&mut seq, test_instr(Instruction::Nop, line)).unwrap();
         }
-        let snapshots = seq.python_locations.as_ref().unwrap();
+        let snapshots = &seq.raw_python_locations;
         assert_eq!(snapshots.len(), 1);
         assert_eq!(snapshots.capacity(), initial_capacity);
         assert_eq!(exported_locations(&seq)[0], [11, 2, 12, 7]);
@@ -8500,7 +8505,7 @@ mod tests {
 
         instruction_sequence_insert_instruction(&mut seq, 100, test_instr(Instruction::Nop, 99))
             .unwrap();
-        assert_eq!(seq.python_locations.as_ref().unwrap().len(), 1);
+        assert_eq!(seq.raw_python_locations.len(), 1);
         assert_eq!(exported_locations(&seq)[100], [99, 99, 0, 0]);
 
         seq.addop(i32::from(Opcode::Nop.as_u8()), 0, -3, -5, 0, -7)

@@ -106,36 +106,6 @@ class CompileBenchmarkTests(unittest.TestCase):
         self.assertIn("Growth", report)
         self.assertIn("assigns/4", report)
         self.assertIn("sha256", data["interpreters"]["base"])
-
-    def test_cli_records_working_directory_for_relative_path_reproduction(self):
-        with tempfile.TemporaryDirectory() as directory:
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(Path(bench.__file__).resolve()),
-                    "--cpython",
-                    sys.executable,
-                    "--base",
-                    sys.executable,
-                    "--head",
-                    sys.executable,
-                    "--workloads",
-                    "assigns",
-                    "--sizes",
-                    "1",
-                    "--rounds",
-                    "1",
-                    "--samples",
-                    "1",
-                    "--warmups",
-                    "0",
-                    "--output",
-                    directory,
-                ],
-                capture_output=True,
-                check=True,
-            )
-            data = json.loads((Path(directory) / "results.json").read_text())
         self.assertEqual(data["cwd"], str(Path.cwd()))
 
     def test_unexecutable_target_is_reported_without_losing_other_results(self):

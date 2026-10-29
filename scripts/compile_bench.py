@@ -39,6 +39,8 @@ SYNTHETIC_SIZES = {
     "unique_defs": (1000, 2000, 4000, 8000),
     "same_name_defs": (500, 1000, 2000, 4000),
     "same_line_lambdas": (500, 1000, 2000, 4000),
+    "same_line_parameter_lambdas": (250, 500, 1000, 2000),
+    "same_line_identical_lambdas": (250, 500, 1000, 2000),
     "nested_globals": (500, 1000, 2000, 4000),
     "frozenset_membership": (400, 800, 1600, 3200),
     "folded_lists": (1000, 2000, 4000, 8000),
@@ -60,6 +62,10 @@ def synthetic_source(name, size):
         return "\n".join(f"def f():\n    return {i}" for i in range(size))
     if name == "same_line_lambdas":
         return "values = (" + ",".join(f"lambda: {i}" for i in range(size)) + ",)"
+    if name == "same_line_parameter_lambdas":
+        return "values = (" + ",".join(f"lambda p{i}: p{i}" for i in range(size)) + ",)"
+    if name == "same_line_identical_lambdas":
+        return "values = (" + ",".join("lambda: 0" for _ in range(size)) + ",)"
     if name == "nested_globals":
         return "\n".join(
             f"x{i} = {i}\ndef f{i}():\n    global x{i}\n    return x{i}"

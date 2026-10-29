@@ -202,9 +202,8 @@ struct Compiler<'symbols, 'warnings> {
     syntax_warning_handler: Option<&'warnings mut SyntaxWarningHandler<'warnings>>,
     /// If true, keep unoptimized nested instruction sequences on the parent.
     save_nested_seqs: bool,
-    /// Names that some non-inlined nested scope of the module declares
-    /// explicitly global, computed once per module compile instead of
-    /// re-walking the whole symbol table for every module-level name.
+    /// Explicit globals in non-inlined descendants, independent of code position.
+    /// One set can therefore serve the entire module compilation.
     module_nested_globals: Option<std::collections::HashSet<Name>>,
 }
 
@@ -308,8 +307,8 @@ struct SymbolTableCursors {
 /// Mutable state for one activation of an immutable analyzed scope.
 /// Descendants stay borrowed so activating a scope does not copy its subtree.
 struct SymbolTableFrame<'symbols> {
-    table: &'symbols SymbolTable,
-    symbols: Cow<'symbols, IndexMap<Name, Symbol>>,
+    analyzed_scope: &'symbols SymbolTable,
+    active_symbols: Cow<'symbols, IndexMap<Name, Symbol>>,
     sub_tables: Vec<&'symbols SymbolTable>,
     next_sub_table: usize,
     next_hidden_annotation_block: usize,
@@ -318,15 +317,15 @@ struct SymbolTableFrame<'symbols> {
 }
 
 impl<'symbols> SymbolTableFrame<'symbols> {
-    fn new(table: &'symbols SymbolTable) -> Self {
+    fn new(analyzed_scope: &'symbols SymbolTable) -> Self {
         Self {
-            table,
-            symbols: Cow::Borrowed(&table.symbols),
-            sub_tables: table.sub_tables.iter().collect(),
-            next_sub_table: table.next_sub_table,
-            next_hidden_annotation_block: table.next_hidden_annotation_block,
-            next_inlined_comprehension_block: table.next_inlined_comprehension_block,
-            annotation_block: table
+            analyzed_scope,
+            active_symbols: Cow::Borrowed(&analyzed_scope.symbols),
+            sub_tables: analyzed_scope.sub_tables.iter().collect(),
+            next_sub_table: analyzed_scope.next_sub_table,
+            next_hidden_annotation_block: analyzed_scope.next_hidden_annotation_block,
+            next_inlined_comprehension_block: analyzed_scope.next_inlined_comprehension_block,
+            annotation_block: analyzed_scope
                 .annotation_block
                 .as_deref()
                 .map(Self::new)
@@ -335,8 +334,7 @@ impl<'symbols> SymbolTableFrame<'symbols> {
     }
 
     fn lookup(&self, name: &Name) -> Option<&Symbol> {
-        // Comprehensions can override the analyzed symbol's scope temporarily.
-        self.symbols.get(name)
+        self.active_symbols.get(name)
     }
 }
 
@@ -344,7 +342,7 @@ impl Deref for SymbolTableFrame<'_> {
     type Target = SymbolTable;
 
     fn deref(&self) -> &Self::Target {
-        self.table
+        self.analyzed_scope
     }
 }
 
@@ -1723,7 +1721,7 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
     fn is_name_imported(&self, name: &str) -> bool {
         self.symbol_table_stack
             .first()
-            .and_then(|table| table.symbols.get(name))
+            .and_then(|table| table.active_symbols.get(name))
             .is_some_and(|sym| sym.flags.contains(SymbolFlags::DEF_IMPORT))
     }
 
@@ -1774,7 +1772,7 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
     }
 
     /// Advance past the next non-annotation scope without activating it.
-    fn consume_next_sub_table(&mut self) -> CompileResult<()> {
+    fn consume_next_sub_table(&mut self) -> CompileResult<&'symbols SymbolTable> {
         // Look up the next table contained in the scope of the current table
         let current_table = self
             .symbol_table_stack
@@ -1803,19 +1801,18 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
             ))));
         }
 
+        let analyzed_scope = current_table.sub_tables[current_table.next_sub_table];
         current_table.next_sub_table += 1;
-        Ok(())
+        Ok(analyzed_scope)
     }
 
     /// Push the next symbol table on to the stack
     fn push_symbol_table(&mut self) -> CompileResult<&SymbolTableFrame<'symbols>> {
-        self.consume_next_sub_table()?;
-        let current_table = self.current_symbol_table();
-        let table =
-            SymbolTableFrame::new(current_table.sub_tables[current_table.next_sub_table - 1]);
+        let analyzed_scope = self.consume_next_sub_table()?;
+        let frame = SymbolTableFrame::new(analyzed_scope);
 
         // Push the next table onto the stack
-        self.symbol_table_stack.push(table);
+        self.symbol_table_stack.push(frame);
         Ok(self.current_symbol_table())
     }
 
@@ -1886,7 +1883,7 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
         {
             let idx = current_table.next_hidden_annotation_block;
             current_table.next_hidden_annotation_block += 1;
-            Some(&current_table.table.hidden_annotation_blocks[idx])
+            Some(&current_table.analyzed_scope.hidden_annotation_blocks[idx])
         } else {
             None
         }
@@ -2131,7 +2128,7 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
         // Build cellvars using dictbytype (CELL scope or COMP_CELL flag, sorted)
         let mut cellvar_cache = IndexSet::default();
         let mut cell_names: Vec<_> = ste
-            .symbols
+            .active_symbols
             .iter()
             .filter(|(_, s)| {
                 s.scope == SymbolScope::Cell || s.flags.contains(SymbolFlags::DEF_COMP_CELL)
@@ -2169,7 +2166,7 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
             .as_ref()
             .map(|annotation| {
                 annotation
-                    .symbols
+                    .active_symbols
                     .iter()
                     .filter(|(_, s)| s.scope == SymbolScope::Free)
                     .map(|(name, _)| name.clone())
@@ -2177,7 +2174,7 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
             })
             .unwrap_or_default();
         let mut free_names: Vec<_> = ste
-            .symbols
+            .active_symbols
             .iter()
             .filter(|(_, s)| {
                 s.scope == SymbolScope::Free
@@ -3462,8 +3459,6 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
         symboltable::maybe_mangle_name(private.map(Name::from).as_ref(), mangled_names, name)
     }
 
-    /// Collect every name that a non-inlined nested scope declares explicitly
-    /// global, in one pass over the module symbol table.
     fn collect_module_nested_globals(
         table: &SymbolTable,
         out: &mut std::collections::HashSet<Name>,
@@ -3480,11 +3475,7 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
         }
     }
 
-    /// Whether a nested scope of the module declares this name explicitly
-    /// global. The answer is independent of the current code position, so the
-    /// set is collected once per module compile rather than re-walking the
-    /// symbol table tree for every module-level name.
-    fn module_name_declared_global_in_nested_scope_cached(&mut self, name: &Name) -> bool {
+    fn module_name_declared_global_in_nested_scope(&mut self, name: &Name) -> bool {
         if self.current_symbol_table().typ != CompilerScope::Module {
             return false;
         }
@@ -3623,17 +3614,12 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
             }
         };
 
-        // This walk is only consulted for the Local and Unknown scopes below.
-        // Running it for every name costs a full symbol-table tree traversal per
-        // module-level name, which is quadratic in the number of nested
-        // definitions, so compute it lazily at the two places that read it.
-
         // Determine operation type based on scope
         let op_type = match actual_scope {
             SymbolScope::Free => NameOp::Deref,
             SymbolScope::Cell => NameOp::Deref,
             SymbolScope::Local => {
-                if self.module_name_declared_global_in_nested_scope_cached(name.as_ref()) {
+                if self.module_name_declared_global_in_nested_scope(name.as_ref()) {
                     NameOp::Global
                 } else if is_function_like
                     || self
@@ -3672,7 +3658,7 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
                 }
             }
             SymbolScope::Unknown => {
-                if self.module_name_declared_global_in_nested_scope_cached(name.as_ref()) {
+                if self.module_name_declared_global_in_nested_scope(name.as_ref()) {
                     NameOp::Global
                 } else {
                     NameOp::Name
@@ -9731,13 +9717,12 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
         let Some(outermost) = generators.first() else {
             return Ok(None);
         };
-        let is_coroutine = self
+        let (table, _) = self
             .lookup_comprehension_symbol_table_after_skipped_nested_scopes_in_expr(
                 &outermost.iter,
                 ComprehensionType::Generator,
-                |table, _| table.is_coroutine,
             )?;
-        if is_coroutine {
+        if table.is_coroutine {
             return Ok(None);
         }
         Ok(Some(id.as_str()))
@@ -10863,23 +10848,22 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
             line_number,
         );
         seek(
-            table.table.hidden_annotation_blocks.iter(),
+            table.analyzed_scope.hidden_annotation_blocks.iter(),
             &mut table.next_hidden_annotation_block,
             line_number,
         );
         seek(
-            table.table.inlined_comprehension_blocks.iter(),
+            table.analyzed_scope.inlined_comprehension_blocks.iter(),
             &mut table.next_inlined_comprehension_block,
             line_number,
         );
     }
 
-    fn lookup_comprehension_symbol_table_after_skipped_nested_scopes_in_expr<T>(
+    fn lookup_comprehension_symbol_table_after_skipped_nested_scopes_in_expr(
         &mut self,
         expression: &ast::Expr,
         comprehension_type: ComprehensionType,
-        select: impl FnOnce(&'symbols SymbolTable, ComprehensionSymbolSource) -> T,
-    ) -> CompileResult<T> {
+    ) -> CompileResult<(&'symbols SymbolTable, ComprehensionSymbolSource)> {
         let saved_cursor = self
             .symbol_table_stack
             .last()
@@ -10898,14 +10882,14 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
                 .expect("no current symbol table");
             if comprehension_type != ComprehensionType::Generator
                 && let Some(table) = current_table
-                    .table
+                    .analyzed_scope
                     .inlined_comprehension_blocks
                     .get(current_table.next_inlined_comprehension_block)
             {
-                return Ok(select(table, ComprehensionSymbolSource::Inlined));
+                return Ok((table, ComprehensionSymbolSource::Inlined));
             }
             if let Some(table) = current_table.sub_tables.get(current_table.next_sub_table) {
-                Ok(select(table, ComprehensionSymbolSource::Child))
+                Ok((*table, ComprehensionSymbolSource::Child))
             } else {
                 let name = current_table.name.clone();
                 let typ = current_table.typ;
@@ -11054,7 +11038,6 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
             .lookup_comprehension_symbol_table_after_skipped_nested_scopes_in_expr(
                 &outermost.iter,
                 comprehension_type,
-                |table, source| (table, source),
             )?;
 
         let is_inlined = self.is_inlined_comprehension_context(comprehension_type, comp_table);
@@ -11430,7 +11413,7 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
                 let comp_scope = comp_sym.scope;
 
                 let current_table = self.symbol_table_stack.last().expect("no symbol table");
-                if let Some(outer_sym) = current_table.symbols.get(name) {
+                if let Some(outer_sym) = current_table.active_symbols.get(name) {
                     let outer_scope = outer_sym.scope;
                     if (comp_scope != outer_scope
                         && comp_scope != SymbolScope::Free
@@ -11441,7 +11424,7 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
                         let current_table =
                             self.symbol_table_stack.last_mut().expect("no symbol table");
                         current_table
-                            .symbols
+                            .active_symbols
                             .to_mut()
                             .insert(name.clone(), comp_sym.clone());
                     }
@@ -11486,7 +11469,7 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
                 {
                     let i = if self
                         .current_symbol_table()
-                        .symbols
+                        .active_symbols
                         .get(name)
                         .is_some_and(|s| s.scope == SymbolScope::Free)
                     {
@@ -11746,7 +11729,10 @@ impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
 
         let current_table = self.symbol_table_stack.last_mut().expect("no symbol table");
         for (name, original_sym) in temp_symbols {
-            current_table.symbols.to_mut().insert(name, original_sym);
+            current_table
+                .active_symbols
+                .to_mut()
+                .insert(name, original_sym);
         }
         for name in changed_fast_hidden {
             self.current_code_info()
@@ -15359,7 +15345,7 @@ match x:
         compiler.consume_next_sub_table().unwrap();
         let active = compiler.symbol_table_stack.last_mut().unwrap();
         assert!(active.next_sub_table > 0);
-        active.symbols.to_mut().shift_remove(&name);
+        active.active_symbols.to_mut().shift_remove(&name);
         assert!(active.lookup(&name).is_none());
         compiler.pop_symbol_table();
 
