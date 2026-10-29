@@ -1038,26 +1038,39 @@ impl Comparable for PyCode {
 
 impl Hashable for PyCode {
     fn hash(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<crate::common::hash::PyHash> {
-        let code = &zelf.code;
-        // Hash a tuple of key attributes, matching CPython's code_hash
-        let tuple = vm.ctx.new_tuple(vec![
-            zelf.co_name.clone().into(),
-            vm.ctx.new_int(code.arg_count).into(),
-            vm.ctx.new_int(code.posonlyarg_count).into(),
-            vm.ctx.new_int(code.kwonlyarg_count).into(),
-            vm.ctx.new_int(code.varnames.len()).into(),
-            vm.ctx.new_int(code.flags.bits()).into(),
-            vm.ctx
-                .new_int(code.first_line_number.map_or(0, |n| n.get()) as i64)
-                .into(),
-            zelf.get_code(vm).into(),
-            {
-                let consts: Vec<_> = code.constants.iter().map(|c| c.0.clone()).collect();
-                vm.ctx.new_tuple(consts).into()
-            },
-        ]);
-        tuple.as_object().hash(vm)
+        // Preserve attribute hashing order without allocating temporary
+        // tuples or integers. Hash the constants slice rather than calling
+        // a constants tuple subclass's __hash__ or __iter__ override.
+        hash_code_with_constants(zelf, vm, || {
+            super::tuple::tuple_hash(zelf.co_consts().as_slice(), vm)
+        })
     }
+}
+
+fn hash_code_with_constants(
+    zelf: &Py<PyCode>,
+    vm: &VirtualMachine,
+    hash_constants: impl FnOnce() -> PyResult<crate::common::hash::PyHash>,
+) -> PyResult<crate::common::hash::PyHash> {
+    use crate::common::hash::{hash_tuple, hash_usize};
+
+    let code = &zelf.code;
+    let name_hash = zelf.co_name.as_object().hash(vm)?;
+    let code_hash = zelf.get_code(vm).as_object().hash(vm)?;
+    let constants_hash = hash_constants()?;
+    hash_tuple([
+        Ok(name_hash),
+        Ok(i64::from(code.arg_count)),
+        Ok(i64::from(code.posonlyarg_count)),
+        Ok(i64::from(code.kwonlyarg_count)),
+        Ok(hash_usize(code.varnames.len())),
+        Ok(i64::from(code.flags.bits())),
+        Ok(hash_usize(
+            code.first_line_number.map_or(0, |line| line.get()),
+        )),
+        Ok(code_hash),
+        Ok(constants_hash),
+    ])
 }
 
 // Arguments for code object constructor

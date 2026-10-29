@@ -21,7 +21,7 @@ use crate::{
     unparse::UnparseExpr,
 };
 use alloc::borrow::Cow;
-use core::{mem, slice};
+use core::{mem, ops::Deref, slice};
 use malachite_bigint::BigInt;
 use num_complex::Complex;
 use num_traits::{Num, ToPrimitive, Zero};
@@ -178,9 +178,9 @@ enum NameUsage {
     Delete,
 }
 /// Main structure holding the state of compilation.
-struct Compiler<'a> {
+struct Compiler<'symbols, 'warnings> {
     code_stack: Vec<ir::CodeInfo>,
-    symbol_table_stack: Vec<SymbolTable>,
+    symbol_table_stack: Vec<SymbolTableFrame<'symbols>>,
     source_file: SourceFile,
     // current_source_location: SourceLocation,
     current_source_span: CompilerSourceSpan,
@@ -199,9 +199,12 @@ struct Compiler<'a> {
     do_not_emit_bytecode: u32,
     /// Mirrors `c_disable_warning` while compiling FINALLY_END copies.
     disable_warning: u32,
-    syntax_warning_handler: Option<&'a mut SyntaxWarningHandler<'a>>,
+    syntax_warning_handler: Option<&'warnings mut SyntaxWarningHandler<'warnings>>,
     /// If true, keep unoptimized nested instruction sequences on the parent.
     save_nested_seqs: bool,
+    /// Explicit globals in non-inlined descendants, independent of code position.
+    /// One set can therefore serve the entire module compilation.
+    module_nested_globals: Option<std::collections::HashSet<Name>>,
 }
 
 /// A Python `__future__` feature flag imported via `from __future__ import <feature>`.
@@ -299,6 +302,48 @@ struct SymbolTableCursors {
     sub_table: usize,
     hidden_annotation_block: usize,
     inlined_comprehension_block: usize,
+}
+
+/// Mutable state for one activation of an immutable analyzed scope.
+/// Descendants stay borrowed so activating a scope does not copy its subtree.
+struct SymbolTableFrame<'symbols> {
+    analyzed_scope: &'symbols SymbolTable,
+    active_symbols: Cow<'symbols, IndexMap<Name, Symbol>>,
+    sub_tables: Vec<&'symbols SymbolTable>,
+    next_sub_table: usize,
+    next_hidden_annotation_block: usize,
+    next_inlined_comprehension_block: usize,
+    annotation_block: Option<Box<Self>>,
+}
+
+impl<'symbols> SymbolTableFrame<'symbols> {
+    fn new(analyzed_scope: &'symbols SymbolTable) -> Self {
+        Self {
+            analyzed_scope,
+            active_symbols: Cow::Borrowed(&analyzed_scope.symbols),
+            sub_tables: analyzed_scope.sub_tables.iter().collect(),
+            next_sub_table: analyzed_scope.next_sub_table,
+            next_hidden_annotation_block: analyzed_scope.next_hidden_annotation_block,
+            next_inlined_comprehension_block: analyzed_scope.next_inlined_comprehension_block,
+            annotation_block: analyzed_scope
+                .annotation_block
+                .as_deref()
+                .map(Self::new)
+                .map(Box::new),
+        }
+    }
+
+    fn lookup(&self, name: &Name) -> Option<&Symbol> {
+        self.active_symbols.get(name)
+    }
+}
+
+impl Deref for SymbolTableFrame<'_> {
+    type Target = SymbolTable;
+
+    fn deref(&self) -> &Self::Target {
+        self.analyzed_scope
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -492,25 +537,25 @@ pub fn compile_ast_with_syntax_warning_handler<'a>(
         end_location: None,
         source_path: source_file.name().to_owned(),
     })?;
+    let symbol_table = match &ast {
+        ruff_python_ast::Mod::Module(module) => scan_module_symbols(module, &source_file, &opts),
+        ruff_python_ast::Mod::Expression(expr) => scan_expr_symbols(expr, &source_file, &opts),
+    }?;
     let mut compiler = Compiler::new_with_syntax_warning_handler(
         opts,
-        source_file.clone(),
+        source_file,
         "<module>",
         syntax_warning_handler,
     );
     compiler.ast_locations = locations;
     match ast {
-        ast::Mod::Module(module) => {
-            let symbols = scan_module_symbols(&module, &source_file, &compiler.opts)?;
-            match mode {
-                Mode::Exec | Mode::Eval => compiler.compile_program(&module, symbols)?,
-                Mode::Single => compiler.compile_program_single(&module.body, symbols)?,
-                Mode::BlockExpr => compiler.compile_block_expr(&module.body, symbols)?,
-            }
-        }
+        ast::Mod::Module(module) => match mode {
+            Mode::Exec | Mode::Eval => compiler.compile_program(&module, &symbol_table)?,
+            Mode::Single => compiler.compile_program_single(&module.body, &symbol_table)?,
+            Mode::BlockExpr => compiler.compile_block_expr(&module.body, &symbol_table)?,
+        },
         ast::Mod::Expression(expression) => {
-            let symbols = scan_expr_symbols(&expression, &source_file, &compiler.opts)?;
-            compiler.compile_eval(&expression, symbols)?;
+            compiler.compile_eval(&expression, &symbol_table)?;
         }
     }
     Ok(compiler.exit_scope())
@@ -613,9 +658,13 @@ pub fn compile_codegen_ast<'a>(
         source_path: source_file.name().to_owned(),
     })?;
 
+    let symbol_table = match &ast {
+        ruff_python_ast::Mod::Module(module) => scan_module_symbols(module, &source_file, &opts),
+        ruff_python_ast::Mod::Expression(expr) => scan_expr_symbols(expr, &source_file, &opts),
+    }?;
     let mut compiler = Compiler::new_with_syntax_warning_handler(
         opts,
-        source_file.clone(),
+        source_file,
         "<module>",
         syntax_warning_handler,
     );
@@ -624,21 +673,17 @@ pub fn compile_codegen_ast<'a>(
     match ast {
         ruff_python_ast::Mod::Module(module) => match mode {
             Mode::Exec | Mode::Eval => {
-                let symbol_table = scan_module_symbols(&module, &source_file, &compiler.opts)?;
-                compiler.compile_program(&module, symbol_table)?;
+                compiler.compile_program(&module, &symbol_table)?;
             }
             Mode::Single => {
-                let symbol_table = scan_module_symbols(&module, &source_file, &compiler.opts)?;
-                compiler.compile_program_single(&module.body, symbol_table)?;
+                compiler.compile_program_single(&module.body, &symbol_table)?;
             }
             Mode::BlockExpr => {
-                let symbol_table = scan_module_symbols(&module, &source_file, &compiler.opts)?;
-                compiler.compile_block_expr(&module.body, symbol_table)?;
+                compiler.compile_block_expr(&module.body, &symbol_table)?;
             }
         },
         ruff_python_ast::Mod::Expression(expr) => {
-            let symbol_table = scan_expr_symbols(&expr, &source_file, &compiler.opts)?;
-            compiler.compile_eval(&expr, symbol_table)?;
+            compiler.compile_eval(&expr, &symbol_table)?;
         }
     }
 
@@ -710,7 +755,7 @@ fn compile_program_with_syntax_warning_handler<'a>(
         "<module>",
         syntax_warning_handler,
     );
-    compiler.compile_program(ast, symbol_table)?;
+    compiler.compile_program(ast, &symbol_table)?;
     let code = compiler.exit_scope();
     trace!("Compilation completed: {code:?}");
     Ok(code)
@@ -738,7 +783,7 @@ fn compile_program_single_with_syntax_warning_handler<'a>(
         "<module>",
         syntax_warning_handler,
     );
-    compiler.compile_program_single(&ast.body, symbol_table)?;
+    compiler.compile_program_single(&ast.body, &symbol_table)?;
     let code = compiler.exit_scope();
     trace!("Compilation completed: {code:?}");
     Ok(code)
@@ -765,7 +810,7 @@ fn compile_block_expression_with_syntax_warning_handler<'a>(
         "<module>",
         syntax_warning_handler,
     );
-    compiler.compile_block_expr(&ast.body, symbol_table)?;
+    compiler.compile_block_expr(&ast.body, &symbol_table)?;
     let code = compiler.exit_scope();
     trace!("Compilation completed: {code:?}");
     Ok(code)
@@ -792,7 +837,7 @@ fn compile_expression_with_syntax_warning_handler<'a>(
         "<module>",
         syntax_warning_handler,
     );
-    compiler.compile_eval(ast, symbol_table)?;
+    compiler.compile_eval(ast, &symbol_table)?;
     let code = compiler.exit_scope();
     Ok(code)
 }
@@ -819,7 +864,7 @@ macro_rules! emit {
     };
 }
 
-fn eprint_location(zelf: &Compiler<'_>) {
+fn eprint_location(zelf: &Compiler<'_, '_>) {
     let start = zelf.source_file.to_source_code().source_location(
         zelf.current_source_span.range.start(),
         PositionEncoding::Utf8,
@@ -840,7 +885,7 @@ fn eprint_location(zelf: &Compiler<'_>) {
 
 /// Better traceback for internal error
 #[track_caller]
-fn unwrap_internal<T>(zelf: &Compiler<'_>, r: InternalResult<T>) -> T {
+fn unwrap_internal<T>(zelf: &Compiler<'_, '_>, r: InternalResult<T>) -> T {
     if let Err(ref r_err) = r {
         eprintln!("=== CODEGEN PANIC INFO ===");
         eprintln!("This IS an internal error: {r_err}");
@@ -850,7 +895,7 @@ fn unwrap_internal<T>(zelf: &Compiler<'_>, r: InternalResult<T>) -> T {
     r.unwrap()
 }
 
-fn compiler_unwrap_option<T>(zelf: &Compiler<'_>, o: Option<T>) -> T {
+fn compiler_unwrap_option<T>(zelf: &Compiler<'_, '_>, o: Option<T>) -> T {
     if o.is_none() {
         eprintln!("=== CODEGEN PANIC INFO ===");
         eprintln!("This IS an internal error, an option was unwrapped during codegen");
@@ -971,7 +1016,7 @@ impl InferredType {
 
 const STACK_USE_GUIDELINE: u32 = 30;
 
-impl<'warnings> Compiler<'warnings> {
+impl<'symbols, 'warnings> Compiler<'symbols, 'warnings> {
     fn constant_truthiness(constant: &ConstantData) -> bool {
         match constant {
             ConstantData::Tuple { elements } | ConstantData::Frozenset { elements } => {
@@ -1329,6 +1374,7 @@ impl<'warnings> Compiler<'warnings> {
             disable_warning: 0,
             syntax_warning_handler,
             save_nested_seqs: false,
+            module_nested_globals: None,
         }
     }
 
@@ -1660,7 +1706,7 @@ impl<'warnings> Compiler<'warnings> {
     }
 
     /// Get the SymbolTable for the current scope.
-    fn current_symbol_table(&self) -> &SymbolTable {
+    fn current_symbol_table(&self) -> &SymbolTableFrame<'symbols> {
         self.symbol_table_stack
             .last()
             .expect("symbol_table_stack is empty! This is a compiler bug.")
@@ -1675,7 +1721,7 @@ impl<'warnings> Compiler<'warnings> {
     fn is_name_imported(&self, name: &str) -> bool {
         self.symbol_table_stack
             .first()
-            .and_then(|table| table.symbols.get(name))
+            .and_then(|table| table.active_symbols.get(name))
             .is_some_and(|sym| sym.flags.contains(SymbolFlags::DEF_IMPORT))
     }
 
@@ -1725,8 +1771,8 @@ impl<'warnings> Compiler<'warnings> {
         idx.to_u32()
     }
 
-    /// Push the next symbol table on to the stack
-    fn push_symbol_table(&mut self) -> CompileResult<&SymbolTable> {
+    /// Advance past the next non-annotation scope without activating it.
+    fn consume_next_sub_table(&mut self) -> CompileResult<&'symbols SymbolTable> {
         // Look up the next table contained in the scope of the current table
         let current_table = self
             .symbol_table_stack
@@ -1755,12 +1801,18 @@ impl<'warnings> Compiler<'warnings> {
             ))));
         }
 
-        let idx = current_table.next_sub_table;
+        let analyzed_scope = current_table.sub_tables[current_table.next_sub_table];
         current_table.next_sub_table += 1;
-        let table = current_table.sub_tables[idx].clone();
+        Ok(analyzed_scope)
+    }
+
+    /// Push the next symbol table on to the stack
+    fn push_symbol_table(&mut self) -> CompileResult<&SymbolTableFrame<'symbols>> {
+        let analyzed_scope = self.consume_next_sub_table()?;
+        let frame = SymbolTableFrame::new(analyzed_scope);
 
         // Push the next table onto the stack
-        self.symbol_table_stack.push(table);
+        self.symbol_table_stack.push(frame);
         Ok(self.current_symbol_table())
     }
 
@@ -1768,7 +1820,7 @@ impl<'warnings> Compiler<'warnings> {
         &mut self,
         typ: CompilerScope,
         table_name: &str,
-    ) -> CompileResult<&SymbolTable> {
+    ) -> CompileResult<&SymbolTableFrame<'symbols>> {
         let current_table = self
             .symbol_table_stack
             .last_mut()
@@ -1794,7 +1846,7 @@ impl<'warnings> Compiler<'warnings> {
             ))));
         };
 
-        let table = current_table.sub_tables[idx].clone();
+        let table = SymbolTableFrame::new(current_table.sub_tables[idx]);
         current_table.next_sub_table = idx + 1;
         self.symbol_table_stack.push(table);
         Ok(self.current_symbol_table())
@@ -1805,34 +1857,36 @@ impl<'warnings> Compiler<'warnings> {
     /// arguments AST node. Without future annotations they are also children;
     /// with future annotations they are hidden from children and consumed here.
     fn push_annotation_symbol_table(&mut self) -> bool {
-        let Some(annotation_table) = ({
-            let current_table = self
-                .symbol_table_stack
-                .last_mut()
-                .expect("no current symbol table");
-
-            let next_idx = current_table.next_sub_table;
-            if next_idx < current_table.sub_tables.len()
-                && current_table.sub_tables[next_idx].typ == CompilerScope::Annotation
-            {
-                let next_table = current_table.sub_tables[next_idx].clone();
-                current_table.next_sub_table += 1;
-                Some(next_table)
-            } else if current_table.next_hidden_annotation_block
-                < current_table.hidden_annotation_blocks.len()
-            {
-                let idx = current_table.next_hidden_annotation_block;
-                current_table.next_hidden_annotation_block += 1;
-                Some(current_table.hidden_annotation_blocks[idx].clone())
-            } else {
-                None
-            }
-        }) else {
+        let Some(annotation_table) = self.consume_annotation_symbol_table() else {
             return false;
         };
 
-        self.symbol_table_stack.push(annotation_table);
+        self.symbol_table_stack
+            .push(SymbolTableFrame::new(annotation_table));
         true
+    }
+
+    fn consume_annotation_symbol_table(&mut self) -> Option<&'symbols SymbolTable> {
+        let current_table = self
+            .symbol_table_stack
+            .last_mut()
+            .expect("no current symbol table");
+
+        let next_idx = current_table.next_sub_table;
+        if next_idx < current_table.sub_tables.len()
+            && current_table.sub_tables[next_idx].typ == CompilerScope::Annotation
+        {
+            current_table.next_sub_table += 1;
+            Some(current_table.sub_tables[next_idx])
+        } else if current_table.next_hidden_annotation_block
+            < current_table.hidden_annotation_blocks.len()
+        {
+            let idx = current_table.next_hidden_annotation_block;
+            current_table.next_hidden_annotation_block += 1;
+            Some(&current_table.analyzed_scope.hidden_annotation_blocks[idx])
+        } else {
+            None
+        }
     }
 
     fn next_function_annotation_symbol_table_uses_annotations(&self) -> bool {
@@ -1877,7 +1931,7 @@ impl<'warnings> Compiler<'warnings> {
     }
 
     /// Pop the current symbol table off the stack
-    fn pop_symbol_table(&mut self) -> SymbolTable {
+    fn pop_symbol_table(&mut self) -> SymbolTableFrame<'symbols> {
         self.symbol_table_stack.pop().expect("compiler bug")
     }
 
@@ -2074,7 +2128,7 @@ impl<'warnings> Compiler<'warnings> {
         // Build cellvars using dictbytype (CELL scope or COMP_CELL flag, sorted)
         let mut cellvar_cache = IndexSet::default();
         let mut cell_names: Vec<_> = ste
-            .symbols
+            .active_symbols
             .iter()
             .filter(|(_, s)| {
                 s.scope == SymbolScope::Cell || s.flags.contains(SymbolFlags::DEF_COMP_CELL)
@@ -2112,7 +2166,7 @@ impl<'warnings> Compiler<'warnings> {
             .as_ref()
             .map(|annotation| {
                 annotation
-                    .symbols
+                    .active_symbols
                     .iter()
                     .filter(|(_, s)| s.scope == SymbolScope::Free)
                     .map(|(name, _)| name.clone())
@@ -2120,7 +2174,7 @@ impl<'warnings> Compiler<'warnings> {
             })
             .unwrap_or_default();
         let mut free_names: Vec<_> = ste
-            .symbols
+            .active_symbols
             .iter()
             .filter(|(_, s)| {
                 s.scope == SymbolScope::Free
@@ -3049,7 +3103,7 @@ impl<'warnings> Compiler<'warnings> {
     fn compile_program(
         &mut self,
         body: &ast::ModModule,
-        symbol_table: SymbolTable,
+        symbol_table: &'symbols SymbolTable,
     ) -> CompileResult<()> {
         let size_before = self.code_stack.len();
         // Set future_annotations from symbol table (detected during symbol table scan)
@@ -3070,7 +3124,7 @@ impl<'warnings> Compiler<'warnings> {
         }
 
         // Module-level __conditional_annotations__ cell
-        let has_module_cond_ann = Self::scope_needs_conditional_annotations_cell(&symbol_table);
+        let has_module_cond_ann = Self::scope_needs_conditional_annotations_cell(symbol_table);
         if has_module_cond_ann {
             self.current_code_info()
                 .metadata
@@ -3078,7 +3132,8 @@ impl<'warnings> Compiler<'warnings> {
                 .insert("__conditional_annotations__".to_string());
         }
 
-        self.symbol_table_stack.push(symbol_table);
+        self.symbol_table_stack
+            .push(SymbolTableFrame::new(symbol_table));
 
         let is_coroutine = self.current_symbol_table().is_coroutine;
         self.emit_scope_prefix(CompilerScope::Module, 1, is_coroutine);
@@ -3131,7 +3186,7 @@ impl<'warnings> Compiler<'warnings> {
     fn compile_program_single(
         &mut self,
         body: &[ast::Stmt],
-        symbol_table: SymbolTable,
+        symbol_table: &'symbols SymbolTable,
     ) -> CompileResult<()> {
         self.interactive = true;
         // Set future_annotations from symbol table (detected during symbol table scan)
@@ -3152,14 +3207,15 @@ impl<'warnings> Compiler<'warnings> {
         }
 
         // Module-level __conditional_annotations__ cell
-        if Self::scope_needs_conditional_annotations_cell(&symbol_table) {
+        if Self::scope_needs_conditional_annotations_cell(symbol_table) {
             self.current_code_info()
                 .metadata
                 .cellvars
                 .insert("__conditional_annotations__".to_string());
         }
 
-        self.symbol_table_stack.push(symbol_table);
+        self.symbol_table_stack
+            .push(SymbolTableFrame::new(symbol_table));
         let module_start_loc = self.module_start_location(body);
 
         let is_coroutine = self.current_symbol_table().is_coroutine;
@@ -3193,7 +3249,7 @@ impl<'warnings> Compiler<'warnings> {
     fn compile_block_expr(
         &mut self,
         body: &[ast::Stmt],
-        symbol_table: SymbolTable,
+        symbol_table: &'symbols SymbolTable,
     ) -> CompileResult<()> {
         let future_features = self.future_features;
         self.current_code_info().flags |= future_features;
@@ -3202,7 +3258,8 @@ impl<'warnings> Compiler<'warnings> {
                 .flags
                 .insert(bytecode::CodeFlags::COROUTINE);
         }
-        self.symbol_table_stack.push(symbol_table);
+        self.symbol_table_stack
+            .push(SymbolTableFrame::new(symbol_table));
         let is_coroutine = self.current_symbol_table().is_coroutine;
         self.emit_scope_prefix(CompilerScope::Module, 1, is_coroutine);
 
@@ -3268,7 +3325,7 @@ impl<'warnings> Compiler<'warnings> {
     fn compile_eval(
         &mut self,
         expression: &ast::ModExpression,
-        symbol_table: SymbolTable,
+        symbol_table: &'symbols SymbolTable,
     ) -> CompileResult<()> {
         let future_features = self.future_features;
         self.current_code_info().flags |= future_features;
@@ -3277,7 +3334,8 @@ impl<'warnings> Compiler<'warnings> {
                 .flags
                 .insert(bytecode::CodeFlags::COROUTINE);
         }
-        self.symbol_table_stack.push(symbol_table);
+        self.symbol_table_stack
+            .push(SymbolTableFrame::new(symbol_table));
         let is_coroutine = self.current_symbol_table().is_coroutine;
         self.emit_scope_prefix(CompilerScope::Module, 1, is_coroutine);
 
@@ -3401,14 +3459,39 @@ impl<'warnings> Compiler<'warnings> {
         symboltable::maybe_mangle_name(private.map(Name::from).as_ref(), mangled_names, name)
     }
 
-    fn module_name_declared_global_in_nested_scope(table: &SymbolTable, name: &Name) -> bool {
-        table.sub_tables.iter().any(|subtable| {
-            (!subtable.comp_inlined
-                && subtable
-                    .lookup(name)
-                    .is_some_and(|symbol| symbol.scope == SymbolScope::GlobalExplicit))
-                || Self::module_name_declared_global_in_nested_scope(subtable, name)
-        })
+    fn collect_module_nested_globals(
+        table: &SymbolTable,
+        out: &mut std::collections::HashSet<Name>,
+    ) {
+        for subtable in &table.sub_tables {
+            if !subtable.comp_inlined {
+                for (name, symbol) in &subtable.symbols {
+                    if symbol.scope == SymbolScope::GlobalExplicit {
+                        out.insert(name.clone());
+                    }
+                }
+            }
+            Self::collect_module_nested_globals(subtable, out);
+        }
+    }
+
+    fn module_name_declared_global_in_nested_scope(&mut self, name: &Name) -> bool {
+        if self.current_symbol_table().typ != CompilerScope::Module {
+            return false;
+        }
+        if self.module_nested_globals.is_none() {
+            let mut globals = std::collections::HashSet::new();
+            Self::collect_module_nested_globals(
+                self.symbol_table_stack
+                    .first()
+                    .expect("module symbol table"),
+                &mut globals,
+            );
+            self.module_nested_globals = Some(globals);
+        }
+        self.module_nested_globals
+            .as_ref()
+            .is_some_and(|globals| globals.contains(name))
     }
 
     // = compiler_nameop
@@ -3531,18 +3614,12 @@ impl<'warnings> Compiler<'warnings> {
             }
         };
 
-        let module_global_from_nested_scope = {
-            let current_table = self.current_symbol_table();
-            current_table.typ == CompilerScope::Module
-                && Self::module_name_declared_global_in_nested_scope(current_table, name.as_ref())
-        };
-
         // Determine operation type based on scope
         let op_type = match actual_scope {
             SymbolScope::Free => NameOp::Deref,
             SymbolScope::Cell => NameOp::Deref,
             SymbolScope::Local => {
-                if module_global_from_nested_scope {
+                if self.module_name_declared_global_in_nested_scope(name.as_ref()) {
                     NameOp::Global
                 } else if is_function_like
                     || self
@@ -3581,7 +3658,7 @@ impl<'warnings> Compiler<'warnings> {
                 }
             }
             SymbolScope::Unknown => {
-                if module_global_from_nested_scope {
+                if self.module_name_declared_global_in_nested_scope(name.as_ref()) {
                     NameOp::Global
                 } else {
                     NameOp::Name
@@ -9640,12 +9717,12 @@ impl<'warnings> Compiler<'warnings> {
         let Some(outermost) = generators.first() else {
             return Ok(None);
         };
-        let (comp_table, _) = self
+        let (table, _) = self
             .lookup_comprehension_symbol_table_after_skipped_nested_scopes_in_expr(
                 &outermost.iter,
                 ComprehensionType::Generator,
             )?;
-        if comp_table.is_coroutine {
+        if table.is_coroutine {
             return Ok(None);
         }
         Ok(Some(id.as_str()))
@@ -10304,26 +10381,17 @@ impl<'warnings> Compiler<'warnings> {
         )
     }
 
-    fn consume_next_sub_table(&mut self) -> CompileResult<()> {
-        {
-            let _ = self.push_symbol_table()?;
-        }
-        self.pop_symbol_table();
-        Ok(())
-    }
-
     fn consume_function_annotation_symbol_table_if_used(&mut self) -> CompileResult<()> {
         if !self.next_function_annotation_symbol_table_uses_annotations() {
             return Ok(());
         }
-        if !self.push_annotation_symbol_table() {
+        if self.consume_annotation_symbol_table().is_none() {
             let current_table = self.current_symbol_table();
             return Err(self.error(CodegenErrorType::SyntaxError(format!(
                 "no annotation symbol table available in {} (type: {:?})",
                 current_table.name, current_table.typ
             ))));
         }
-        self.pop_annotation_symbol_table();
         Ok(())
     }
 
@@ -10333,12 +10401,12 @@ impl<'warnings> Compiler<'warnings> {
     ) -> CompileResult<()> {
         use ast::visitor::Visitor;
 
-        struct SkippedScopeVisitor<'a, 'warnings> {
-            compiler: &'a mut Compiler<'warnings>,
+        struct SkippedScopeVisitor<'a, 'symbols, 'warnings> {
+            compiler: &'a mut Compiler<'symbols, 'warnings>,
             error: Option<CodegenError>,
         }
 
-        impl SkippedScopeVisitor<'_, '_> {
+        impl SkippedScopeVisitor<'_, '_, '_> {
             fn consume_scope(&mut self) {
                 if self.error.is_none() {
                     self.error = self.compiler.consume_next_sub_table().err();
@@ -10388,7 +10456,7 @@ impl<'warnings> Compiler<'warnings> {
             }
         }
 
-        impl ast::visitor::Visitor<'_> for SkippedScopeVisitor<'_, '_> {
+        impl ast::visitor::Visitor<'_> for SkippedScopeVisitor<'_, '_, '_> {
             fn visit_expr(&mut self, expr: &ast::Expr) {
                 if self.error.is_some() {
                     return;
@@ -10491,12 +10559,12 @@ impl<'warnings> Compiler<'warnings> {
     ) -> CompileResult<()> {
         use ast::visitor::Visitor;
 
-        struct SkippedStatementScopeVisitor<'a, 'warnings> {
-            compiler: &'a mut Compiler<'warnings>,
+        struct SkippedStatementScopeVisitor<'a, 'symbols, 'warnings> {
+            compiler: &'a mut Compiler<'symbols, 'warnings>,
             error: Option<CodegenError>,
         }
 
-        impl SkippedStatementScopeVisitor<'_, '_> {
+        impl SkippedStatementScopeVisitor<'_, '_, '_> {
             fn consume_scope(&mut self) {
                 if self.error.is_none() {
                     self.error = self.compiler.consume_next_sub_table().err();
@@ -10540,7 +10608,7 @@ impl<'warnings> Compiler<'warnings> {
             }
         }
 
-        impl ast::visitor::Visitor<'_> for SkippedStatementScopeVisitor<'_, '_> {
+        impl ast::visitor::Visitor<'_> for SkippedStatementScopeVisitor<'_, '_, '_> {
             fn visit_stmt(&mut self, stmt: &ast::Stmt) {
                 if self.error.is_some() {
                     return;
@@ -10680,12 +10748,12 @@ impl<'warnings> Compiler<'warnings> {
     ) -> CompileResult<()> {
         use ast::visitor::Visitor;
 
-        struct SkippedHandlerScopeVisitor<'a, 'warnings> {
-            compiler: &'a mut Compiler<'warnings>,
+        struct SkippedHandlerScopeVisitor<'a, 'symbols, 'warnings> {
+            compiler: &'a mut Compiler<'symbols, 'warnings>,
             error: Option<CodegenError>,
         }
 
-        impl ast::visitor::Visitor<'_> for SkippedHandlerScopeVisitor<'_, '_> {
+        impl ast::visitor::Visitor<'_> for SkippedHandlerScopeVisitor<'_, '_, '_> {
             fn visit_expr(&mut self, expr: &ast::Expr) {
                 if self.error.is_some() {
                     return;
@@ -10757,11 +10825,15 @@ impl<'warnings> Compiler<'warnings> {
     /// re-compiled, and every scope that body opens begins on its own line or
     /// later.
     fn seek_symbol_table_cursors_to_line(&mut self, line_number: u32) {
-        fn seek(tables: &[SymbolTable], cursor: &mut usize, line_number: u32) {
-            while tables
-                .get(*cursor)
-                .is_some_and(|table| table.line_number < line_number)
-            {
+        fn seek<'a>(
+            tables: impl Iterator<Item = &'a SymbolTable>,
+            cursor: &mut usize,
+            line_number: u32,
+        ) {
+            for table in tables.skip(*cursor) {
+                if table.line_number >= line_number {
+                    break;
+                }
                 *cursor += 1;
             }
         }
@@ -10770,14 +10842,18 @@ impl<'warnings> Compiler<'warnings> {
             .symbol_table_stack
             .last_mut()
             .expect("no current symbol table");
-        seek(&table.sub_tables, &mut table.next_sub_table, line_number);
         seek(
-            &table.hidden_annotation_blocks,
+            table.sub_tables.iter().copied(),
+            &mut table.next_sub_table,
+            line_number,
+        );
+        seek(
+            table.analyzed_scope.hidden_annotation_blocks.iter(),
             &mut table.next_hidden_annotation_block,
             line_number,
         );
         seek(
-            &table.inlined_comprehension_blocks,
+            table.analyzed_scope.inlined_comprehension_blocks.iter(),
             &mut table.next_inlined_comprehension_block,
             line_number,
         );
@@ -10787,7 +10863,7 @@ impl<'warnings> Compiler<'warnings> {
         &mut self,
         expression: &ast::Expr,
         comprehension_type: ComprehensionType,
-    ) -> CompileResult<(SymbolTable, ComprehensionSymbolSource)> {
+    ) -> CompileResult<(&'symbols SymbolTable, ComprehensionSymbolSource)> {
         let saved_cursor = self
             .symbol_table_stack
             .last()
@@ -10806,13 +10882,14 @@ impl<'warnings> Compiler<'warnings> {
                 .expect("no current symbol table");
             if comprehension_type != ComprehensionType::Generator
                 && let Some(table) = current_table
+                    .analyzed_scope
                     .inlined_comprehension_blocks
                     .get(current_table.next_inlined_comprehension_block)
             {
-                return Ok((table.clone(), ComprehensionSymbolSource::Inlined));
+                return Ok((table, ComprehensionSymbolSource::Inlined));
             }
             if let Some(table) = current_table.sub_tables.get(current_table.next_sub_table) {
-                Ok((table.clone(), ComprehensionSymbolSource::Child))
+                Ok((*table, ComprehensionSymbolSource::Child))
             } else {
                 let name = current_table.name.clone();
                 let typ = current_table.typ;
@@ -10834,7 +10911,7 @@ impl<'warnings> Compiler<'warnings> {
 
     fn push_output_with_symbol_table(
         &mut self,
-        table: SymbolTable,
+        table: &'symbols SymbolTable,
         flags: bytecode::CodeFlags,
         posonlyarg_count: u32,
         arg_count: u32,
@@ -10842,7 +10919,7 @@ impl<'warnings> Compiler<'warnings> {
         obj_name: &str,
     ) -> CompileResult<()> {
         let scope_type = table.typ;
-        self.symbol_table_stack.push(table);
+        self.symbol_table_stack.push(SymbolTableFrame::new(table));
 
         let key = self.symbol_table_stack.len() - 1;
         let lineno = self.get_source_line_number().get();
@@ -10963,7 +11040,7 @@ impl<'warnings> Compiler<'warnings> {
                 comprehension_type,
             )?;
 
-        let is_inlined = self.is_inlined_comprehension_context(comprehension_type, &comp_table);
+        let is_inlined = self.is_inlined_comprehension_context(comprehension_type, comp_table);
 
         if is_inlined {
             // CPython inlines every non-generator comprehension that the
@@ -10972,7 +11049,7 @@ impl<'warnings> Compiler<'warnings> {
             // and relies on the inlined path itself to handle GET_AITER /
             // async-comprehension cleanup.
             return self.compile_inlined_comprehension(
-                &comp_table,
+                comp_table,
                 init_collection,
                 generators,
                 compile_element,
@@ -11252,7 +11329,7 @@ impl<'warnings> Compiler<'warnings> {
     /// This generates bytecode inline without creating a new code object
     fn compile_inlined_comprehension(
         &mut self,
-        comp_table: &SymbolTable,
+        comp_table: &'symbols SymbolTable,
         init_collection: Option<AnyInstruction>,
         generators: &[ast::Comprehension],
         compile_element: &dyn Fn(&mut Self, usize) -> CompileResult<()>,
@@ -11306,7 +11383,7 @@ impl<'warnings> Compiler<'warnings> {
                     .expect("no current symbol table");
                 let insert_pos = current_table.next_sub_table;
                 for (i, st) in comp_table.sub_tables.iter().enumerate() {
-                    current_table.sub_tables.insert(insert_pos + i, st.clone());
+                    current_table.sub_tables.insert(insert_pos + i, st);
                 }
             }
             let mut pushed_locals: Vec<Name> = Vec::new();
@@ -11336,7 +11413,7 @@ impl<'warnings> Compiler<'warnings> {
                 let comp_scope = comp_sym.scope;
 
                 let current_table = self.symbol_table_stack.last().expect("no symbol table");
-                if let Some(outer_sym) = current_table.symbols.get(name) {
+                if let Some(outer_sym) = current_table.active_symbols.get(name) {
                     let outer_scope = outer_sym.scope;
                     if (comp_scope != outer_scope
                         && comp_scope != SymbolScope::Free
@@ -11346,7 +11423,10 @@ impl<'warnings> Compiler<'warnings> {
                         temp_symbols.insert(name.clone(), outer_sym.clone());
                         let current_table =
                             self.symbol_table_stack.last_mut().expect("no symbol table");
-                        current_table.symbols.insert(name.clone(), comp_sym.clone());
+                        current_table
+                            .active_symbols
+                            .to_mut()
+                            .insert(name.clone(), comp_sym.clone());
                     }
                 }
             }
@@ -11389,7 +11469,7 @@ impl<'warnings> Compiler<'warnings> {
                 {
                     let i = if self
                         .current_symbol_table()
-                        .symbols
+                        .active_symbols
                         .get(name)
                         .is_some_and(|s| s.scope == SymbolScope::Free)
                     {
@@ -11649,7 +11729,10 @@ impl<'warnings> Compiler<'warnings> {
 
         let current_table = self.symbol_table_stack.last_mut().expect("no symbol table");
         for (name, original_sym) in temp_symbols {
-            current_table.symbols.insert(name, original_sym);
+            current_table
+                .active_symbols
+                .to_mut()
+                .insert(name, original_sym);
         }
         for name in changed_fast_hidden {
             self.current_code_info()
@@ -11864,21 +11947,14 @@ impl<'warnings> Compiler<'warnings> {
 
     fn arg_constant(&mut self, constant: ConstantData) -> oparg::ConstIdx {
         let info = self.current_code_info();
-        if let ConstantData::Code { code } = &constant
-            && let Some(idx) = info.metadata.consts.iter().position(|existing| {
-                matches!(
-                    existing,
-                    ConstantData::Code {
-                        code: existing_code
-                    } if Self::code_objects_equivalent(existing_code, code)
-                )
-            })
-        {
-            return u32::try_from(idx)
-                .expect("constant table index overflow")
-                .into();
-        }
-        info.metadata.consts.insert_full(constant).0.to_u32().into()
+        let (idx, _) = match constant {
+            ConstantData::Code { code } => info
+                .metadata
+                .consts
+                .insert_code(code, Self::code_objects_equivalent),
+            constant => info.metadata.consts.insert_full(constant),
+        };
+        idx.to_u32().into()
     }
 
     fn constants_equivalent(lhs: &ConstantData, rhs: &ConstantData) -> bool {
@@ -14226,6 +14302,93 @@ mod tests {
         compile_exec_with_options(source, opts)
     }
 
+    #[test]
+    fn consuming_scopes_does_not_grow_the_activation_stack() {
+        for future_annotations in [false, true] {
+            let opts = CompileOpts::default();
+            let source_file = SourceFileBuilder::new(
+                "<test>",
+                "def first(x: (lambda: lambda: 0)): pass\ndef second(): pass\n",
+            )
+            .finish();
+            let parsed = ruff_python_parser::parse(
+                source_file.source_text(),
+                ruff_python_parser::Mode::Module.into(),
+            )
+            .unwrap();
+            let ast::Mod::Module(module) = parsed.into_syntax() else {
+                unreachable!();
+            };
+            let table = SymbolTable::scan_program_with_options(
+                &module,
+                source_file.clone(),
+                false,
+                future_annotations,
+                opts.recursion_limit,
+            )
+            .unwrap();
+            let mut compiler =
+                Compiler::new_with_syntax_warning_handler(opts, source_file, "<module>", None);
+            compiler.symbol_table_stack = vec![SymbolTableFrame::new(&table)];
+            let capacity = compiler.symbol_table_stack.capacity();
+
+            compiler
+                .consume_function_annotation_symbol_table_if_used()
+                .unwrap();
+            assert!(!compiler.next_function_annotation_symbol_table_uses_annotations());
+            compiler.consume_next_sub_table().unwrap();
+            let table = compiler.current_symbol_table();
+            let next = table.sub_tables[table.next_sub_table..]
+                .iter()
+                .find(|table| table.typ != CompilerScope::Annotation)
+                .unwrap();
+            assert_eq!(next.name, "second");
+            compiler.consume_next_sub_table().unwrap();
+            assert!(compiler.consume_next_sub_table().is_err());
+
+            assert_eq!(compiler.symbol_table_stack.len(), 1);
+            assert_eq!(compiler.symbol_table_stack.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn code_pool_reuses_structurally_equal_clones() {
+        let code = compile_exec("def f():\n    return lambda: 12345\n");
+        let mut pool = ir::ConstantPool::default();
+
+        assert_eq!(
+            pool.insert_code(Box::new(code.clone()), Compiler::code_objects_equivalent),
+            (0, true)
+        );
+        assert_eq!(
+            pool.insert_code(Box::new(code), Compiler::code_objects_equivalent),
+            (0, false)
+        );
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn code_pool_keeps_unequal_nested_constants_in_colliding_bucket() {
+        let first = compile_exec("def f():\n    return 12345\n");
+        let second = compile_exec("def f():\n    return 54321\n");
+        let mut pool = ir::ConstantPool::default();
+
+        assert_eq!(
+            pool.insert_code(Box::new(first), Compiler::code_objects_equivalent),
+            (0, true)
+        );
+        assert_eq!(pool.code_candidates(&second), vec![0]);
+        assert_eq!(
+            pool.insert_code(Box::new(second.clone()), Compiler::code_objects_equivalent),
+            (1, true)
+        );
+        assert_eq!(
+            pool.insert_code(Box::new(second), Compiler::code_objects_equivalent),
+            (1, false)
+        );
+        assert_eq!(pool.len(), 2);
+    }
+
     fn compile_single(source: &str) -> CodeObject {
         let opts = CompileOpts::default();
         let source_file = SourceFileBuilder::new("source_path", source).finish();
@@ -14275,7 +14438,7 @@ mod tests {
         .unwrap();
         let mut compiler =
             Compiler::new_with_syntax_warning_handler(opts, source_file, "<module>", None);
-        compiler.compile_program(&ast, symbol_table).unwrap();
+        compiler.compile_program(&ast, &symbol_table).unwrap();
         compiler.exit_scope()
     }
 
@@ -14321,8 +14484,8 @@ mod tests {
         let mut compiler =
             Compiler::new_with_syntax_warning_handler(opts, source_file, "<module>", None);
         match mode {
-            Mode::Single => compiler.compile_program_single(&ast.body, symbol_table),
-            _ => compiler.compile_program(&ast, symbol_table),
+            Mode::Single => compiler.compile_program_single(&ast.body, &symbol_table),
+            _ => compiler.compile_program(&ast, &symbol_table),
         }
         .unwrap();
 
@@ -14466,7 +14629,7 @@ mod tests {
         };
         let mut compiler =
             Compiler::new_with_syntax_warning_handler(opts, source_file, "<module>", None);
-        compiler.compile_program(&ast, symbol_table).unwrap_err()
+        compiler.compile_program(&ast, &symbol_table).unwrap_err()
     }
 
     fn compile_exec_error(source: &str) -> CodegenError {
@@ -15108,6 +15271,166 @@ match x:
             .find_map(|sub_table| find_symbol_table(sub_table, name))
     }
 
+    #[test]
+    fn activating_scope_borrows_metadata_and_descendants() {
+        let source = "def outer(x):\n    return lambda y: lambda z: x + y + z\n";
+        let table = scan_program_symbol_table(source);
+        let outer = find_symbol_table(&table, "outer").unwrap();
+        let child_index = outer
+            .sub_tables
+            .iter()
+            .position(|child| child.typ == CompilerScope::Lambda)
+            .unwrap();
+        assert!(!outer.varnames.is_empty());
+        assert!(!outer.sub_tables[child_index].varnames.is_empty());
+        let outer_names = outer.varnames.as_ptr();
+        let child_names = outer.sub_tables[child_index].varnames.as_ptr();
+        let source_file = SourceFileBuilder::new("source_path", source).finish();
+        let mut compiler = Compiler::new_with_syntax_warning_handler(
+            CompileOpts::default(),
+            source_file,
+            "<module>",
+            None,
+        );
+        compiler
+            .symbol_table_stack
+            .push(SymbolTableFrame::new(&table));
+        let active = compiler.push_symbol_table().unwrap();
+        assert_eq!(active.varnames.as_ptr(), outer_names);
+        assert_eq!(
+            active.sub_tables[child_index].varnames.as_ptr(),
+            child_names
+        );
+    }
+
+    #[test]
+    fn activating_scope_borrows_unmodified_symbols() {
+        let source = "def outer(x):\n    return x\n";
+        let table = scan_program_symbol_table(source);
+        let original = find_symbol_table(&table, "outer").unwrap();
+        let name: Name = "x".into();
+        let symbol = original.lookup(&name).unwrap();
+        let source_file = SourceFileBuilder::new("source_path", source).finish();
+        let mut compiler = Compiler::new_with_syntax_warning_handler(
+            CompileOpts::default(),
+            source_file,
+            "<module>",
+            None,
+        );
+        compiler
+            .symbol_table_stack
+            .push(SymbolTableFrame::new(&table));
+        let active = compiler.push_symbol_table().unwrap();
+        assert!(core::ptr::eq(active.lookup(&name).unwrap(), symbol));
+    }
+
+    #[test]
+    fn replayed_scope_gets_fresh_local_state_without_changing_analysis() {
+        let source = "def outer(x):\n    return lambda y: x + y\n";
+        let table = scan_program_symbol_table(source);
+        let outer = find_symbol_table(&table, "outer").unwrap();
+        let name: Name = "x".into();
+        let source_file = SourceFileBuilder::new("source_path", source).finish();
+        let mut compiler = Compiler::new_with_syntax_warning_handler(
+            CompileOpts::default(),
+            source_file,
+            "<module>",
+            None,
+        );
+        compiler
+            .symbol_table_stack
+            .push(SymbolTableFrame::new(&table));
+        let start = compiler.current_symbol_table_cursors();
+        compiler.push_symbol_table().unwrap();
+        compiler.consume_next_sub_table().unwrap();
+        let active = compiler.symbol_table_stack.last_mut().unwrap();
+        assert!(active.next_sub_table > 0);
+        active.active_symbols.to_mut().shift_remove(&name);
+        assert!(active.lookup(&name).is_none());
+        compiler.pop_symbol_table();
+
+        compiler.set_symbol_table_cursors(start);
+        let replayed = compiler.push_symbol_table().unwrap();
+        assert_eq!(replayed.next_sub_table, 0);
+        assert!(core::ptr::eq(
+            replayed.lookup(&name).unwrap(),
+            outer.lookup(&name).unwrap()
+        ));
+        assert_eq!(outer.next_sub_table, 0);
+        assert_eq!(table.next_sub_table, 0);
+    }
+
+    #[test]
+    fn restored_annotation_frame_keeps_its_cursor_without_changing_analysis() {
+        let source = "first: (lambda: int)()\nsecond: (lambda: str)()\n";
+        let table = scan_program_symbol_table(source);
+        let original = table.annotation_block.as_ref().unwrap();
+        let source_file = SourceFileBuilder::new("source_path", source).finish();
+        let mut compiler = Compiler::new_with_syntax_warning_handler(
+            CompileOpts::default(),
+            source_file,
+            "<module>",
+            None,
+        );
+        compiler
+            .symbol_table_stack
+            .push(SymbolTableFrame::new(&table));
+        assert!(compiler.push_current_annotation_symbol_table());
+        compiler.consume_next_sub_table().unwrap();
+        let cursor = compiler.current_symbol_table().next_sub_table;
+        assert!(cursor > 0);
+        let annotation = compiler.pop_symbol_table();
+        compiler
+            .symbol_table_stack
+            .last_mut()
+            .unwrap()
+            .annotation_block = Some(Box::new(annotation));
+        assert!(compiler.push_current_annotation_symbol_table());
+        assert_eq!(compiler.current_symbol_table().next_sub_table, cursor);
+        compiler.consume_next_sub_table().unwrap();
+        assert!(compiler.current_symbol_table().next_sub_table > cursor);
+        assert_eq!(original.next_sub_table, 0);
+    }
+
+    #[test]
+    fn legacy_inlined_comprehension_splices_borrowed_children_into_active_frame_only() {
+        let source = "values = [lambda: x for x in (1, 2)]\n";
+        let source_file = SourceFileBuilder::new("source_path", source).finish();
+        let parsed =
+            ruff_python_parser::parse(source, ruff_python_parser::Mode::Module.into()).unwrap();
+        let ast::Mod::Module(module) = parsed.into_syntax() else {
+            unreachable!()
+        };
+        let mut table = SymbolTable::scan_program(&module, source_file.clone()).unwrap();
+        let comprehension = table.inlined_comprehension_blocks.remove(0);
+        assert!(!comprehension.sub_tables.is_empty());
+        table.sub_tables = vec![comprehension];
+        let first_child = &table.sub_tables[0].sub_tables[0];
+        let mut compiler = Compiler::new_with_syntax_warning_handler(
+            CompileOpts::default(),
+            source_file,
+            "<module>",
+            None,
+        );
+        compiler.compile_program(&module, &table).unwrap();
+        assert!(core::ptr::eq(
+            compiler.current_symbol_table().sub_tables[1],
+            first_child
+        ));
+        assert_eq!(table.sub_tables.len(), 1);
+        assert_eq!(table.next_sub_table, 0);
+        let code = compiler.exit_scope();
+        let lambda = find_code(&code, "<lambda>").unwrap();
+        assert_eq!(
+            lambda
+                .freevars
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["x"]
+        );
+    }
+
     fn compile_exec_late_cfg_trace(source: &str) -> Vec<(String, String)> {
         let opts = CompileOpts::default();
         let source_file = SourceFileBuilder::new("source_path", source).finish();
@@ -15126,7 +15449,7 @@ match x:
             .unwrap();
         let mut compiler =
             Compiler::new_with_syntax_warning_handler(opts, source_file, "<module>", None);
-        compiler.compile_program(&ast, symbol_table).unwrap();
+        compiler.compile_program(&ast, &symbol_table).unwrap();
         compiler.pop_symbol_table();
         let stack_top = compiler.code_stack.pop().unwrap();
         stack_top.debug_late_cfg_trace().unwrap()
@@ -15174,7 +15497,9 @@ match x:
         let mut compiler =
             Compiler::new_with_syntax_warning_handler(opts, source_file, "<module>", None);
         compiler.future_annotations = symbol_table.future_annotations;
-        compiler.symbol_table_stack.push(symbol_table);
+        compiler
+            .symbol_table_stack
+            .push(SymbolTableFrame::new(&symbol_table));
         compiler.set_source_range(range);
         compiler.enter_function(name.as_str(), parameters).unwrap();
         compiler
@@ -30029,7 +30354,7 @@ x = 1
         .unwrap();
         let mut compiler =
             Compiler::new_with_syntax_warning_handler(opts, source_file, "<module>", None);
-        compiler.compile_program(&ast, symbol_table).unwrap();
+        compiler.compile_program(&ast, &symbol_table).unwrap();
 
         let jump_positions = compiler
             .current_code_info()

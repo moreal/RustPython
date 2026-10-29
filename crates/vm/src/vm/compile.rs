@@ -3270,3 +3270,130 @@ type Alias[T: (1)()] = ("value")()
         }
     }
 }
+
+#[cfg(test)]
+mod scope_frame_tests {
+    use super::*;
+    use crate::Interpreter;
+
+    fn run(source: &str, future_annotations: bool) {
+        Interpreter::without_stdlib(Default::default()).enter(|vm| {
+            let scope = vm.new_scope_with_builtins();
+            scope
+                .globals
+                .set_item(
+                    "future_annotations",
+                    vm.ctx.new_bool(future_annotations).into(),
+                    vm,
+                )
+                .unwrap();
+            let mut opts = vm.compile_opts();
+            opts.future_features.set(
+                crate::bytecode::CodeFlags::FUTURE_ANNOTATIONS,
+                future_annotations,
+            );
+            let code = vm
+                .compile_with_opts(source, compiler::Mode::Exec, "<scope-frames>", opts)
+                .map_err(|error| error.into_pyexception(vm, Some(source)))
+                .unwrap();
+            vm.unwrap_pyresult(vm.run_code_obj(code, scope));
+        });
+    }
+
+    #[test]
+    fn finally_replay_keeps_nested_closures_and_annotation_scopes() {
+        for future_annotations in [false, true] {
+            run(
+                r#"
+children = []
+
+def outer(mode):
+    x = 40
+    try:
+        if mode == 1:
+            return "early"
+        if mode == 2:
+            raise LookupError("boom")
+    finally:
+        def child(y: int) -> int:
+            return (lambda z: x + y + z)(1)
+        children.append(child)
+    return "normal"
+
+assert outer(0) == "normal"
+assert outer(1) == "early"
+try:
+    outer(2)
+except LookupError as error:
+    assert str(error) == "boom"
+else:
+    raise AssertionError("the exception path must survive finally replay")
+assert len(children) == 3
+assert [child(1) for child in children] == [42, 42, 42]
+expected = {"y": "int", "return": "int"} if future_annotations else {"y": int, "return": int}
+assert [child.__annotations__ for child in children] == [expected, expected, expected]
+"#,
+                future_annotations,
+            );
+        }
+    }
+
+    #[test]
+    fn module_and_class_annotations_keep_distinct_nested_scopes() {
+        run(
+            r#"
+first: (lambda: int)()
+second: (lambda: str)()
+
+def make_class():
+    T = int
+    class Example:
+        x = 99
+        first: (lambda: T)()
+        values = [lambda: x for x in (1, 2)]
+        second: (lambda: str)()
+    return Example
+
+Example = make_class()
+assert __annotate__(1) == {"first": int, "second": str}
+assert Example.__annotations__ == {"first": int, "second": str}
+assert Example.x == 99
+assert [function() for function in Example.values] == [2, 2]
+"#,
+            false,
+        );
+    }
+
+    #[test]
+    fn inlined_comprehensions_restore_enclosing_symbols_and_scope_order() {
+        run(
+            r#"
+x = 100
+
+def outer():
+    x = 40
+    functions = [lambda: x for x in (1, 2)]
+    nested = [[lambda: y for y in (3, 4)] for x in (5, 6)]
+    assert [function() for function in functions] == [2, 2]
+    assert [[function() for function in row] for row in nested] == [[4, 4], [4, 4]]
+    assert list((lambda: x)() for x in (lambda: (7, 8))()) == [7, 8]
+    def consume(values):
+        return tuple(values)
+    assert consume((lambda: x)() for x in (lambda: (11, 12))()) == (11, 12)
+    return x
+
+assert outer() == 40
+assert x == 100
+
+class Example:
+    x = 200
+    functions = [lambda: x for x in (9, 10)]
+    assert x == 200
+
+assert Example.x == 200
+assert [function() for function in Example.functions] == [10, 10]
+"#,
+            false,
+        );
+    }
+}
